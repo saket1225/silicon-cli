@@ -693,13 +693,21 @@ def _select_silicons_for_custom_settings(silicons: list[dict]) -> set[str]:
 def _team_setup_configs(silicons: list[dict], opts: PullOpts | None = None) -> dict[str, dict]:
     kw = opts.setup_config_kwargs() if opts else {}
     base = stemcell.choose_setup_config("Default setup for all team silicons", **kw)
-    # With an explicit brain (or assume-yes), skip per-silicon customization.
-    custom = set() if (opts and (opts.assume_yes or opts.brain)) else \
-        _select_silicons_for_custom_settings(silicons)
+    # Glass may specify a brain per silicon (from the Create Team wizard). When it
+    # does, honor those and skip the interactive per-silicon prompt.
+    glass_has_brains = any((s.get("brain") or "").strip() for s in silicons)
+    custom = set()
+    if not glass_has_brains and not (opts and (opts.assume_yes or opts.brain)):
+        custom = _select_silicons_for_custom_settings(silicons)
     configs: dict[str, dict] = {}
     for silicon in silicons:
         sid = str(silicon.get("silicon_id") or "").strip()
-        configs[sid] = base
+        b = (silicon.get("brain") or "").strip().lower()
+        if b in ("claude", "codex"):
+            order = [x for x in (silicon.get("brain_order") or [b]) if x in ("claude", "codex")] or [b]
+            configs[sid] = stemcell.choose_setup_config("", brain=b, brain_order=order)
+        else:
+            configs[sid] = base
     for silicon in silicons:
         sid = str(silicon.get("silicon_id") or "").strip()
         if sid in custom:
