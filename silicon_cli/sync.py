@@ -55,6 +55,7 @@ PROVIDER_API_KEYS = (
     ("OPENAI_API_KEY", "OpenAI"),
     ("ELEVENLABS_API_KEY", "ElevenLabs"),
     ("DEEPGRAM_API_KEY", "Deepgram"),
+    ("GIPHY_API_KEY", "GIPHY"),
     ("STEEL_API_KEY", "Steel"),
 )
 
