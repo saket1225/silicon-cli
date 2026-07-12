@@ -241,7 +241,7 @@ def cmd_help() -> None:
   silicon status [name]       Show instance status
   silicon browser [name]      Open headed browser for login
   silicon browser-profile setup <token>
-                             Create a Steel browser profile through Glass
+                             Create a cloud browser profile through Glass
   silicon browser-profile finish <token> <session_id> [before_ids_csv]
                              Finish a browser profile setup session
   silicon debug [name]        Attach to running instance (live logs)

@@ -606,7 +606,7 @@ def browser_profile_finish(token: str | None, session_id: str | None, before_ids
     profile = body.get("profile") or {}
     name = profile.get("name") or profile.get("id") or "browser profile"
     assigned = body.get("assigned", 0)
-    ui.success(f"Saved Steel profile '{name}' and assigned it to {assigned} silicon(s).")
+    ui.success(f"Saved browser profile '{name}' and assigned it to {assigned} silicon(s).")
 
 
 def browser_profile_setup(token: str | None) -> None:
@@ -628,7 +628,7 @@ def browser_profile_setup(token: str | None) -> None:
         ui.error("Glass returned an incomplete browser setup session.")
         sys.exit(1)
 
-    ui.success("Steel setup session started.")
+    ui.success("Browser setup session started.")
     ui.info(f"Viewer URL: {viewer_url}")
     try:
         webbrowser.open(viewer_url)
