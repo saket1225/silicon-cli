@@ -19,13 +19,16 @@ from pathlib import Path
 from typing import Iterator
 
 from . import interface_cli, registry, ui
-from .config import REGISTRY_DIR, SILICON_UPDATE_ALLOW_UNSIGNED_GIT
+from .config import REGISTRY_DIR
 from .updater.cache import ReleaseCache
 from .updater.channel import fetch_latest_release
 from .updater.generation import GenerationStore, ManagedPointerMissing
 from .updater.io import fsync_dir, hash_tree
 from .updater.overlay import OverlayStore
-from .updater.release import FetchedRelease
+from .updater.release import (
+    FetchedRelease,
+    release_identity_is_authoritative,
+)
 
 SKIP_NAMES = {".git", "__pycache__", ".DS_Store"}
 PRESERVE_ROOT = {"env.py", "silicon.json", ".glass.json"}
@@ -60,7 +63,6 @@ class PreparedStemcell:
 def prepare_hydration(
     *,
     install_deps: bool = True,
-    allow_unsigned_git: bool | None = None,
     expected_tree_sha256: str | None = None,
     bind_docker_runtime: bool = False,
 ) -> Iterator[PreparedStemcell]:
@@ -73,18 +75,12 @@ def prepare_hydration(
 
     cache = ReleaseCache(REGISTRY_DIR / "cache")
     if expected_tree_sha256:
-        ui.info("Loading the authenticated Silicon release for pull recovery...")
+        ui.info("Loading the published Silicon release for pull recovery...")
         release = cache.load(expected_tree_sha256)
     else:
         release = fetch_latest_release(
             cache,
-            allow_unsigned_git=(
-                SILICON_UPDATE_ALLOW_UNSIGNED_GIT
-                if allow_unsigned_git is None
-                else allow_unsigned_git
-            ),
             info=ui.info,
-            warn=ui.warn,
         )
     # Runtime binding is caller-scoped. A local hydration must never inherit
     # an unrelated Docker setting from the operator's ambient CLI home.
@@ -302,14 +298,13 @@ def _install_initial_generation(
         # release, so republishing that pointer is the only safe recovery.
         floor = store.release_floor()
         if floor is not None and (
-            identity.trust != "signed-ed25519"
-            or identity.source != "glass"
+            not release_identity_is_authoritative(identity)
             or identity.sequence != int(floor["sequence"])
             or identity.tree_sha256 != floor["tree_sha256"]
         ):
             raise RuntimeError(
                 "managed first-generation recovery does not match the "
-                "publisher-authenticated release recorded before the crash"
+                "published release recorded before the crash"
             )
         store.activate(new_generation, previous=store.legacy_flat())
         return
@@ -330,13 +325,11 @@ def hydrate(
     setup_interface: bool = True,
     register_install: bool = True,
     prepared: PreparedStemcell | None = None,
-    allow_unsigned_git: bool | None = None,
     bind_docker_runtime: bool = False,
 ) -> None:
     if prepared is None:
         with prepare_hydration(
             install_deps=install_deps,
-            allow_unsigned_git=allow_unsigned_git,
             bind_docker_runtime=bind_docker_runtime,
         ) as shared:
             hydrate(
@@ -398,7 +391,7 @@ def hydrate(
         if not _env_value(env_path, key):
             _env_upsert(env_path, key, default)
 
-    # Interactive setup modifies only durable instance data.  The signed code
+    # Interactive setup modifies only durable instance data. The published code
     # generation remains byte-for-byte identical to its release identity.
     if setup_config is not None:
         _apply_setup(sj, setup_config)

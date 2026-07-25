@@ -9,17 +9,17 @@ from pathlib import Path
 
 
 MINIMUM_PYTHON_PACKAGES = {
-    "silicon-cli": "1.0.21",
-    "silicon-browser": "1.0.7",
+    "silicon-cli": "1.0.22",
+    "silicon-browser": "1.0.8",
     "silicon-extend": "0.1.1",
 }
 EXACT_PYTHON_PACKAGES = {
     "silicon-extend": "0.1.1",
 }
 MINIMUM_COMMAND_VERSIONS = {
-    "silicon-browser": "1.0.7",
+    "silicon-browser": "1.0.8",
     "silicon-extend": "0.1.1",
-    "silicon-interface": "2.0.0",
+    "silicon-interface": "2.0.1",
     "claude": "2.1.219",
     "codex": "0.145.0",
     "node": "22.0.0",

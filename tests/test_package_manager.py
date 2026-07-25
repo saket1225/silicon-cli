@@ -24,6 +24,23 @@ def _install(name: str, runtime: str = "local") -> registry.Install:
 
 
 class PackageManagerTests(unittest.TestCase):
+    def test_silicon_latest_version_comes_from_published_git_tags(self):
+        with mock.patch.object(
+            package_manager,
+            "resolve_latest_published_git_release",
+            return_value=SimpleNamespace(version="2.0.0"),
+        ) as resolve, mock.patch.object(
+            package_manager,
+            "_http_json",
+        ) as http:
+            version, error = package_manager._latest_version(
+                package_manager.PACKAGE_BY_KEY["silicon"]
+            )
+
+        self.assertEqual((version, error), ("2.0.0", ""))
+        resolve.assert_called_once_with(package_manager.STEMCELL_GIT_URL)
+        http.assert_not_called()
+
     def test_inventory_filters_instance_rows_but_keeps_server_host_rows(self):
         alpha = _install("alpha", "docker")
         beta = _install("beta")
@@ -65,7 +82,7 @@ class PackageManagerTests(unittest.TestCase):
         self.assertEqual(result["installations"], 1)
         self.assertEqual(result["summary"]["total"], 2)
 
-    def test_docker_package_update_rolls_signed_runtime_and_host_copy(self):
+    def test_docker_package_update_rolls_published_runtime_and_host_copy(self):
         alpha = _install("alpha", "docker")
         with (
             mock.patch.object(
@@ -95,6 +112,7 @@ class PackageManagerTests(unittest.TestCase):
         update_instance.assert_called_once_with("alpha")
         update_host.assert_called_once()
         self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["steps"][0]["step"], "git-release")
 
     def test_running_local_silicon_blocks_shared_host_mutation(self):
         alpha = _install("alpha")

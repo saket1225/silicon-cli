@@ -14,7 +14,6 @@ from pathlib import Path
 from . import docker_runtime, glassagent, process, registry, ui
 from .config import (
     REGISTRY_DIR,
-    SILICON_UPDATE_ALLOW_UNSIGNED_GIT,
     active_release_root,
     python_run_cmd,
     runtime_environment,
@@ -26,7 +25,7 @@ from .updater import (
     UpdateError,
 )
 from .updater.cache import ReleaseCache
-from .updater.channel import fetch_latest_release
+from .updater.channel import ReleaseChannelError, fetch_latest_release
 from .updater.fleet import FleetJournal, FleetJournalError
 from .updater.lock import InstanceLock
 from .updater.maintenance import MaintenanceError, MaintenanceProtocol
@@ -130,14 +129,10 @@ def _canonical_snapshot_gc(
     return collect
 
 
-def _fetch_latest(
-    cache: ReleaseCache, *, allow_unsigned_git: bool = False
-) -> FetchedRelease:
+def _fetch_latest(cache: ReleaseCache) -> FetchedRelease:
     return fetch_latest_release(
         cache,
-        allow_unsigned_git=allow_unsigned_git,
         info=ui.info,
-        warn=ui.warn,
     )
 
 
@@ -1040,7 +1035,6 @@ def update_instance(
     *,
     dry_run: bool = False,
     deadline_seconds: float | None = None,
-    allow_unsigned_git: bool = False,
 ) -> None:
     installs = _targets(target)
     _refuse_self_update(installs)
@@ -1067,20 +1061,20 @@ def update_instance(
         ):
             return
     cache = _cache()
-    release = _fetch_latest(
-        cache,
-        allow_unsigned_git=allow_unsigned_git,
-    )
+    release = _fetch_latest(cache)
     docker_installs = [install for install in installs if install.is_docker]
     if docker_installs and not dry_run:
         runtime_image = release.manifest.runtime_image
         if not runtime_image:
             raise UpdateError(
-                "Docker updates require a signed release manifest with an "
-                "immutable runtime_image digest; unsigned Git compatibility "
-                "updates are available only for local runtimes"
+                "Docker updates require the published Stemcell Git tag to "
+                "declare an immutable runtime_image digest"
             )
-        docker_runtime.prepare_release_image(runtime_image)
+        runtime_config = docker_runtime.prepare_release_image(runtime_image)
+        docker_runtime.verify_runtime_contract(
+            runtime_config,
+            runtime_image,
+        )
     instance_roots = [Path(item.path) for item in registry.installs()]
     updaters = [
         (
@@ -1341,7 +1335,7 @@ def _print_status(value) -> None:
 def update_command(arguments: list[str]) -> None:
     try:
         _update_command(arguments)
-    except (UpdateError, FleetJournalError) as exc:
+    except RuntimeError as exc:
         ui.error(str(exc))
         raise SystemExit(2) from exc
 
@@ -1356,15 +1350,12 @@ def _update_command(arguments: list[str]) -> None:
         operation = args.pop(0)
     dry_run = False
     deadline_seconds = None
-    allow_unsigned_git = SILICON_UPDATE_ALLOW_UNSIGNED_GIT
     positionals: list[str] = []
     index = 0
     while index < len(args):
         argument = args[index]
         if argument == "--dry-run":
             dry_run = True
-        elif argument == "--allow-unsigned-git":
-            allow_unsigned_git = True
         elif argument == "--deadline":
             if index + 1 >= len(args):
                 raise UpdateError("--deadline requires a duration such as 30m")
@@ -1385,7 +1376,6 @@ def _update_command(arguments: list[str]) -> None:
                 target,
                 dry_run=dry_run,
                 deadline_seconds=deadline_seconds,
-                allow_unsigned_git=allow_unsigned_git,
             )
             return
         if operation == "status":
@@ -1440,7 +1430,7 @@ def _update_command(arguments: list[str]) -> None:
                         deadline=deadline, transaction_id=transaction_id
                     )
                 )
-    except (UpdateError, FleetJournalError) as exc:
+    except (UpdateError, FleetJournalError, ReleaseChannelError) as exc:
         ui.error(str(exc))
         raise SystemExit(2) from exc
 

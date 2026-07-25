@@ -279,7 +279,7 @@ class BootstrapSnapshotAdapterTests(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 BootstrapSnapshotError,
-                "one sequence for different immutable release trees",
+                "reused for different immutable content",
             ):
                 restore_local_snapshot_in_place(
                     root,

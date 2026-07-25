@@ -12,7 +12,6 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
-import math
 import os
 import shutil
 import stat
@@ -22,6 +21,11 @@ from typing import Mapping
 
 from .io import atomic_write_json, fsync_dir, sha256_file, validate_relative_path
 from .lock import AdvisoryFileLock, AdvisoryLockError
+from .release import (
+    ReleaseVerificationError,
+    compare_release_floors,
+    validate_release_floor,
+)
 
 SNAPSHOT_SCHEMA = 1
 CLASSES = {
@@ -77,10 +81,8 @@ class BootstrapSnapshotError(RuntimeError):
 @dataclass(frozen=True)
 class _ReleaseFloorPlan:
     snapshot_entry: Mapping[str, object] | None
-    snapshot_sequence: int | None
-    snapshot_tree_sha256: str | None
-    minimum_sequence: int
-    minimum_tree_sha256: str
+    snapshot_floor: Mapping[str, object] | None
+    minimum_floor: Mapping[str, object]
 
 
 def _canonical(value: object) -> bytes:
@@ -103,33 +105,18 @@ def _validate_release_sequence_floor(
     value: Mapping[str, object],
     *,
     label: str,
-) -> tuple[int, str]:
-    sequence = value.get("sequence")
-    tree_sha256 = value.get("tree_sha256")
-    recorded_at = value.get("recorded_at")
-    if (
-        set(value) != {"schema", "sequence", "tree_sha256", "recorded_at"}
-        or value.get("schema") != 1
-        or not isinstance(sequence, int)
-        or isinstance(sequence, bool)
-        or sequence <= 0
-        or not isinstance(tree_sha256, str)
-        or len(tree_sha256) != 64
-        or any(char not in "0123456789abcdef" for char in tree_sha256)
-        or not isinstance(recorded_at, (int, float))
-        or isinstance(recorded_at, bool)
-        or not math.isfinite(float(recorded_at))
-        or float(recorded_at) <= 0
-    ):
-        raise BootstrapSnapshotError(f"{label} is invalid")
-    return sequence, tree_sha256
+) -> dict[str, object]:
+    try:
+        return validate_release_floor(value)
+    except ReleaseVerificationError as exc:
+        raise BootstrapSnapshotError(f"{label} is invalid") from exc
 
 
 def _read_release_sequence_floor(
     path: Path,
     *,
     label: str,
-) -> tuple[int, str] | None:
+) -> dict[str, object] | None:
     try:
         before = path.lstat()
     except FileNotFoundError:
@@ -211,28 +198,20 @@ def _plan_release_sequence_floor_restore(
             )
     if current is None and snapshot is None:
         return None
-    if (
-        current is not None
-        and snapshot is not None
-        and current[0] == snapshot[0]
-        and current[1] != snapshot[1]
-    ):
-        raise BootstrapSnapshotError(
-            "release sequence floor reuses one sequence for different "
-            "immutable release trees"
-        )
     minimum = current
-    if minimum is None or (
-        snapshot is not None and snapshot[0] > minimum[0]
-    ):
+    if minimum is None:
         minimum = snapshot
+    elif snapshot is not None:
+        try:
+            if compare_release_floors(snapshot, minimum) > 0:
+                minimum = snapshot
+        except ReleaseVerificationError as exc:
+            raise BootstrapSnapshotError(str(exc)) from exc
     assert minimum is not None
     return _ReleaseFloorPlan(
         snapshot_entry=snapshot_entry,
-        snapshot_sequence=snapshot[0] if snapshot is not None else None,
-        snapshot_tree_sha256=snapshot[1] if snapshot is not None else None,
-        minimum_sequence=minimum[0],
-        minimum_tree_sha256=minimum[1],
+        snapshot_floor=snapshot,
+        minimum_floor=minimum,
     )
 
 
@@ -242,23 +221,17 @@ def _release_floor_needs_restore(
 ) -> bool:
     if plan.snapshot_entry is None:
         return False
-    assert plan.snapshot_sequence is not None
-    assert plan.snapshot_tree_sha256 is not None
+    assert plan.snapshot_floor is not None
     current = _read_release_sequence_floor(
         root / RELEASE_SEQUENCE_FLOOR,
         label="release sequence floor",
     )
     if current is None:
         return True
-    if (
-        current[0] == plan.snapshot_sequence
-        and current[1] != plan.snapshot_tree_sha256
-    ):
-        raise BootstrapSnapshotError(
-            "release sequence floor reuses one sequence for different "
-            "immutable release trees"
-        )
-    return current[0] < plan.snapshot_sequence
+    try:
+        return compare_release_floors(plan.snapshot_floor, current) > 0
+    except ReleaseVerificationError as exc:
+        raise BootstrapSnapshotError(str(exc)) from exc
 
 
 def _verify_release_sequence_floor(
@@ -269,17 +242,17 @@ def _verify_release_sequence_floor(
         root / RELEASE_SEQUENCE_FLOOR,
         label="release sequence floor",
     )
-    if current is None or current[0] < plan.minimum_sequence:
+    if current is None:
         raise BootstrapSnapshotError(
             "snapshot restore lowered or removed the release sequence floor"
         )
-    if (
-        current[0] == plan.minimum_sequence
-        and current[1] != plan.minimum_tree_sha256
-    ):
+    try:
+        below = compare_release_floors(current, plan.minimum_floor) < 0
+    except ReleaseVerificationError as exc:
+        raise BootstrapSnapshotError(str(exc)) from exc
+    if below:
         raise BootstrapSnapshotError(
-            "snapshot restore changed the immutable release tree at the "
-            "release sequence floor"
+            "snapshot restore lowered or removed the release sequence floor"
         )
 
 

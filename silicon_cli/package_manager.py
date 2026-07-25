@@ -27,11 +27,12 @@ from . import (
 )
 from .config import (
     REGISTRY_DIR,
-    SILICON_RELEASE_MANIFEST_URL,
+    STEMCELL_GIT_URL,
     active_release_root,
     active_environment_python,
 )
 from .host_lock import HostFileLock
+from .updater.release import resolve_latest_published_git_release
 
 INVENTORY_MARKER = "SILICON_PACKAGE_INVENTORY="
 UPDATE_MARKER = "SILICON_PACKAGE_UPDATE="
@@ -53,10 +54,10 @@ PACKAGE_SPECS = (
     PackageSpec(
         "silicon",
         "Silicon",
-        "signed-release",
+        "git-release",
         "silicon-stemcell",
         "silicon update <target>",
-        "glass",
+        "git",
     ),
     PackageSpec(
         "silicon-cli",
@@ -149,10 +150,14 @@ def _latest_version(spec: PackageSpec) -> tuple[str, str]:
                 f"https://registry.npmjs.org/{encoded}/latest"
             )
             return str(body.get("version") or ""), ""
-        body = _http_json(SILICON_RELEASE_MANIFEST_URL)
-        signed = body.get("signed") if isinstance(body, dict) else {}
-        identity = signed.get("identity") if isinstance(signed, dict) else {}
-        return str((identity or {}).get("version") or ""), ""
+        if spec.latest_source == "git":
+            return (
+                resolve_latest_published_git_release(
+                    STEMCELL_GIT_URL
+                ).version,
+                "",
+            )
+        raise RuntimeError(f"unknown latest-version source: {spec.latest_source}")
     except Exception as exc:
         return "", str(exc)[:300]
 
@@ -350,7 +355,7 @@ def _docker_rows(
                 _numeric_version(str(versions.get(version_key) or "")),
                 latest.get(key, ""),
                 location="docker-image",
-                strategy="signed-runtime",
+                strategy="published-runtime",
                 install=install,
                 detail=detail,
             )
@@ -367,8 +372,8 @@ def _docker_rows(
             PACKAGE_BY_KEY["silicon"],
             _numeric_version(silicon_version) or silicon_version,
             latest.get("silicon", ""),
-            location="signed-generation",
-            strategy="signed-runtime",
+            location="immutable-generation",
+            strategy="git-release",
             install=install,
         )
     )
@@ -389,8 +394,8 @@ def _local_rows(install: registry.Install, latest: dict[str, str]) -> list[dict]
             PACKAGE_BY_KEY["silicon"],
             _numeric_version(silicon_version) or silicon_version,
             latest.get("silicon", ""),
-            location="signed-generation",
-            strategy="signed-release",
+            location="immutable-generation",
+            strategy="git-release",
             install=install,
         )
     )
@@ -405,7 +410,7 @@ def _local_rows(install: registry.Install, latest: dict[str, str]) -> list[dict]
             ),
             latest.get("silicon-extend", ""),
             location="generation-environment",
-            strategy="signed-release",
+            strategy="git-release",
             install=install,
         )
     )
@@ -518,18 +523,20 @@ def _update_package_unlocked(
     docker_installs = [install for install in installs if install.is_docker]
     local_installs = [install for install in installs if not install.is_docker]
 
-    signed_targets = list(docker_installs)
+    release_targets = list(docker_installs)
     if package_key in {"silicon", "silicon-extend"}:
-        signed_targets.extend(local_installs)
-    if signed_targets:
-        names = ",".join(dict.fromkeys(install.name for install in signed_targets))
+        release_targets.extend(local_installs)
+    if release_targets:
+        names = ",".join(
+            dict.fromkeys(install.name for install in release_targets)
+        )
         try:
             update.update_instance(names)
         except SystemExit as exc:
             code = int(exc.code or 1)
             steps.append(
                 {
-                    "step": "signed-release",
+                    "step": "git-release",
                     "status": "done" if code == 0 else "failed",
                     "returncode": code,
                     "detail": "",
@@ -538,13 +545,13 @@ def _update_package_unlocked(
         except Exception as exc:
             steps.append(
                 {
-                    "step": "signed-release",
+                    "step": "git-release",
                     "status": "failed",
                     "detail": str(exc),
                 }
             )
         else:
-            steps.append({"step": "signed-release", "status": "done"})
+            steps.append({"step": "git-release", "status": "done"})
 
     if package_key != "silicon":
         running_local = [

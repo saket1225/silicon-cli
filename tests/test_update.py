@@ -45,19 +45,16 @@ class CliUpdateTests(unittest.TestCase):
             "ada",
             dry_run=True,
             deadline_seconds=None,
-            allow_unsigned_git=False,
         )
 
-    def test_unsigned_git_source_requires_an_explicit_flag(self):
-        with mock.patch.object(update, "update_instance") as update_instance:
+    def test_removed_unsigned_git_flag_fails_closed(self):
+        with (
+            mock.patch.object(update, "update_instance") as update_instance,
+            self.assertRaises(SystemExit),
+        ):
             update.update_command(["--allow-unsigned-git", "ada"])
 
-        update_instance.assert_called_once_with(
-            "ada",
-            dry_run=False,
-            deadline_seconds=None,
-            allow_unsigned_git=True,
-        )
+        update_instance.assert_not_called()
 
     def test_update_deadline_rejects_nonfinite_and_unbounded_values(self):
         for value in ("nan", "inf", "169h"):
@@ -108,6 +105,63 @@ class CliUpdateTests(unittest.TestCase):
         ):
             update.update_instance("ada")
         fetch.assert_not_called()
+
+    def test_invalid_git_release_fails_cleanly_before_any_stop_or_drain(self):
+        inst = registry.Install(
+            index=0,
+            name="ada",
+            path="/tmp/ada",
+            pid_file="/tmp/ada/.silicon.pid",
+        )
+        with (
+            mock.patch.object(update, "_targets", return_value=[inst]),
+            mock.patch.object(update.FleetJournal, "active", return_value=None),
+            mock.patch.object(update, "_cache", return_value=object()),
+            mock.patch.object(
+                update,
+                "_fetch_latest",
+                side_effect=update.ReleaseChannelError(
+                    "published Stemcell has no immutable runtime_image digest"
+                ),
+            ),
+            mock.patch.object(
+                update,
+                "TransactionalUpdater",
+            ) as updater,
+            mock.patch.object(update.process, "stop_one") as stop,
+            mock.patch.object(
+                update.MaintenanceProtocol,
+                "request_drain",
+            ) as drain,
+            mock.patch.object(update.ui, "error") as error,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            update.update_command(["ada"])
+
+        self.assertEqual(raised.exception.code, 2)
+        updater.assert_not_called()
+        stop.assert_not_called()
+        drain.assert_not_called()
+        error.assert_called_once()
+
+    def test_runtime_preflight_failure_is_reported_without_a_traceback(self):
+        with (
+            mock.patch.object(
+                update,
+                "update_instance",
+                side_effect=RuntimeError(
+                    "published runtime contract verification failed"
+                ),
+            ),
+            mock.patch.object(update.ui, "error") as error,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            update.update_command(["ada"])
+
+        self.assertEqual(raised.exception.code, 2)
+        error.assert_called_once_with(
+            "published runtime contract verification failed"
+        )
 
     def test_startup_reconciles_nonterminal_update_before_work(self):
         inst = registry.Install(

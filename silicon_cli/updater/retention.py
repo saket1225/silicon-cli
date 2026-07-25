@@ -383,7 +383,7 @@ class RetentionManager:
                     trees.update(groups[1])
                     environment_paths.update(groups[2])
 
-        # A host pull fetches and prepares its exact signed release before any
+        # A host pull fetches and prepares its exact published release before any
         # final instance directory exists. Its separate owner-only journal is
         # therefore the only reference protecting that cache entry across a
         # concurrent update retention pass.

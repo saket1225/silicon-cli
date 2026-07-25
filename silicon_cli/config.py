@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import stat
 from pathlib import Path
@@ -14,18 +15,23 @@ REGISTRY_FILE = REGISTRY_DIR / "registry.json"
 
 # Glass sync server (pull/push). Override with GLASS_SERVER_URL to point elsewhere.
 GLASS_SERVER_URL = os.environ.get("GLASS_SERVER_URL", "https://glass.teamofsilicons.com").rstrip("/")
-SILICON_RELEASE_MANIFEST_URL = os.environ.get(
-    "SILICON_RELEASE_MANIFEST_URL",
-    f"{GLASS_SERVER_URL}/api/v1/silicon-release/latest.json",
-)
-SILICON_UPDATE_ALLOW_UNSIGNED_GIT = os.environ.get(
-    "SILICON_UPDATE_ALLOW_UNSIGNED_GIT", ""
-).lower() in {"1", "true", "yes", "on"}
 
-# Stemcell — the base every new silicon is hydrated from.
+# Stemcell — stable SemVer tags are the source for new and updated Silicons.
 STEMCELL_REPO = os.environ.get("SILICON_STEMCELL_REPO", "teamofsilicons/silicon-stemcell")
+_stemcell_repository_parts = STEMCELL_REPO.split("/")
+if (
+    re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", STEMCELL_REPO)
+    is None
+    or len(_stemcell_repository_parts) != 2
+    or any(
+        part in {".", ".."} or len(part) > 100
+        for part in _stemcell_repository_parts
+    )
+):
+    raise RuntimeError(
+        "SILICON_STEMCELL_REPO must be one GitHub owner/repository pair"
+    )
 STEMCELL_GIT_URL = f"https://github.com/{STEMCELL_REPO}.git"
-STEMCELL_ZIP_URL = f"https://github.com/{STEMCELL_REPO}/archive/refs/heads/main.zip"
 
 # Silicon Interface CLI. During local development, silicon-cli will auto-detect
 # a sibling silicon-interface checkout; in production this package spec is used.
@@ -35,7 +41,7 @@ SILICON_INTERFACE_CLI_PACKAGE = os.environ.get(
 )
 SILICON_INTERFACE_CLI_TARBALL = os.environ.get(
     "SILICON_INTERFACE_CLI_TARBALL",
-    "https://registry.npmjs.org/@teamofsilicons/silicon-interface-cli/-/silicon-interface-cli-2.0.0.tgz",
+    "https://registry.npmjs.org/@teamofsilicons/silicon-interface-cli/-/silicon-interface-cli-2.0.1.tgz",
 )
 SILICON_INTERFACE_CLI_SOURCE = os.environ.get("SILICON_INTERFACE_CLI_SOURCE", "")
 SILICON_INTERFACE_CLI_SKIP = os.environ.get("SILICON_INTERFACE_CLI_SKIP", "").lower() in {

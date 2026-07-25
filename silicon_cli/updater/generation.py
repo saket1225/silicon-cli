@@ -13,7 +13,11 @@ from .lock import AdvisoryFileLock, AdvisoryLockError
 from .release import (
     ReleaseIdentity,
     ReleaseVerificationError,
+    compare_release_floors,
+    release_floor_from_identity,
+    release_identity_is_authoritative,
     runtime_image_is_pinned,
+    validate_release_floor,
 )
 
 
@@ -48,12 +52,8 @@ class GenerationStore:
             cursor = cursor.parent
 
     @staticmethod
-    def _publisher_authenticated(identity: ReleaseIdentity) -> bool:
-        return bool(
-            identity.sequence > 0
-            and identity.trust == "signed-ed25519"
-            and identity.source == "glass"
-        )
+    def _authoritative_release(identity: ReleaseIdentity) -> bool:
+        return release_identity_is_authoritative(identity)
 
     def current(self) -> dict[str, Any]:
         managed = self._managed()
@@ -119,10 +119,10 @@ class GenerationStore:
     def release_floor(
         self, current: dict[str, Any] | None = None
     ) -> dict[str, Any] | None:
-        """Return the highest authenticated release sequence ever accepted.
+        """Return the highest authoritative published version ever accepted.
 
         The floor is deliberately independent from the active generation:
-        an explicit runtime rollback must never make an older signed release
+        an explicit runtime rollback must never make an older published release
         eligible through the normal update channel.
         """
 
@@ -137,30 +137,11 @@ class GenerationStore:
             ):
                 raise GenerationError("release sequence floor is unsafe")
             try:
-                value = read_json(path)
-            except (OSError, ValueError) as exc:
+                value = validate_release_floor(read_json(path))
+            except (OSError, ValueError, ReleaseVerificationError) as exc:
                 raise GenerationError(
                     "release sequence floor is corrupt"
                 ) from exc
-            if (
-                set(value)
-                != {"schema", "sequence", "tree_sha256", "recorded_at"}
-                or value.get("schema") != 1
-                or not isinstance(value.get("sequence"), int)
-                or isinstance(value.get("sequence"), bool)
-                or int(value["sequence"]) <= 0
-                or not isinstance(value.get("tree_sha256"), str)
-                or len(value["tree_sha256"]) != 64
-                or any(
-                    char not in "0123456789abcdef"
-                    for char in value["tree_sha256"]
-                )
-                or not isinstance(value.get("recorded_at"), (int, float))
-                or isinstance(value.get("recorded_at"), bool)
-                or not math.isfinite(float(value["recorded_at"]))
-                or float(value["recorded_at"]) <= 0
-            ):
-                raise GenerationError("release sequence floor is invalid")
             stored = value
 
         active: dict[str, Any] | None = None
@@ -171,25 +152,40 @@ class GenerationStore:
                 raise GenerationError(
                     "active generation has an invalid release identity"
                 ) from exc
-            if self._publisher_authenticated(identity):
-                active = {
-                    "schema": 1,
-                    "sequence": identity.sequence,
-                    "tree_sha256": identity.tree_sha256,
-                    "recorded_at": float(current.get("activated_at") or time.time()),
-                }
+            if self._authoritative_release(identity):
+                active = release_floor_from_identity(
+                    identity,
+                    recorded_at=float(
+                        current.get("activated_at") or time.time()
+                    ),
+                )
 
         if stored is None:
             return active
-        if active is None or int(stored["sequence"]) > int(active["sequence"]):
+        if active is None:
             return stored
-        if int(stored["sequence"]) < int(active["sequence"]):
+        if (
+            stored["schema"] == 1
+            and stored["sequence"] == active["sequence"]
+            and stored["tree_sha256"] == active["tree_sha256"]
+        ):
             return active
-        if stored["tree_sha256"] != active["tree_sha256"]:
+        try:
+            order = compare_release_floors(active, stored)
+        except ReleaseVerificationError as exc:
+            if stored["schema"] == 1:
+                # A schema-1 floor predates version-aware cross-authority
+                # ordering. Preserve its historical sequence until the exact
+                # matching release identity can enrich it.
+                return (
+                    active
+                    if int(active["sequence"]) > int(stored["sequence"])
+                    else stored
+                )
             raise GenerationError(
-                "release sequence floor conflicts with the active generation"
-            )
-        return stored
+                "release floor conflicts with the active generation"
+            ) from exc
+        return active if order > 0 else stored
 
     def _record_release_floor_unlocked(
         self,
@@ -201,27 +197,25 @@ class GenerationStore:
             identity = ReleaseIdentity.from_dict(release)
         except ReleaseVerificationError as exc:
             raise GenerationError("cannot record an invalid release identity") from exc
-        if not self._publisher_authenticated(identity):
+        if not self._authoritative_release(identity):
             return
+        candidate = release_floor_from_identity(
+            identity,
+            recorded_at=time.time(),
+        )
         existing = self.release_floor()
         if existing is not None:
-            old_sequence = int(existing["sequence"])
-            if old_sequence > identity.sequence:
+            try:
+                order = compare_release_floors(candidate, existing)
+            except ReleaseVerificationError as exc:
+                raise GenerationError(str(exc)) from exc
+            if order < 0:
                 return
-            if old_sequence == identity.sequence:
-                if existing["tree_sha256"] != identity.tree_sha256:
-                    raise GenerationError(
-                        "release sequence was reused for different immutable content"
-                    )
+            if order == 0 and existing["schema"] != 1:
                 return
         atomic_write_json(
             self.release_floor_path,
-            {
-                "schema": 1,
-                "sequence": identity.sequence,
-                "tree_sha256": identity.tree_sha256,
-                "recorded_at": time.time(),
-            },
+            candidate,
             mode=0o600,
         )
 
@@ -237,7 +231,7 @@ class GenerationStore:
             raise GenerationError(str(exc)) from exc
 
     def record_release_floor(self, release: dict[str, Any] | None) -> None:
-        """Durably raise, but never lower, the signed-release sequence floor."""
+        """Durably raise, but never lower, the published-release floor."""
 
         if not isinstance(release, dict):
             return
@@ -257,8 +251,8 @@ class GenerationStore:
             return
         if not isinstance(release, dict):
             raise GenerationError(
-                "cannot activate an unauthenticated generation after a signed "
-                "release sequence floor was established"
+                "cannot activate a non-published generation after a release "
+                "sequence floor was established"
             )
         try:
             identity = ReleaseIdentity.from_dict(release)
@@ -266,21 +260,52 @@ class GenerationStore:
             raise GenerationError(
                 "cannot activate an invalid release identity"
             ) from exc
-        if not self._publisher_authenticated(identity):
+        if not self._authoritative_release(identity):
             raise GenerationError(
-                "cannot activate an unauthenticated generation after a signed "
-                "release sequence floor was established"
+                "cannot activate a non-published generation after a release "
+                "sequence floor was established"
             )
-        if identity.sequence < int(floor["sequence"]):
+        candidate = release_floor_from_identity(
+            identity,
+            recorded_at=time.time(),
+        )
+        try:
+            order = compare_release_floors(candidate, floor)
+        except ReleaseVerificationError as exc:
+            raise GenerationError(str(exc)) from exc
+        if order < 0:
             raise GenerationError(
-                "cannot activate a release below the signed sequence floor"
+                "cannot activate a release below the published version floor"
             )
-        if (
-            identity.sequence == int(floor["sequence"])
-            and identity.tree_sha256 != floor["tree_sha256"]
-        ):
+
+    def validate_release_candidate(
+        self,
+        identity: ReleaseIdentity,
+        *,
+        current: dict[str, Any] | None = None,
+    ) -> None:
+        """Fail unless ``identity`` is at or above the durable floor."""
+
+        floor = self.release_floor(current)
+        if floor is None:
+            return
+        if not self._authoritative_release(identity):
             raise GenerationError(
-                "release sequence was reused for different immutable content"
+                "refusing a non-published release after an authoritative "
+                "version floor has been established"
+            )
+        candidate = release_floor_from_identity(
+            identity,
+            recorded_at=time.time(),
+        )
+        try:
+            order = compare_release_floors(candidate, floor)
+        except ReleaseVerificationError as exc:
+            raise GenerationError(str(exc)) from exc
+        if order < 0:
+            raise GenerationError(
+                "candidate is older than the highest published release "
+                "previously accepted"
             )
 
     def validate(self, value: dict[str, Any]) -> None:
@@ -445,11 +470,13 @@ class GenerationStore:
         with self._release_floor_lock():
             previous = self.current() if previous is None else previous
             self.validate(previous)
+            # Enrich a sequence-only legacy floor from the exact active
+            # generation before comparing it with a Git-version floor.
+            self._record_release_floor_unlocked(previous.get("release"))
             self._enforce_release_floor(
                 value.get("release"),
                 allow_release_rollback=allow_release_rollback,
             )
-            self._record_release_floor_unlocked(previous.get("release"))
             self._record_release_floor_unlocked(value.get("release"))
             if not self._managed():
                 atomic_write_json(

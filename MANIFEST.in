@@ -4,7 +4,7 @@ include pyproject.toml
 include uv.lock
 include .github/workflows/publish-runtime.yml
 recursive-include docker/runtime *
-recursive-include silicon_cli *.json *.py
+recursive-include silicon_cli *.py
 recursive-include tests *.py
 global-exclude *.py[cod]
 global-exclude __pycache__

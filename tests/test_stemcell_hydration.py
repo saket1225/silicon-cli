@@ -86,7 +86,8 @@ class SignedHydrationTests(unittest.TestCase):
             marker.unlink()
 
             with self.assertRaisesRegex(
-                Exception, "signed sequence floor|recorded before the crash"
+                Exception,
+                "published (?:sequence|version) floor|recorded before the crash",
             ):
                 stemcell._install_initial_generation(
                     target, release_b, install_deps=False
@@ -213,8 +214,9 @@ class SignedHydrationTests(unittest.TestCase):
                     )
 
                 fetch.assert_called_once()
-                self.assertFalse(
-                    fetch.call_args.kwargs["allow_unsigned_git"]
+                self.assertNotIn(
+                    "allow_unsigned_git",
+                    fetch.call_args.kwargs,
                 )
                 prepare_environment.assert_called_once()
                 bind_runtime.assert_not_called()

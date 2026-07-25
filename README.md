@@ -66,7 +66,8 @@ silicon help                 Show help
 `silicon-browser`, `silicon-extend`, `silicon-interface`, `claude`, or
 `codex`. Shared pip/npm copies update once on the host. Local instance copies
 update only across a safe stop boundary, and Docker copies move through the
-signed runtime release instead of being modified inside a running container.
+published, digest-pinned runtime instead of being modified inside a running
+container.
 Glass uses the JSON form of these commands to provide team-scoped inventory
 and durable update jobs.
 
@@ -76,10 +77,7 @@ and durable update jobs.
 | --- | --- | --- |
 | `SILICON_HOME` | `~/.silicon` | registry + CLI state |
 | `GLASS_SERVER_URL` | `https://glass.teamofsilicons.com` | Glass sync server (pull/push) |
-| `SILICON_RELEASE_MANIFEST_URL` | `<GLASS_SERVER_URL>/api/v1/silicon-release/latest.json` | signed schema-1 release manifest |
-| `SILICON_RELEASE_TRUSTED_KEYS` | packaged production keys | JSON map of key id to base64 raw Ed25519 public key; additive for self-hosting/key rotation |
-| `SILICON_UPDATE_ALLOW_UNSIGNED_GIT` | *(empty)* | explicit compatibility opt-in; select exact-revision Git instead of the signed channel |
-| `SILICON_STEMCELL_REPO` | `teamofsilicons/silicon-stemcell` | base for `new` |
+| `SILICON_STEMCELL_REPO` | `teamofsilicons/silicon-stemcell` | GitHub repository used by `new`, `pull`, and `update` |
 | `SILICON_PYTHON` | `python3` | interpreter used to run a silicon's `main.py` |
 | `SILICON_INTERFACE_CLI_PACKAGE` | `@teamofsilicons/silicon-interface-cli` | npm package used to install the Silicon Interface CLI |
 | `SILICON_INTERFACE_CLI_TARBALL` | versioned npm tarball | fallback package URL if registry metadata is briefly unavailable |
@@ -87,7 +85,7 @@ and durable update jobs.
 | `SILICON_INTERFACE_CLI_SKIP` | *(empty)* | set to `1` to skip interface CLI setup |
 | `SILICON_INTERFACE_DAEMON_SKIP` | *(empty)* | set to `1` to install the CLI without starting its listener daemon |
 | `SILICON_RUNTIME` | *(empty)* | default pull uses Docker; set to `local` to opt out |
-| `SILICON_RUNTIME_IMAGE` | signed release manifest | bootstrap-only exact digest when no runtime digest is persisted; it cannot retarget an installed release |
+| `SILICON_RUNTIME_IMAGE` | published Stemcell tag metadata | bootstrap-only exact digest when no runtime digest is persisted; it cannot retarget an installed release |
 | `SILICON_DOCKER_ROOT` | `~/silicons` | Docker-backed instance root |
 | `SILICON_DOCKER_COMPOSE` | `<root>/compose.yml` | generated Compose file path |
 | `SILICON_DOCKER_SHARED_HOME` | `<root>/.shared-home` | VM-wide Claude/Codex auth home mounted into every container |
@@ -114,14 +112,15 @@ documented by Docker. The CLI never downloads or executes `get.docker.com` (or
 any other mutable installer) as root.
 
 `silicon pull` first checks Docker and Compose without selecting an image. It
-then verifies the signed Silicon release manifest, reads the exact
-`registry/repository@sha256:<digest>` runtime identity covered by that signature,
-pulls it, and verifies Docker reports that same repository digest before any
-instance or credential is created. The digest is persisted on each instance and
-generation; updates switch it only at activation, and rollback restores the
-prior generation's digest. A cached image is reusable only when that exact
-digest verifies. Pull completes only after each active Docker Silicon exposes
-the pinned Silicon Extend package and its `silicon-extend` command.
+then resolves the highest published stable Stemcell Git tag, verifies that
+tag's exact object, commit, version, files, and tree, and reads its exact
+`registry/repository@sha256:<digest>` runtime identity. It pulls the image and
+verifies Docker reports that same repository digest before any instance or
+credential is created. The digest is persisted on each instance and generation;
+updates switch it only at activation, and rollback restores the prior
+generation's digest. A cached image is reusable only when that exact digest
+verifies. Pull completes only after each active Docker Silicon exposes the
+pinned Silicon Extend package and its `silicon-extend` command.
 
 ```bash
 pip install silicon-cli
@@ -160,7 +159,7 @@ silicon codex --version
 The runtime image contains the complete Silicon runtime contract: Silicon CLI,
 Silicon Browser, Silicon Extend, Silicon Interface CLI, Claude Code, Codex,
 Node 22+, Python tooling, and Git. `silicon pull` verifies every command,
-minimum supported version, and the Python dependency graph in the exact signed
+minimum supported version, and the Python dependency graph in the exact pinned
 image digest before it asks Glass to claim or register a Silicon. Immutable
 releases use the updater's pre-staged, hash-locked dependency environment. Only
 a legacy flat installation falls back to creating `/silicon/.venv` from its
@@ -198,8 +197,8 @@ silicon docker compose
 ```
 
 Build and publish the runtime image from this repo, then record the registry's
-immutable digest in Glass as `SILICON_RELEASE_RUNTIME_IMAGE` before publishing
-the matching Stemcell release:
+immutable digest as `runtime_image` in the Stemcell's `silicon.info` before
+creating and pushing the matching stable Git tag:
 
 ```bash
 docker build -f docker/runtime/Dockerfile -t ghcr.io/teamofsilicons/silicon-runtime:<version> .
@@ -326,7 +325,7 @@ Before stopping anything, the updater verifies a canonical recovery snapshot.
 It records the exact services that were running, atomically switches the active
 generation, restores that service state, and requires stable health checks
 before committing. A failure after the stop boundary automatically reactivates
-an authenticated reconstruction of the prior generation rather than trusting a
+a verified reconstruction of the prior generation rather than trusting a
 writable dormant directory. The mutable data root, memory, credentials,
 conversations, and local customization overlay are kept outside immutable
 release generations.
@@ -348,46 +347,28 @@ Cancellation is accepted only before the service-stop boundary. `resume`
 finishes or safely recovers an interrupted update according to its fsynced
 journal; it never guesses from a partially copied directory. Retention keeps
 the active, prior-known-good, and every nonterminal transaction generation even
-when old unreferenced generations are pruned. A durable highest-accepted signed
-release sequence remains in force even after an explicit runtime rollback.
+when old unreferenced generations are pruned. A durable highest-accepted
+published-version floor remains in force even after an explicit runtime
+rollback.
 
-The default release channel accepts only an expiry-checked HTTPS manifest with
-at least one valid Ed25519 signature from a pinned public key. The manifest pins
-the exact content-addressed artifact and every extracted file; candidate code is
-never executed to perform or validate the update. Key rotation is additive:
-ship a new `key_id` and raw 32-byte public key in the CLI keyring before Glass
-begins signing with it, retain the old public key through the supported-client
-window, then remove it in a later CLI release. A self-hosted public-only keyring
-uses this operator-ready format:
+Git is the sole source of truth for normal Stemcell releases. The updater lists
+the canonical repository's tags, considers only exact stable
+`vMAJOR.MINOR.PATCH` tags, and numerically selects the highest version. It never
+uses `main`, timestamps, prereleases, GitHub's separate “latest release” object,
+or an older fallback tag.
 
-```bash
-export SILICON_RELEASE_TRUSTED_KEYS='{"release-2026-01":"<base64 of the raw 32-byte Ed25519 public key>"}'
-```
+The selected tag is pinned to both its advertised tag object and peeled commit.
+The updater fetches that exact ref, detects a tag that moves during the fetch,
+requires `silicon.info.version` to match the tag, requires an immutable runtime
+digest, and seals the downloaded tree into a deterministic SHA-256-verified
+artifact. Candidate Stemcell code is never executed by the updater. A durable
+SemVer floor rejects downgrades and detects a rewritten tag that reuses an
+accepted version with different content.
 
-The matching private key belongs only in Glass's secret store as
-`SILICON_RELEASE_SIGNING_PRIVATE_KEY`; it must never be placed in this CLI,
-an instance directory, or the JSON above. Until the production key is securely
-provisioned and its public half is packaged, signed updates fail closed.
-
-Production release-key handoff is deliberately explicit:
-
-1. Generate the Ed25519 keypair offline or in an HSM.
-2. Put only the standard-base64 raw 32-byte public key, under a stable key ID,
-   in `silicon_cli/release_trust_anchors.json`.
-3. Run
-   `python -m silicon_cli.updater.signatures --check-packaged`; a clean source
-   tree intentionally fails this gate until a real production anchor exists.
-4. Build and publish the wheel, then configure Glass's release signer with the
-   matching private key from its secret store/HSM.
-5. For rotation, ship and deploy the new public anchor before Glass uses it,
-   and retain the previous anchor until every supported CLI has crossed the
-   overlap window.
-
-For a deliberate compatibility operation,
-`--allow-unsigned-git` (or `SILICON_UPDATE_ALLOW_UNSIGNED_GIT=1`) selects the
-exact-revision Git source. It is never an automatic downgrade. That mode pins a
-single commit and verifies the downloaded tree and archive by SHA-256, but it
-cannot authenticate the publisher and always emits a warning.
+Published stable tags are immutable release records: protect the `v*` tag
+namespace in GitHub and never force-push, move, or reuse one. Build the final
+runtime first, commit its digest and matching version in `silicon.info`, and
+only then create and push the tag.
 
 ## Implementation notes
 

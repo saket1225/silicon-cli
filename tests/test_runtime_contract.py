@@ -45,7 +45,7 @@ class RuntimeContractTests(unittest.TestCase):
         )
         payload = {
             "failures": [],
-            "versions": {"silicon-cli": "1.0.21", "node": "v22.0.0"},
+            "versions": {"silicon-cli": "1.0.22", "node": "v22.0.0"},
         }
         with mock.patch.object(
             docker_runtime,
@@ -69,7 +69,7 @@ class RuntimeContractTests(unittest.TestCase):
         )
         self.assertIn(image, command)
         self.assertIn(runtime_contract.DOCKER_PROBE_SCRIPT, command)
-        self.assertEqual(versions["silicon-cli"], "1.0.21")
+        self.assertEqual(versions["silicon-cli"], "1.0.22")
 
     def test_docker_runtime_probe_fails_closed_on_outdated_dependency(self):
         image = (

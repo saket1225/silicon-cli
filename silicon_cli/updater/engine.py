@@ -31,7 +31,10 @@ from .lock import InstanceLock
 from .overlay import OverlayStore
 from .planner import UpdatePlan, apply_plan, build_plan
 from .policy import RUNTIME_EXACT, RUNTIME_PREFIXES
-from .release import FetchedRelease, create_artifact
+from .release import (
+    FetchedRelease,
+    create_artifact,
+)
 from .retention import RetentionManager
 
 
@@ -219,35 +222,13 @@ class TransactionalUpdater:
     def _validate_release_sequence(
         self, current: dict[str, Any], release: FetchedRelease
     ) -> None:
-        floor = self.generations.release_floor(current)
-        if floor is None:
-            return
-        candidate = release.manifest.identity
-        if (
-            candidate.trust != "signed-ed25519"
-            or candidate.source != "glass"
-            or candidate.sequence <= 0
-        ):
-            raise UpdateError(
-                "refusing an unauthenticated release after a signed release "
-                "sequence floor has been established"
+        try:
+            self.generations.validate_release_candidate(
+                release.manifest.identity,
+                current=current,
             )
-        current_sequence = int(floor["sequence"])
-        candidate_sequence = candidate.sequence
-        if current_sequence and candidate_sequence < current_sequence:
-            raise UpdateError(
-                "refusing release rollback: candidate sequence is older "
-                "than the highest signed release previously accepted"
-            )
-        if (
-            current_sequence
-            and candidate_sequence == current_sequence
-            and floor.get("tree_sha256")
-            != release.manifest.identity.tree_sha256
-        ):
-            raise UpdateError(
-                "release sequence was reused for different immutable content"
-            )
+        except GenerationError as exc:
+            raise UpdateError(str(exc)) from exc
 
     def _finish_before_stop(
         self,
@@ -1282,7 +1263,7 @@ class TransactionalUpdater:
             generation.get("runtime_image") or ""
         ):
             raise UpdateError(
-                "generation runtime image disagrees with the signed release"
+                "generation runtime image disagrees with the published release"
             )
         shutil.rmtree(destination, ignore_errors=True)
         self.cache.materialize(release, destination)

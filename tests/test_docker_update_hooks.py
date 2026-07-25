@@ -339,7 +339,12 @@ class DockerUpdateHookTests(unittest.TestCase):
             mock.patch.object(
                 update.docker_runtime,
                 "prepare_release_image",
+                return_value={"image": release.manifest.runtime_image},
             ),
+            mock.patch.object(
+                update.docker_runtime,
+                "verify_runtime_contract",
+            ) as verify_runtime,
             mock.patch.object(update, "_hooks", return_value=EngineHooks()),
             mock.patch.object(
                 update, "TransactionalUpdater", side_effect=updater_for
@@ -348,7 +353,7 @@ class DockerUpdateHookTests(unittest.TestCase):
             mock.patch.object(update.ui, "success"),
             mock.patch.object(update.docker_runtime, "run_silicon") as delegated,
         ):
-            update.update_instance("group", allow_unsigned_git=True)
+            update.update_instance("group")
 
         self.assertEqual(
             events,
@@ -359,7 +364,11 @@ class DockerUpdateHookTests(unittest.TestCase):
                 "run:ada",
             ],
         )
-        fetch.assert_called_once_with(cache, allow_unsigned_git=True)
+        verify_runtime.assert_called_once_with(
+            {"image": release.manifest.runtime_image},
+            release.manifest.runtime_image,
+        )
+        fetch.assert_called_once_with(cache)
         delegated.assert_not_called()
         expected_roots = [Path(local.path), Path(self.install.path)]
         for call in updater_class.call_args_list:
@@ -403,6 +412,11 @@ class DockerUpdateHookTests(unittest.TestCase):
             mock.patch.object(
                 update.docker_runtime,
                 "prepare_release_image",
+                return_value={"image": release.manifest.runtime_image},
+            ),
+            mock.patch.object(
+                update.docker_runtime,
+                "verify_runtime_contract",
             ),
             mock.patch.object(update, "_hooks", return_value=EngineHooks()),
             mock.patch.object(

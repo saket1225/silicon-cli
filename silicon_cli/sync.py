@@ -1339,7 +1339,7 @@ def _prepare_runtime_for_release(prepared, *, use_docker: bool) -> tuple[Path, s
     runtime_image = str(prepared.release.manifest.runtime_image or "")
     if not runtime_image:
         raise RuntimeError(
-            "the authenticated Silicon release has no digest-pinned runtime image"
+            "the published Silicon release has no digest-pinned runtime image"
         )
     config = docker_runtime.ensure_ready(
         auto_init=True,

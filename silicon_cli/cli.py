@@ -293,7 +293,6 @@ def cmd_help() -> None:
   silicon backup [name] [now|stop|status] Alias for silicon push
   silicon update <target>     Stage, drain, checkpoint, update, validate, and restart
   silicon update --dry-run <target>  Show the exact merge/update plan
-  silicon update --allow-unsigned-git <target>  Explicit compatibility source
   silicon update status [name]       Show generation and transaction state
   silicon update cancel [name]       Cancel an update before its stop boundary
   silicon update resume [name]       Resume an interrupted transaction

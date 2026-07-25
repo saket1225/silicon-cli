@@ -128,8 +128,8 @@ def _require_runtime_image(image: object, *, context: str) -> str:
         )
         return value
     raise RuntimeError(
-        f"{context} has no signed, immutable runtime image. Fetch a signed "
-        "Silicon release first; the image must be "
+        f"{context} has no published, immutable runtime image. Fetch a "
+        "published Silicon release first; the image must be "
         "registry/repository@sha256:<digest>. Mutable tags such as :latest "
         f"are refused. Set {UNPINNED_IMAGE_OPT_IN}=1 only for isolated local "
         "development."
@@ -240,8 +240,8 @@ def init(
             ui.info(f"Runtime image: {chosen_image}")
         else:
             ui.info(
-                "Runtime image: awaiting the digest from the signed Silicon "
-                "release channel"
+                "Runtime image: awaiting the digest committed to the "
+                "published Stemcell tag"
             )
         if docker_sudo:
             ui.info("Docker commands will run through sudo for this runtime.")
@@ -508,7 +508,7 @@ def _ensure_image(config: dict, *, refresh: bool = False) -> None:
             ui.info("Using the existing local-development image.")
         return
     raise RuntimeError(
-        f"Could not pull and verify the signed Docker image: {image}. "
+        f"Could not pull and verify the pinned Docker image: {image}. "
         "Authenticate to its registry if it is private, then retry."
     )
 
@@ -566,13 +566,13 @@ def ensure_ready(
 
 
 def prepare_release_image(image: str) -> dict:
-    """Pull and verify a signed image without changing active runtime state."""
+    """Pull and verify a published image without changing active runtime state."""
 
     pinned = str(image or "").strip()
     if not runtime_image_is_pinned(pinned):
         raise RuntimeError(
-            "Docker releases require a signed immutable runtime image digest; "
-            "unsigned Git releases cannot select a Docker runtime"
+            "Docker releases require the immutable runtime image digest "
+            "committed in the published Stemcell Git tag"
         )
     cfg = {**load_config(required=True), "image": pinned}
     _ensure_image(cfg)
@@ -629,7 +629,7 @@ def inspect_runtime_contract(config: dict, image: str) -> dict:
 
 
 def verify_runtime_contract(config: dict, image: str) -> dict[str, str]:
-    """Prove the signed image contains the complete supported toolchain."""
+    """Prove the pinned image contains the complete supported toolchain."""
 
     selected = _require_runtime_image(
         image,
@@ -643,19 +643,19 @@ def verify_runtime_contract(config: dict, image: str) -> dict[str, str]:
         else:
             detail = "the runtime probe failed without structured diagnostics"
         raise RuntimeError(
-            "the signed Silicon runtime image is missing or has outdated "
+            "the published Silicon runtime image is missing or has outdated "
             f"required dependencies: {detail}. Publish a fresh runtime image "
             "containing Silicon CLI, Silicon Browser, Silicon Extend, Silicon "
             "Interface CLI, Claude Code, Codex, Node 22+, Python, and Git; "
-            "then publish that digest in the signed Silicon release."
+            "then commit that digest in the published Stemcell tag."
         )
     versions = payload.get("versions")
     if not isinstance(versions, dict):
         raise RuntimeError(
-            "the signed Silicon runtime dependency probe returned no version "
+            "the published Silicon runtime dependency probe returned no version "
             "inventory"
         )
-    ui.success("Verified the complete signed Silicon runtime toolchain.")
+    ui.success("Verified the complete published Silicon runtime toolchain.")
     return {
         str(name): str(version)
         for name, version in versions.items()
@@ -668,7 +668,7 @@ def bind_release_runtime(
     installs: Iterable[registry.Install] = (),
     pull: bool = True,
 ) -> dict:
-    """Verify and persist the exact image authenticated by a release.
+    """Verify and persist the exact image committed by a release.
 
     The image is pulled and content-address verified before either config or
     registry metadata changes. With no selected install this establishes the
@@ -686,8 +686,8 @@ def bind_release_runtime(
     else:
         if not runtime_image_is_pinned(pinned):
             raise RuntimeError(
-                "Docker releases require a signed immutable runtime image "
-                "digest"
+                "Docker releases require the immutable runtime image digest "
+                "committed in the published Stemcell Git tag"
             )
         candidate = {
             **load_config(required=True),
@@ -727,7 +727,7 @@ def bind_release_runtime(
 
 
 def active_generation_runtime_image(inst: registry.Install) -> str:
-    """Return the signed image bound to the selected code generation."""
+    """Return the pinned image bound to the selected code generation."""
 
     from .updater.generation import GenerationError, GenerationStore
 
@@ -947,10 +947,9 @@ def ensure_pull_runtime() -> bool:
     if runtime_opted_out():
         ui.info("SILICON_RUNTIME is set to local/host; pulling without Docker runtime.")
         return False
-    # At this point no authenticated release has been fetched yet, so there is
+    # At this point no published Stemcell tag has been fetched yet, so there is
     # deliberately no image to pull. ``stemcell.prepare_hydration`` binds the
-    # digest from the verified signed manifest before any target or secret is
-    # written.
+    # digest committed to that exact tag before any target or secret is written.
     ensure_ready(
         auto_init=True,
         install=True,
@@ -1469,7 +1468,7 @@ if (
         raise RuntimeError(
             f"Docker Silicon '{inst.name}' does not have the required "
             f"Silicon Extend {SILICON_EXTEND_VERSION} runtime. Ensure the "
-            "signed runtime image and Stemcell requirements lock include it, "
+            "published runtime image and Stemcell requirements lock include it, "
             "then rerun the same pull."
         )
 
@@ -1488,7 +1487,7 @@ def prepare_environment(
     if not lockfile.is_file():
         if requirements.is_file():
             raise RuntimeError(
-                "signed Docker release has requirements.txt but no "
+                "published Docker release has requirements.txt but no "
                 "hash-pinned requirements.lock"
             )
         return None
@@ -1954,7 +1953,7 @@ def cmd_docker(args: list[str]) -> None:
             render_compose(cfg)
         else:
             ui.info(
-                "Docker prerequisites are ready. The next signed `silicon "
+                "Docker prerequisites are ready. The next published `silicon "
                 "pull` binds and pulls its immutable runtime image digest."
             )
         return

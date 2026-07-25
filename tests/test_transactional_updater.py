@@ -31,6 +31,7 @@ from silicon_cli.updater.maintenance import MaintenanceProtocol
 from silicon_cli.updater.overlay import OverlayStore
 from silicon_cli.updater.planner import apply_plan, build_plan, seed_legacy_snapshot
 from silicon_cli.updater.release import (
+    PUBLISHED_GIT_TRUST,
     ReleaseVerificationError,
     create_artifact,
     safe_extract,
@@ -1409,7 +1410,7 @@ class TransactionTests(unittest.TestCase):
             Fixture._write(old_source, "core/tool.py", "VALUE = 'old'\n")
             old = sequenced(old_source, 19, "v19")
             with self.assertRaisesRegex(
-                UpdateError, "highest signed release previously accepted"
+                UpdateError, "highest published release previously accepted"
             ):
                 updater.run(old)
             floor = json.loads(
@@ -1420,6 +1421,250 @@ class TransactionTests(unittest.TestCase):
                 ).read_text(encoding="utf-8")
             )
             self.assertEqual(floor["sequence"], 20)
+
+    def test_published_git_floor_rejects_downgrade_and_rewritten_tag(self):
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = Fixture(Path(raw))
+
+            def published(
+                source: Path,
+                *,
+                version: str,
+                sequence: int,
+                revision: str,
+                tag_object: str,
+                artifact_name: str,
+            ):
+                return create_artifact(
+                    source,
+                    fixture.root / artifact_name,
+                    revision=revision,
+                    source_label=(
+                        "git+https://github.com/teamofsilicons/"
+                        "silicon-stemcell.git@refs/tags/"
+                        f"v{version}#{tag_object}"
+                    ),
+                    trust=PUBLISHED_GIT_TRUST,
+                    version=version,
+                    sequence=sequence,
+                    runtime_image=(
+                        "registry.example/silicon@sha256:" + "1" * 64
+                    ),
+                )
+
+            high_source = fixture.root / "git-high"
+            shutil.copytree(fixture.new, high_source)
+            high = published(
+                high_source,
+                version="2.0.0",
+                sequence=2_000_001,
+                revision="a" * 40,
+                tag_object="b" * 40,
+                artifact_name="git-high.tar",
+            )
+            updater = TransactionalUpdater(
+                fixture.instance,
+                fixture.cache,
+                hooks=fixture.hooks(),
+            )
+            updater.run(high)
+            updater.rollback()
+
+            old_source = fixture.root / "git-old"
+            shutil.copytree(fixture.new, old_source)
+            Fixture._write(old_source, "core/tool.py", "VALUE = 'older'\n")
+            old = published(
+                old_source,
+                version="1.9.0",
+                sequence=1_009_001,
+                revision="c" * 40,
+                tag_object="d" * 40,
+                artifact_name="git-old.tar",
+            )
+            with self.assertRaisesRegex(
+                UpdateError,
+                "highest published release previously accepted",
+            ):
+                updater.run(old)
+
+            rewritten_source = fixture.root / "git-rewritten"
+            shutil.copytree(fixture.new, rewritten_source)
+            Fixture._write(
+                rewritten_source,
+                "core/tool.py",
+                "VALUE = 'rewritten'\n",
+            )
+            rewritten = published(
+                rewritten_source,
+                version="2.0.0",
+                sequence=2_000_001,
+                revision="e" * 40,
+                tag_object="f" * 40,
+                artifact_name="git-rewritten.tar",
+            )
+            with self.assertRaisesRegex(
+                UpdateError,
+                "reused for different immutable content",
+            ):
+                updater.run(rewritten)
+
+    def test_legacy_floor_migrates_by_version_and_never_allows_git_downgrade(self):
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = Fixture(Path(raw))
+            signed_source = fixture.root / "signed-v2"
+            shutil.copytree(fixture.new, signed_source)
+            (signed_source / "silicon-release.json").write_text(
+                json.dumps(
+                    {
+                        "identity": {
+                            "version": "2.0.0",
+                            "sequence": 1,
+                            "tree_sha256": "",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            signed = create_artifact(
+                signed_source,
+                fixture.root / "signed-v2.tar",
+                revision="a" * 64,
+                source_label="glass",
+                trust="signed-ed25519",
+                runtime_image=(
+                    "registry.example/silicon@sha256:" + "1" * 64
+                ),
+            )
+            updater = TransactionalUpdater(
+                fixture.instance,
+                fixture.cache,
+                hooks=fixture.hooks(),
+            )
+            updater.run(signed)
+
+            # Model an installation whose durable floor predates schema 2.
+            floor_path = (
+                fixture.instance
+                / ".silicon"
+                / "release-sequence-floor.json"
+            )
+            floor_path.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "sequence": 1,
+                        "tree_sha256": signed.manifest.identity.tree_sha256,
+                        "recorded_at": 1.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            git_source = fixture.root / "git-v1"
+            shutil.copytree(fixture.new, git_source)
+            Fixture._write(git_source, "core/tool.py", "VALUE = 'older'\n")
+            git_release = create_artifact(
+                git_source,
+                fixture.root / "git-v1.tar",
+                revision="b" * 40,
+                source_label=(
+                    "git+https://github.com/teamofsilicons/"
+                    "silicon-stemcell.git@refs/tags/v1.9.0#"
+                    + "c" * 40
+                ),
+                trust=PUBLISHED_GIT_TRUST,
+                version="1.9.0",
+                sequence=1_009_001,
+                runtime_image=(
+                    "registry.example/silicon@sha256:" + "1" * 64
+                ),
+            )
+            with self.assertRaisesRegex(
+                UpdateError,
+                "older than the highest published release",
+            ):
+                updater.run(git_release)
+
+    def test_newer_git_version_replaces_legacy_floor_namespace(self):
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = Fixture(Path(raw))
+            signed_source = fixture.root / "signed-v1"
+            shutil.copytree(fixture.new, signed_source)
+            (signed_source / "silicon-release.json").write_text(
+                json.dumps(
+                    {
+                        "identity": {
+                            "version": "1.9.0",
+                            "sequence": 99,
+                            "tree_sha256": "",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            signed = create_artifact(
+                signed_source,
+                fixture.root / "signed-v1.tar",
+                revision="d" * 64,
+                source_label="glass",
+                trust="signed-ed25519",
+                runtime_image=(
+                    "registry.example/silicon@sha256:" + "2" * 64
+                ),
+            )
+            updater = TransactionalUpdater(
+                fixture.instance,
+                fixture.cache,
+                hooks=fixture.hooks(),
+            )
+            updater.run(signed)
+            (
+                fixture.instance
+                / ".silicon"
+                / "release-sequence-floor.json"
+            ).write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "sequence": 99,
+                        "tree_sha256": signed.manifest.identity.tree_sha256,
+                        "recorded_at": 1.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            git_source = fixture.root / "git-v2"
+            shutil.copytree(fixture.new, git_source)
+            Fixture._write(git_source, "core/tool.py", "VALUE = 'newer'\n")
+            git_release = create_artifact(
+                git_source,
+                fixture.root / "git-v2.tar",
+                revision="e" * 40,
+                source_label=(
+                    "git+https://github.com/teamofsilicons/"
+                    "silicon-stemcell.git@refs/tags/v2.0.0#"
+                    + "f" * 40
+                ),
+                trust=PUBLISHED_GIT_TRUST,
+                version="2.0.0",
+                sequence=2_000_001,
+                runtime_image=(
+                    "registry.example/silicon@sha256:" + "2" * 64
+                ),
+            )
+            updater.run(git_release)
+
+            floor = json.loads(
+                (
+                    fixture.instance
+                    / ".silicon"
+                    / "release-sequence-floor.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(floor["schema"], 2)
+            self.assertEqual(floor["version"], "2.0.0")
+            self.assertEqual(floor["trust"], PUBLISHED_GIT_TRUST)
 
     def test_unsigned_sequence_cannot_poison_signed_release_floor(self):
         with tempfile.TemporaryDirectory() as raw:
