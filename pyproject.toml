@@ -1,21 +1,26 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools==83.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "silicon-cli"
-version = "1.0.19"
+version = "1.0.20"
 description = "Silicon CLI — create, run, and manage your silicon instances."
 readme = "README.md"
 requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Saket" }]
 keywords = ["silicon", "cli", "agents"]
 classifiers = [
   "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
 ]
-dependencies = ["certifi>=2024.2.2"]
+dependencies = [
+  "certifi>=2024.2.2",
+  "cryptography>=46.0",
+  "silicon-extend==0.1.1",
+]
 
 [project.urls]
 Homepage = "https://github.com/teamofsilicons/silicon-cli"
@@ -24,5 +29,8 @@ Repository = "https://github.com/teamofsilicons/silicon-cli"
 [project.scripts]
 silicon = "silicon_cli.cli:main"
 
-[tool.setuptools]
-packages = ["silicon_cli"]
+[tool.setuptools.packages.find]
+include = ["silicon_cli*"]
+
+[tool.setuptools.package-data]
+silicon_cli = ["release_trust_anchors.json"]

@@ -12,44 +12,125 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 from . import interface_cli, registry, ui
-from .config import STEMCELL_GIT_URL, STEMCELL_ZIP_URL, base_python_cmd, python_run_cmd, venv_python
+from .config import REGISTRY_DIR, SILICON_UPDATE_ALLOW_UNSIGNED_GIT
+from .updater.cache import ReleaseCache
+from .updater.channel import fetch_latest_release
+from .updater.generation import GenerationStore, ManagedPointerMissing
+from .updater.io import fsync_dir, hash_tree
+from .updater.overlay import OverlayStore
+from .updater.release import FetchedRelease
 
 SKIP_NAMES = {".git", "__pycache__", ".DS_Store"}
 PRESERVE_ROOT = {"env.py", "silicon.json", ".glass.json"}
 ALLOWED_PROVIDERS = {"claude", "codex", "chatgpt"}
+DATA_ROOT_CAPABILITY = ".silicon-data-root-v1"
+DATA_SEED_ROOT_FILES = ("silicon.json", "env.py", ".backupsilicon")
+DATA_SEED_DIRECTORIES = (
+    "core/cron",
+    "core/interface_state",
+    "logs",
+    "prompts/advertising",
+    "prompts/memory/carbons",
+    "prompts/memory/projects",
+    "prompts/memory/silicons",
+    "sessions",
+    "worker/outputs",
+)
+LEGACY_FLAT_MARKERS = ("main.py", "manager.py", "glass_agent.py")
 
 
-def download_stemcell(target: str) -> None:
-    shutil.rmtree(target, ignore_errors=True)
-    os.makedirs(target, exist_ok=True)
-    if shutil.which("git"):
-        subprocess.run(["git", "clone", "--depth", "1", STEMCELL_GIT_URL, target],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        shutil.rmtree(Path(target) / ".git", ignore_errors=True)
-        return
-    # Fallback: download the zip
-    dl = shutil.which("curl") or shutil.which("wget")
-    if not dl:
-        ui.error("Need git, curl, or wget to download Silicon.")
-        sys.exit(1)
-    tmp_zip = tempfile.mktemp(suffix=".zip", prefix="silicon-")
-    if "curl" in dl:
-        subprocess.run([dl, "-fsSL", STEMCELL_ZIP_URL, "-o", tmp_zip], check=True)
+@dataclass(frozen=True)
+class PreparedStemcell:
+    """One verified release shared by every Silicon in a pull operation."""
+
+    cache: ReleaseCache
+    release: FetchedRelease
+    source: Path
+    environment: Path | None
+
+
+@contextmanager
+def prepare_hydration(
+    *,
+    install_deps: bool = True,
+    allow_unsigned_git: bool | None = None,
+    expected_tree_sha256: str | None = None,
+    bind_docker_runtime: bool = False,
+) -> Iterator[PreparedStemcell]:
+    """Fetch, verify, materialize, and prepare a Stemcell exactly once.
+
+    The yielded source is read-only input for one or many calls to
+    :func:`hydrate`.  No candidate code is imported or executed.  Dependency
+    preparation consumes only the authenticated hash-pinned lockfile.
+    """
+
+    cache = ReleaseCache(REGISTRY_DIR / "cache")
+    if expected_tree_sha256:
+        ui.info("Loading the authenticated Silicon release for pull recovery...")
+        release = cache.load(expected_tree_sha256)
     else:
-        subprocess.run([dl, "-q", STEMCELL_ZIP_URL, "-O", tmp_zip], check=True)
-    subprocess.run(["unzip", "-q", tmp_zip, "-d", target], check=True)
-    os.unlink(tmp_zip)
-    extracted = [p for p in Path(target).iterdir() if p.is_dir() and p.name.startswith("silicon-")]
-    if extracted:
-        inner = extracted[0]
-        for item in inner.iterdir():
-            shutil.move(str(item), str(Path(target) / item.name))
-        shutil.rmtree(inner, ignore_errors=True)
+        release = fetch_latest_release(
+            cache,
+            allow_unsigned_git=(
+                SILICON_UPDATE_ALLOW_UNSIGNED_GIT
+                if allow_unsigned_git is None
+                else allow_unsigned_git
+            ),
+            info=ui.info,
+            warn=ui.warn,
+        )
+    # Runtime binding is caller-scoped. A local hydration must never inherit
+    # an unrelated Docker setting from the operator's ambient CLI home.
+    if bind_docker_runtime:
+        from . import docker_runtime
+
+        if not docker_runtime.enabled():
+            raise RuntimeError(
+                "Docker hydration requested before the Docker runtime was "
+                "initialized"
+            )
+        docker_config = docker_runtime.bind_release_runtime(
+            release.manifest.runtime_image
+        )
+        docker_runtime.maybe_prompt_login(docker_config)
+    temporary = Path(tempfile.mkdtemp(prefix="silicon-hydration-release-"))
+    try:
+        source = temporary / "source"
+        cache.materialize(release, source)
+        if not (source / "main.py").is_file():
+            raise RuntimeError("verified Silicon release has no main.py")
+        if not (source / DATA_ROOT_CAPABILITY).is_file():
+            raise RuntimeError(
+                "verified Silicon release does not support a separate durable "
+                "data root"
+            )
+        if (
+            (source / "requirements.txt").is_file()
+            and not (source / "requirements.lock").is_file()
+        ):
+            raise RuntimeError(
+                "verified Silicon release has requirements.txt but no "
+                "hash-pinned requirements.lock"
+            )
+        environment = None
+        if install_deps:
+            ui.info("Preparing one shared, hash-pinned Python environment...")
+            environment = cache.prepare_environment(
+                source,
+                runner=lambda command: subprocess.run(
+                    command, check=False
+                ).returncode,
+            )
+        yield PreparedStemcell(cache, release, source, environment)
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
 
 
 def _env_value(env_path: Path, key: str) -> str:
@@ -90,56 +171,155 @@ def _choose_brain_order(primary: str) -> list[str]:
     return [primary]
 
 
-def _ensure_venv(dst: Path) -> str | None:
-    """Create <dst>/.venv if missing. Returns its interpreter, or None.
-
-    Returns None when the venv can't be created — e.g. Debian/Ubuntu without
-    python3-venv, where ensurepip is stripped from the system interpreter.
-    """
-    existing = venv_python(dst)
-    if existing:
-        return existing
-    r = subprocess.run([base_python_cmd(), "-m", "venv", str(dst / ".venv")],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
-        shutil.rmtree(dst / ".venv", ignore_errors=True)
-        return None
-    return venv_python(dst)
+def _copy_missing_file(source: Path, destination: Path) -> None:
+    if source.is_symlink() or not source.is_file():
+        raise RuntimeError(f"verified hydration seed is unsafe: {source}")
+    if destination.exists() or destination.is_symlink():
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
 
 
-def install_requirements(dst: Path, req: Path) -> None:
-    """Install the silicon's requirements, preferring an instance-local venv.
+def _seed_durable_instance_data(source: Path, destination: Path) -> None:
+    """Seed only mutable instance state; executable code stays in generations."""
 
-    System interpreters are commonly externally managed (PEP 668), so a plain
-    `pip install` is refused. Try, in order: the silicon's own .venv, plain
-    pip, `--user`, `--break-system-packages`. A failure here must abort the
-    hydration — a silicon without its dependencies starts but never completes
-    its Glass handshake.
-    """
-    ui.info("Installing Python dependencies...")
-    vpy = _ensure_venv(dst)
-    if vpy:
-        r = subprocess.run([vpy, "-m", "pip", "install", "-r", str(req), "--quiet"])
-        if r.returncode == 0:
-            return
-        ui.warn("Install into the silicon's venv failed; falling back to the system interpreter.")
-        # A half-provisioned venv must not survive: python_run_cmd() would
-        # prefer it over the system interpreter that gets the deps below.
-        shutil.rmtree(dst / ".venv", ignore_errors=True)
-    py = base_python_cmd()
-    last = None
-    for extra in ([], ["--user"], ["--break-system-packages"]):
-        last = subprocess.run([py, "-m", "pip", "install", "-r", str(req), "--quiet", *extra],
-                              capture_output=True, text=True)
-        if last.returncode == 0:
-            return
-    if last is not None and last.stderr:
-        sys.stderr.write(last.stderr)
-    ui.error("Could not install Python dependencies — this silicon would start but never "
-             "complete its Glass handshake, so hydration was aborted.")
-    ui.info("On Debian/Ubuntu, install venv support and retry:  sudo apt install python3-venv")
-    ui.info("Or point SILICON_PYTHON at an interpreter that allows pip installs.")
-    sys.exit(1)
+    for relative in DATA_SEED_ROOT_FILES:
+        candidate = source / relative
+        if candidate.exists() or candidate.is_symlink():
+            _copy_missing_file(candidate, destination / relative)
+
+    templates = source / "templates"
+    if templates.exists() or templates.is_symlink():
+        if templates.is_symlink() or not templates.is_dir():
+            raise RuntimeError("verified hydration template root is unsafe")
+        for candidate in templates.rglob("*"):
+            if candidate.is_symlink():
+                raise RuntimeError(
+                    f"verified hydration template is unsafe: {candidate}"
+                )
+            relative = candidate.relative_to(templates)
+            target = destination / relative
+            if candidate.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+            elif candidate.is_file():
+                _copy_missing_file(candidate, target)
+            else:
+                raise RuntimeError(
+                    f"verified hydration template is unsafe: {candidate}"
+                )
+
+    for relative in DATA_SEED_DIRECTORIES:
+        (destination / relative).mkdir(parents=True, exist_ok=True)
+
+
+def _seed_legacy_flat_install(source: Path, destination: Path) -> None:
+    """Compatibility seed for a pre-generation Silicon being migrated in place."""
+
+    for path in source.rglob("*"):
+        if path.is_symlink():
+            raise RuntimeError(f"verified hydration source is unsafe: {path}")
+        rel = path.relative_to(source)
+        if any(part in SKIP_NAMES for part in rel.parts):
+            continue
+        target = destination / rel
+        if path.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        if len(rel.parts) == 1 and rel.parts[0] in PRESERVE_ROOT and target.exists():
+            continue
+        if target.exists() or target.is_symlink():
+            continue
+        _copy_missing_file(path, target)
+
+
+def _install_initial_generation(
+    destination: Path,
+    prepared: PreparedStemcell,
+    *,
+    install_deps: bool,
+) -> None:
+    """Atomically establish the authenticated first code generation."""
+
+    destination = Path(destination).resolve(strict=True)
+    identity = prepared.release.manifest.identity
+    expected_tree = identity.tree_sha256
+    generation_id = f"{expected_tree[:16]}-{expected_tree[:16]}"
+    store = GenerationStore(destination)
+    generation = store.releases / generation_id
+    if generation.exists():
+        if generation.is_symlink() or not generation.is_dir():
+            raise RuntimeError("initial generation target is unsafe")
+        actual_tree, _files = hash_tree(generation)
+        if actual_tree != expected_tree:
+            raise RuntimeError("existing initial generation is corrupt")
+    else:
+        store.releases.mkdir(parents=True, exist_ok=True)
+        temporary = store.releases / f".{generation_id}.{os.getpid()}.tmp"
+        shutil.rmtree(temporary, ignore_errors=True)
+        try:
+            shutil.copytree(prepared.source, temporary)
+            actual_tree, _files = hash_tree(temporary)
+            if actual_tree != expected_tree:
+                raise RuntimeError(
+                    "materialized initial generation changed while copying"
+                )
+            os.replace(temporary, generation)
+            fsync_dir(store.releases)
+        finally:
+            shutil.rmtree(temporary, ignore_errors=True)
+
+    environment_path = ""
+    if install_deps:
+        if prepared.environment is None:
+            if (generation / "requirements.lock").is_file():
+                raise RuntimeError(
+                    "the shared dependency environment was not prepared"
+                )
+        else:
+            environment_path = str(prepared.environment.resolve(strict=True))
+
+    overlay = OverlayStore(destination).capture(
+        prepared.source,
+        generation,
+        base_tree_sha256=expected_tree,
+    )
+    new_generation = {
+        "generation_id": generation_id,
+        "release_path": generation.relative_to(destination).as_posix(),
+        "upstream_tree_sha256": expected_tree,
+        "materialized_tree_sha256": expected_tree,
+        "environment_path": environment_path,
+        "release": identity.to_dict(),
+        "runtime_image": prepared.release.manifest.runtime_image,
+        "overlay_root_hash": overlay["root_hash"],
+    }
+    try:
+        current = store.current()
+    except ManagedPointerMissing:
+        # A first hydration can lose power after the fail-closed managed marker
+        # is durable but before its pointer is published. The exact generation
+        # above has already been hash-verified against the authenticated
+        # release, so republishing that pointer is the only safe recovery.
+        floor = store.release_floor()
+        if floor is not None and (
+            identity.trust != "signed-ed25519"
+            or identity.source != "glass"
+            or identity.sequence != int(floor["sequence"])
+            or identity.tree_sha256 != floor["tree_sha256"]
+        ):
+            raise RuntimeError(
+                "managed first-generation recovery does not match the "
+                "publisher-authenticated release recorded before the crash"
+            )
+        store.activate(new_generation, previous=store.legacy_flat())
+        return
+    if current.get("kind") == "immutable-release":
+        if current.get("upstream_tree_sha256") != expected_tree:
+            raise RuntimeError(
+                "target already has a different active Silicon generation"
+            )
+        return
+    store.activate(new_generation)
 
 
 def hydrate(
@@ -149,92 +329,90 @@ def hydrate(
     install_deps: bool = True,
     setup_interface: bool = True,
     register_install: bool = True,
+    prepared: PreparedStemcell | None = None,
+    allow_unsigned_git: bool | None = None,
+    bind_docker_runtime: bool = False,
 ) -> None:
+    if prepared is None:
+        with prepare_hydration(
+            install_deps=install_deps,
+            allow_unsigned_git=allow_unsigned_git,
+            bind_docker_runtime=bind_docker_runtime,
+        ) as shared:
+            hydrate(
+                target,
+                setup_config,
+                install_deps=install_deps,
+                setup_interface=setup_interface,
+                register_install=register_install,
+                prepared=shared,
+                bind_docker_runtime=False,
+            )
+        return
+
     abs_target = str(Path(target).resolve())
     os.makedirs(abs_target, exist_ok=True)
     dst = Path(abs_target)
+    src = prepared.source
 
-    tmp_src = tempfile.mkdtemp(prefix="silicon-src-")
-    try:
-        ui.info("Downloading Silicon stemcell...")
-        download_stemcell(tmp_src)
-        src = Path(tmp_src)
+    # Instance name: silicon.json address/name, else folder name
+    name = ""
+    sj = dst / "silicon.json"
+    if sj.exists():
+        try:
+            data = json.loads(sj.read_text())
+            name = (data.get("address") or data.get("name") or "").strip()
+        except Exception:
+            pass
+    if not name:
+        name = dst.name
 
-        # Instance name: silicon.json address/name, else folder name
-        name = ""
-        sj = dst / "silicon.json"
-        if sj.exists():
-            try:
-                data = json.loads(sj.read_text())
-                name = (data.get("address") or data.get("name") or "").strip()
-            except Exception:
-                pass
-        if not name:
-            name = dst.name
+    ui.info(f"Hydrating {abs_target}...")
+    if any((dst / marker).is_file() for marker in LEGACY_FLAT_MARKERS):
+        _seed_legacy_flat_install(src, dst)
+    else:
+        _seed_durable_instance_data(src, dst)
 
-        ui.info(f"Hydrating {abs_target}...")
-        for path in src.rglob("*"):
-            rel = path.relative_to(src)
-            if any(part in SKIP_NAMES for part in rel.parts):
-                continue
-            tgt = dst / rel
-            if path.is_dir():
-                tgt.mkdir(parents=True, exist_ok=True)
-                continue
-            if len(rel.parts) == 1 and rel.parts[0] in PRESERVE_ROOT and tgt.exists():
-                continue
-            if tgt.exists():
-                continue
-            tgt.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, tgt)
+    # Seed silicon.json
+    silicon = {}
+    if sj.exists():
+        try:
+            silicon = json.loads(sj.read_text())
+        except json.JSONDecodeError:
+            silicon = {}
+    silicon.setdefault("name", "Silicon")
+    silicon.setdefault("run", "python main.py")
+    silicon.setdefault("brain", "claude")
+    silicon.setdefault(
+        "workers",
+        {"browser": ["claude"], "terminal": ["claude"], "writer": ["claude"]},
+    )
+    if not silicon.get("address"):  # the stemcell ships an empty address — fill it
+        silicon["address"] = name
+    silicon.pop("version", None)
+    sj.write_text(json.dumps(silicon, indent=4) + "\n")
 
-        # Seed silicon.json
-        silicon = {}
-        if sj.exists():
-            try:
-                silicon = json.loads(sj.read_text())
-            except json.JSONDecodeError:
-                silicon = {}
-        silicon.setdefault("name", "Silicon")
-        silicon.setdefault("run", "python main.py")
-        silicon.setdefault("brain", "claude")
-        silicon.setdefault("workers", {"browser": ["claude"], "terminal": ["claude"], "writer": ["claude"]})
-        if not silicon.get("address"):  # the stemcell ships an empty address — fill it
-            silicon["address"] = name
-        silicon.pop("version", None)
-        sj.write_text(json.dumps(silicon, indent=4) + "\n")
+    # Seed env.py required keys used by the current stemcell.
+    env_path = dst / "env.py"
+    for key, default in {"GLASS_API_KEY": "", "BROWSER_PROFILE": name}.items():
+        if not _env_value(env_path, key):
+            _env_upsert(env_path, key, default)
 
-        # Seed env.py required keys used by the current stemcell.
-        env_path = dst / "env.py"
-        for key, default in {"GLASS_API_KEY": "", "BROWSER_PROFILE": name}.items():
-            if not _env_value(env_path, key):
-                _env_upsert(env_path, key, default)
+    # Interactive setup modifies only durable instance data.  The signed code
+    # generation remains byte-for-byte identical to its release identity.
+    if setup_config is not None:
+        _apply_setup(sj, setup_config)
+    elif ui.interactive():
+        _interactive_setup(sj)
 
-        # Run the stemcell's snapshot hook (for safe future updates), best-effort
-        updater = src / "scripts" / "silicon_update.py"
-        if updater.exists():
-            subprocess.run([python_run_cmd(), str(updater), "snapshot", "--source", str(src), "--target", abs_target],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _install_initial_generation(dst, prepared, install_deps=install_deps)
 
-        # Interactive setup
-        if setup_config is not None:
-            _apply_setup(sj, setup_config)
-        elif ui.interactive():
-            _interactive_setup(sj)
-
-        # Install dependencies
-        req = dst / "requirements.txt"
-        if install_deps and req.exists():
-            install_requirements(dst, req)
-
-        if register_install:
-            registry.register(name, abs_target)
-        if setup_interface:
-            interface_cli.setup(abs_target)
-        ui.success(f"Hydrated '{name}' at {abs_target}")
-        ui.info(f"Run 'silicon start {name}' when you're ready.")
-    finally:
-        shutil.rmtree(tmp_src, ignore_errors=True)
+    if register_install:
+        registry.register(name, abs_target)
+    if setup_interface:
+        interface_cli.setup(abs_target)
+    ui.success(f"Hydrated '{name}' at {abs_target}")
+    ui.info(f"Run 'silicon start {name}' when you're ready.")
 
 
 def choose_setup_config(

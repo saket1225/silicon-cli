@@ -1,18 +1,68 @@
-"""~/.silicon/registry.json — the list of known silicon installations.
-
-Same file + schema as the original bash CLI, so installs carry over unchanged:
-    {"installations": [{"name", "path", "pid_file"}, ...]}
-"""
+"""Crash-safe registry of known Silicon installations."""
 from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import ui
 from .config import REGISTRY_DIR, REGISTRY_FILE
+from .host_lock import HostFileLock, ensure_private_directory
+from .updater.io import atomic_write_json
+
+MAX_REGISTRY_BYTES = 4 * 1024 * 1024
+
+
+class RegistryCorruption(RuntimeError):
+    pass
+
+
+class RegistryConflict(RuntimeError):
+    pass
+
+
+def _validated_registry(value: object) -> dict:
+    rows = value.get("installations") if isinstance(value, dict) else None
+    if not isinstance(rows, list):
+        raise RegistryCorruption("Silicon registry has no installations list")
+    names: set[str] = set()
+    paths: set[str] = set()
+    services: set[str] = set()
+    containers: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RegistryCorruption("Silicon registry has an invalid installation")
+        name = row.get("name")
+        path = row.get("path")
+        service = row.get("service", "")
+        container = row.get("container_name", "")
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(path, str)
+            or not path
+            or not isinstance(service, str)
+            or not isinstance(container, str)
+        ):
+            raise RegistryCorruption("Silicon registry has an invalid installation")
+        normalized_path = str(Path(path).expanduser().resolve())
+        if (
+            name in names
+            or normalized_path in paths
+            or (service and service in services)
+            or (container and container in containers)
+        ):
+            raise RegistryCorruption("Silicon registry contains duplicate identities")
+        names.add(name)
+        paths.add(normalized_path)
+        if service:
+            services.add(service)
+        if container:
+            containers.add(container)
+    return value
 
 
 @dataclass
@@ -33,17 +83,31 @@ class Install:
 
 
 def _load() -> dict:
-    if REGISTRY_FILE.exists():
-        try:
-            return json.loads(REGISTRY_FILE.read_text())
-        except Exception:
-            return {"installations": []}
-    return {"installations": []}
+    try:
+        metadata = REGISTRY_FILE.lstat()
+    except FileNotFoundError:
+        return {"installations": []}
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_size <= 0
+        or metadata.st_size > MAX_REGISTRY_BYTES
+    ):
+        raise RegistryCorruption(f"Silicon registry is unsafe: {REGISTRY_FILE}")
+    try:
+        value = json.loads(REGISTRY_FILE.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RegistryCorruption(
+            f"Silicon registry is invalid: {REGISTRY_FILE}"
+        ) from exc
+    return _validated_registry(value)
 
 
-def _save(reg: dict) -> None:
-    REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
-    REGISTRY_FILE.write_text(json.dumps(reg, indent=2))
+def _save_unlocked(reg: dict) -> None:
+    ensure_private_directory(REGISTRY_DIR)
+    atomic_write_json(
+        REGISTRY_FILE, _validated_registry(reg), mode=0o600
+    )
 
 
 def installs() -> list[Install]:
@@ -81,47 +145,63 @@ def register(
     update_existing: bool = False,
 ) -> str:
     """Add an installation. Returns 'added' or 'exists'."""
-    path = str(Path(path))
+    path = str(Path(path).expanduser().resolve())
     pid_file = pid_file or str(Path(path) / ".silicon.pid")
-    reg = _load()
-    for inst in reg.get("installations", []):
-        if inst.get("path") == path or inst.get("name") == name:
-            if update_existing:
-                inst.update({
-                    "name": name,
-                    "path": path,
-                    "pid_file": pid_file,
-                    "runtime": runtime,
-                    "service": service,
-                    "compose_file": compose_file,
-                    "image": image,
-                    "container_name": container_name,
-                })
-                _save(reg)
-                return "updated"
-            return "exists"
-    reg.setdefault("installations", []).append({
-        "name": name,
-        "path": path,
-        "pid_file": pid_file,
-        "runtime": runtime,
-        "service": service,
-        "compose_file": compose_file,
-        "image": image,
-        "container_name": container_name,
-    })
-    _save(reg)
-    return "added"
+    with HostFileLock(REGISTRY_DIR / "registry.lock"):
+        reg = _load()
+        rows = reg.get("installations", [])
+        for inst in rows:
+            same_name = inst.get("name") == name
+            same_path = str(Path(inst.get("path", "")).expanduser().resolve()) == path
+            if same_name or same_path:
+                if not (same_name and same_path):
+                    raise RegistryConflict(
+                        f"registry identity collision for '{name}' at {path}"
+                    )
+                if update_existing:
+                    inst.update({
+                        "name": name,
+                        "path": path,
+                        "pid_file": pid_file,
+                        "runtime": runtime,
+                        "service": service,
+                        "compose_file": compose_file,
+                        "image": image,
+                        "container_name": container_name,
+                    })
+                    _save_unlocked(reg)
+                    return "updated"
+                return "exists"
+        for inst in rows:
+            if service and inst.get("service") == service:
+                raise RegistryConflict(f"registry service collision: {service}")
+            if container_name and inst.get("container_name") == container_name:
+                raise RegistryConflict(
+                    f"registry container collision: {container_name}"
+                )
+        rows.append({
+            "name": name,
+            "path": path,
+            "pid_file": pid_file,
+            "runtime": runtime,
+            "service": service,
+            "compose_file": compose_file,
+            "image": image,
+            "container_name": container_name,
+        })
+        _save_unlocked(reg)
+        return "added"
 
 
 def update_install(name: str, **fields) -> bool:
-    reg = _load()
-    for inst in reg.get("installations", []):
-        if inst.get("name") == name:
-            inst.update(fields)
-            _save(reg)
-            return True
-    return False
+    with HostFileLock(REGISTRY_DIR / "registry.lock"):
+        reg = _load()
+        for inst in reg.get("installations", []):
+            if inst.get("name") == name:
+                inst.update(fields)
+                _save_unlocked(reg)
+                return True
+        return False
 
 
 def name_taken(name: str) -> bool:

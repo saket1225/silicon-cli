@@ -2,25 +2,30 @@
 either the original Glass or your own."""
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import stat
 from pathlib import Path
 
 HOME = Path.home()
 REGISTRY_DIR = Path(os.environ.get("SILICON_HOME", HOME / ".silicon"))
 REGISTRY_FILE = REGISTRY_DIR / "registry.json"
-CLI_SOURCE_FILE = REGISTRY_DIR / "cli-source"  # where `silicon script update` reinstalls from
 
 # Glass sync server (pull/push). Override with GLASS_SERVER_URL to point elsewhere.
 GLASS_SERVER_URL = os.environ.get("GLASS_SERVER_URL", "https://glass.teamofsilicons.com").rstrip("/")
+SILICON_RELEASE_MANIFEST_URL = os.environ.get(
+    "SILICON_RELEASE_MANIFEST_URL",
+    f"{GLASS_SERVER_URL}/api/v1/silicon-release/latest.json",
+)
+SILICON_UPDATE_ALLOW_UNSIGNED_GIT = os.environ.get(
+    "SILICON_UPDATE_ALLOW_UNSIGNED_GIT", ""
+).lower() in {"1", "true", "yes", "on"}
 
 # Stemcell — the base every new silicon is hydrated from.
 STEMCELL_REPO = os.environ.get("SILICON_STEMCELL_REPO", "teamofsilicons/silicon-stemcell")
 STEMCELL_GIT_URL = f"https://github.com/{STEMCELL_REPO}.git"
 STEMCELL_ZIP_URL = f"https://github.com/{STEMCELL_REPO}/archive/refs/heads/main.zip"
-
-# Glass CLI (used by pull/push for backups).
-GLASS_CLI_REPO = os.environ.get("SILICON_GLASS_CLI_REPO", "teamofsilicons/glass")
 
 # Silicon Interface CLI. During local development, silicon-cli will auto-detect
 # a sibling silicon-interface checkout; in production this package spec is used.
@@ -30,7 +35,7 @@ SILICON_INTERFACE_CLI_PACKAGE = os.environ.get(
 )
 SILICON_INTERFACE_CLI_TARBALL = os.environ.get(
     "SILICON_INTERFACE_CLI_TARBALL",
-    "https://registry.npmjs.org/@teamofsilicons/silicon-interface-cli/-/silicon-interface-cli-0.1.3.tgz",
+    "https://registry.npmjs.org/@teamofsilicons/silicon-interface-cli/-/silicon-interface-cli-2.0.0.tgz",
 )
 SILICON_INTERFACE_CLI_SOURCE = os.environ.get("SILICON_INTERFACE_CLI_SOURCE", "")
 SILICON_INTERFACE_CLI_SKIP = os.environ.get("SILICON_INTERFACE_CLI_SKIP", "").lower() in {
@@ -48,6 +53,129 @@ def venv_python(path: str | os.PathLike) -> str | None:
     return str(cand) if cand.exists() else None
 
 
+def active_release_root(path: str | os.PathLike) -> Path:
+    """Resolve the atomically selected code generation, or the legacy root."""
+
+    root = Path(path).resolve()
+    pointer = root / ".silicon" / "current.json"
+    from .updater.generation import GenerationError, GenerationStore
+
+    try:
+        return GenerationStore(root).active_root()
+    except (OSError, GenerationError) as exc:
+        raise RuntimeError(
+            f"invalid Silicon generation pointer at {pointer}: {exc}"
+        ) from exc
+
+
+def active_environment_python(path: str | os.PathLike) -> str | None:
+    root = Path(path).resolve()
+    pointer = root / ".silicon" / "current.json"
+    from .updater.generation import GenerationError, GenerationStore
+
+    try:
+        store = GenerationStore(root)
+        generation = store.current()
+        environment = store.resolve_environment(generation)
+        if environment is None:
+            return None
+        cache_environments = (REGISTRY_DIR / "cache" / "environments").resolve()
+        instance_environments = (root / ".silicon" / "environments").resolve()
+        if (
+            not environment.is_dir()
+            or not any(
+                allowed == environment or allowed in environment.parents
+                for allowed in (cache_environments, instance_environments)
+            )
+        ):
+            raise RuntimeError(
+                "active Silicon environment escaped its trusted stores"
+            )
+        release = store.resolve_release(generation)
+        lockfile = release / "requirements.lock"
+        marker = environment / ".silicon-environment.json"
+        if (
+            not lockfile.is_file()
+            or lockfile.is_symlink()
+            or marker.is_symlink()
+        ):
+            raise RuntimeError(
+                "active Silicon environment has no trusted lockfile marker"
+            )
+        marker_stat = marker.stat()
+        if (
+            not stat.S_ISREG(marker_stat.st_mode)
+            or marker_stat.st_size <= 0
+            or marker_stat.st_size > 64 * 1024
+        ):
+            raise RuntimeError("active Silicon environment marker is unsafe")
+        marker_value = json.loads(marker.read_text(encoding="utf-8"))
+        from .updater.cache import runtime_platform_identity
+        from .updater.io import sha256_file
+
+        if (
+            not isinstance(marker_value, dict)
+            or set(marker_value)
+            != {
+                "requirements_sha256",
+                "requirements_file",
+                "require_hashes",
+                "runtime",
+            }
+            or marker_value.get("requirements_sha256")
+            != sha256_file(lockfile)
+            or marker_value.get("requirements_file") != "requirements.lock"
+            or marker_value.get("require_hashes") is not True
+            or marker_value.get("runtime") != runtime_platform_identity()
+        ):
+            raise RuntimeError(
+                "active Silicon environment does not match its lockfile"
+            )
+        candidate = environment / (
+            "Scripts/python.exe" if os.name == "nt" else "bin/python"
+        )
+        if not candidate.is_file() or candidate.is_symlink():
+            raise RuntimeError(
+                "active Silicon environment has no trusted Python executable"
+            )
+        return str(candidate)
+    except (OSError, GenerationError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"invalid Silicon generation environment at {pointer}: {exc}"
+        ) from exc
+
+
+def runtime_environment(path: str | os.PathLike) -> dict[str, str]:
+    environment = dict(os.environ)
+    root = Path(path).resolve()
+    environment["SILICON_DATA_ROOT"] = str(root)
+    environment["SILICON_RELEASE_ROOT"] = str(active_release_root(path))
+    python = active_environment_python(root) or venv_python(root)
+    if python:
+        active_bin = str(Path(python).resolve().parent)
+        entries = [
+            entry
+            for entry in environment.get("PATH", "").split(os.pathsep)
+            if entry and entry != active_bin
+        ]
+        environment["PATH"] = os.pathsep.join([active_bin, *entries])
+    return environment
+
+
+def legacy_offline_update_fenced(path: str | os.PathLike) -> bool:
+    """Whether a stopped legacy instance is reserved for an updater."""
+
+    marker = (
+        Path(path)
+        / ".silicon"
+        / "maintenance"
+        / "legacy-offline.json"
+    )
+    # A malformed or linked marker still fails closed until `update resume`
+    # validates and clears it.
+    return marker.exists() or marker.is_symlink()
+
+
 def base_python_cmd() -> str:
     """The interpreter used to CREATE a silicon's venv (not this CLI's venv)."""
     return os.environ.get("SILICON_PYTHON") or shutil.which("python3") or shutil.which("python") or "python3"
@@ -63,6 +191,9 @@ def python_run_cmd(path: str | os.PathLike | None = None) -> str:
     if os.environ.get("SILICON_PYTHON"):
         return os.environ["SILICON_PYTHON"]
     if path:
+        active = active_environment_python(path)
+        if active:
+            return active
         venv = venv_python(path)
         if venv:
             return venv

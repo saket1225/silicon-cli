@@ -1,13 +1,12 @@
 """Install the Silicon Interface CLI into a silicon folder."""
 from __future__ import annotations
 
-import os
 import re
 import shutil
 import subprocess
 from pathlib import Path
 
-from . import ui
+from . import runtime_contract, ui
 from .config import (
     SILICON_INTERFACE_DAEMON_SKIP,
     SILICON_INTERFACE_CLI_PACKAGE,
@@ -81,11 +80,16 @@ def _run(cmd: list[str], target: Path, *, warn: bool = True) -> bool:
     return False
 
 
-def _npm_install_command(target: Path, package_spec: str) -> list[str] | None:
+def _npm_install_command(
+    target: Path,
+    package_spec: str,
+    *,
+    start_daemon: bool,
+) -> list[str] | None:
     npm = shutil.which("npm")
     if not npm:
         return None
-    return [
+    command = [
         npm,
         "exec",
         "--yes",
@@ -96,9 +100,16 @@ def _npm_install_command(target: Path, package_spec: str) -> list[str] | None:
         "install",
         str(target),
     ]
+    if not start_daemon:
+        command.append("--no-daemon")
+    return command
 
 
-def _npm_install_commands(target: Path) -> list[list[str]]:
+def _npm_install_commands(
+    target: Path,
+    *,
+    start_daemon: bool,
+) -> list[list[str]]:
     package_specs = [SILICON_INTERFACE_CLI_PACKAGE]
     if (
         SILICON_INTERFACE_CLI_TARBALL
@@ -108,7 +119,11 @@ def _npm_install_commands(target: Path) -> list[list[str]]:
 
     commands: list[list[str]] = []
     for package_spec in package_specs:
-        cmd = _npm_install_command(target, package_spec)
+        cmd = _npm_install_command(
+            target,
+            package_spec,
+            start_daemon=start_daemon,
+        )
         if cmd:
             commands.append(cmd)
     return commands
@@ -130,37 +145,86 @@ def _start_daemon(target: Path) -> bool:
     return ok
 
 
-def setup(target: str | Path) -> bool:
+def _stop_daemon(target: Path) -> None:
+    si = target / ".silicon-interface" / "bin" / "si"
+    if si.exists():
+        _run([str(si), "daemon", "stop"], target, warn=False)
+
+
+def _unavailable(message: str, *, required: bool) -> bool:
+    if required:
+        raise RuntimeError(f"Silicon Interface CLI is required: {message}")
+    ui.warn(f"Silicon Interface CLI setup skipped: {message}")
+    return False
+
+
+def _installation_ready(target: Path) -> bool:
+    try:
+        runtime_contract.verify_local_interface_install(target)
+    except RuntimeError:
+        return False
+    return True
+
+
+def setup(
+    target: str | Path,
+    *,
+    required: bool = False,
+    start_daemon: bool = True,
+    force: bool = False,
+) -> bool:
     """Install local si/silicon-interface wrappers into ``target``.
 
-    This is intentionally best-effort. A missing Node runtime or unpublished npm
-    package should not break `silicon new` or `silicon pull`; the user can rerun
-    the setup later after installing Node or setting SILICON_INTERFACE_CLI_SOURCE.
+    Normal hydration remains best-effort. Transactional pulls pass
+    ``required=True`` so a claim cannot commit without a working Interface CLI.
     """
     if SILICON_INTERFACE_CLI_SKIP:
-        return False
+        return _unavailable(
+            "setup was disabled by SILICON_INTERFACE_CLI_SKIP",
+            required=required,
+        )
 
     target_path = Path(target).resolve()
     major = _node_major()
     if major is None:
-        ui.warn("Silicon Interface CLI setup skipped: node not found.")
-        return False
+        return _unavailable("node was not found", required=required)
     if major < 22:
-        ui.warn(
-            "Silicon Interface CLI setup skipped: Node 22+ is required "
-            f"(found Node {major})."
+        return _unavailable(
+            f"Node 22+ is required (found Node {major})",
+            required=required,
         )
-        return False
+
+    if not force and _installation_ready(target_path):
+        ui.success(
+            "Silicon Interface CLI ready: "
+            f"{target_path}/.silicon-interface/bin/si"
+        )
+        if start_daemon:
+            _start_daemon(target_path)
+        return True
+
+    if force:
+        _stop_daemon(target_path)
 
     script = _source_script()
     ui.info("Setting up Silicon Interface CLI...")
     if script:
-        ok = _run([shutil.which("node") or "node", str(script), "install", str(target_path)], target_path)
+        command = [
+            shutil.which("node") or "node",
+            str(script),
+            "install",
+            str(target_path),
+        ]
+        if not start_daemon:
+            command.append("--no-daemon")
+        ok = _run(command, target_path)
     else:
-        commands = _npm_install_commands(target_path)
+        commands = _npm_install_commands(
+            target_path,
+            start_daemon=start_daemon,
+        )
         if not commands:
-            ui.warn("Silicon Interface CLI setup skipped: npm not found.")
-            return False
+            return _unavailable("npm was not found", required=required)
         ok = False
         for index, cmd in enumerate(commands):
             final_attempt = index == len(commands) - 1
@@ -174,9 +238,24 @@ def setup(target: str | Path) -> bool:
                 )
 
     if ok:
+        try:
+            runtime_contract.verify_local_interface_install(target_path)
+        except RuntimeError as exc:
+            if required:
+                raise
+            ui.warn(str(exc))
+            return False
         ui.success(
             "Silicon Interface CLI ready: "
             f"{target_path}/.silicon-interface/bin/si"
         )
-        _start_daemon(target_path)
+        if start_daemon:
+            _start_daemon(target_path)
+        return True
+    if required:
+        raise RuntimeError(
+            "Silicon Interface CLI installation failed. Check npm registry "
+            "access or set SILICON_INTERFACE_CLI_SOURCE, then rerun the same "
+            "pull."
+        )
     return ok

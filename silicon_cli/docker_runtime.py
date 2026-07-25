@@ -2,29 +2,70 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
 import time
-import tempfile
-import urllib.request
 from pathlib import Path
 from typing import Iterable
 
-from . import registry, ui
+from . import registry, runtime_contract, ui
 from .config import REGISTRY_DIR
+from .host_lock import HostFileLock, ensure_private_directory
+from .updater.io import atomic_write_bytes, atomic_write_json
+from .updater.release import runtime_image_is_pinned
 
 CONFIG_FILE = REGISTRY_DIR / "docker.json"
 DEFAULT_ROOT = Path.home() / "silicons"
-DEFAULT_IMAGE = "ghcr.io/teamofsilicons/silicon-runtime:latest"
+DEFAULT_IMAGE = ""
+DEFAULT_IMAGE_REPOSITORY = "ghcr.io/teamofsilicons/silicon-runtime"
 CONTAINER_PATH = "/silicon"
 CONTAINER_HOME = f"{CONTAINER_PATH}/.home"
 CONTAINER_SHARED_HOME = "/silicon-shared-home"
-DOCKER_INSTALL_URL = "https://get.docker.com"
 AUTH_FILE = ".silicon-auth.json"
 AUTH_PROVIDERS = {"claude", "codex"}
+UNPINNED_IMAGE_OPT_IN = "SILICON_DOCKER_ALLOW_UNPINNED_IMAGE"
+SILICON_EXTEND_VERSION = "0.1.1"
+
+_CONTAINER_PROCESS_IDENTITY_HELPER = r"""
+def _process_birth_identity(process_id):
+    if process_id <= 0:
+        return ""
+    try:
+        os.kill(process_id, 0)
+    except OSError:
+        return ""
+    proc_stat = Path(f"/proc/{process_id}/stat")
+    if proc_stat.is_file():
+        try:
+            raw = proc_stat.read_text(encoding="utf-8")
+            closing = raw.rfind(")")
+            if closing < 0:
+                return ""
+            fields = raw[closing + 2 :].split()
+            start_ticks = fields[19]
+            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(
+                encoding="utf-8"
+            ).strip()
+            if boot_id and start_ticks.isdigit():
+                return f"linux:{boot_id}:{start_ticks}"
+        except (OSError, IndexError, ValueError):
+            return ""
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(process_id), "-o", "lstart="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return ""
+    started = " ".join(result.stdout.split())
+    return f"ps:{started}" if result.returncode == 0 and started else ""
+"""
 
 
 def _truthy(value: str | None) -> bool:
@@ -66,8 +107,33 @@ def runtime_opted_out() -> bool:
 
 
 def _save_config(config: dict) -> None:
-    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps(config, indent=2) + "\n")
+    ensure_private_directory(CONFIG_FILE.parent)
+    atomic_write_json(CONFIG_FILE, config, mode=0o600)
+
+
+def _allow_unpinned_image() -> bool:
+    """Explicit local-development escape hatch; never enabled by default."""
+
+    return _truthy(os.environ.get(UNPINNED_IMAGE_OPT_IN))
+
+
+def _require_runtime_image(image: object, *, context: str) -> str:
+    value = str(image or "").strip()
+    if runtime_image_is_pinned(value):
+        return value
+    if value and _allow_unpinned_image():
+        ui.warn(
+            f"{context} is using an unpinned Docker image because "
+            f"{UNPINNED_IMAGE_OPT_IN}=1. This is for local development only."
+        )
+        return value
+    raise RuntimeError(
+        f"{context} has no signed, immutable runtime image. Fetch a signed "
+        "Silicon release first; the image must be "
+        "registry/repository@sha256:<digest>. Mutable tags such as :latest "
+        f"are refused. Set {UNPINNED_IMAGE_OPT_IN}=1 only for isolated local "
+        "development."
+    )
 
 
 def load_config(required: bool = False) -> dict:
@@ -93,7 +159,14 @@ def load_config(required: bool = False) -> dict:
         or data.get("shared_home")
         or root / ".shared-home"
     ).expanduser()
-    image = os.environ.get("SILICON_RUNTIME_IMAGE") or data.get("image") or DEFAULT_IMAGE
+    # Once a digest has been persisted, it is part of the selected release
+    # state and must not be retargeted by a later process environment. The
+    # environment value is bootstrap-only for an as-yet unbound runtime.
+    image = (
+        data.get("image")
+        or os.environ.get("SILICON_RUNTIME_IMAGE")
+        or DEFAULT_IMAGE
+    )
     env_sudo = os.environ.get("SILICON_DOCKER_SUDO")
     docker_sudo = _truthy(env_sudo) if env_sudo is not None else bool(data.get("docker_sudo", False))
     return {
@@ -130,11 +203,14 @@ def init(
     shared_home: str | None = None,
     docker_sudo: bool | None = None,
     quiet: bool = False,
+    write_compose: bool = True,
 ) -> None:
     chosen_root = Path(root).expanduser() if root else DEFAULT_ROOT
     chosen_root = chosen_root.resolve()
-    chosen_image = image or DEFAULT_IMAGE
     current = load_config()
+    chosen_image = image or str(current.get("image") or DEFAULT_IMAGE)
+    if chosen_image and (image is not None or write_compose):
+        _require_runtime_image(chosen_image, context="Docker runtime setup")
     chosen_shared_home = (
         Path(shared_home).expanduser().resolve()
         if shared_home
@@ -154,12 +230,19 @@ def init(
         "docker_sudo": docker_sudo,
     }
     _save_config(config)
-    render_compose(config)
+    if write_compose:
+        render_compose(config)
     if not quiet:
         ui.success(f"Docker runtime enabled. Instances root: {chosen_root}")
         ui.info(f"Compose file: {config['compose_file']}")
         ui.info(f"Shared auth home: {chosen_shared_home}")
-        ui.info(f"Runtime image: {chosen_image}")
+        if chosen_image:
+            ui.info(f"Runtime image: {chosen_image}")
+        else:
+            ui.info(
+                "Runtime image: awaiting the digest from the signed Silicon "
+                "release channel"
+            )
         if docker_sudo:
             ui.info("Docker commands will run through sudo for this runtime.")
 
@@ -184,7 +267,10 @@ def register_instance(name: str, path: str | Path, *, image: str | None = None) 
     abs_path = Path(path).expanduser().resolve()
     svc = service_name(name)
     cname = container_name(name)
-    img = image or cfg["image"]
+    img = _require_runtime_image(
+        image or cfg["image"],
+        context=f"Docker Silicon '{name}'",
+    )
     registry.register(
         name,
         str(abs_path),
@@ -211,39 +297,63 @@ def _docker_installs(compose_file: str | None = None) -> list[registry.Install]:
     return rows
 
 
-def render_compose(config: dict | None = None) -> Path:
+def render_compose(
+    config: dict | None = None,
+    *,
+    update_fence_owners: dict[str, str] | None = None,
+) -> Path:
     cfg = config or load_config(required=True)
     compose = Path(cfg["compose_file"]).expanduser()
     compose.parent.mkdir(parents=True, exist_ok=True)
-
-    rows = _docker_installs(str(compose))
-    lines = ["name: silicon-runtime", "", "services:"]
-    shared_home = str(Path(cfg["shared_home"]).expanduser().resolve())
-    Path(shared_home).mkdir(parents=True, exist_ok=True)
-    if not rows:
-        lines.append("  # Services are added by `silicon new` or `silicon pull`.")
-    for inst in rows:
-        svc = inst.service or service_name(inst.name)
-        cname = inst.container_name or container_name(inst.name)
-        image = inst.image or cfg["image"]
-        user = host_user()
-        path = str(Path(inst.path).expanduser().resolve())
-        lines.extend([
-            f"  {svc}:",
-            f"    image: {_json(image)}",
-            f"    container_name: {_json(cname)}",
-            "    restart: unless-stopped",
-            *([f"    user: {_json(user)}"] if user else []),
-            "    environment:",
-            f"      SILICON_INSTANCE_NAME: {_json(inst.name)}",
-            f"      SILICON_SHARED_HOME: {_json(CONTAINER_SHARED_HOME)}",
-            '      SILICON_CONTAINER_MODE: "1"',
-            "    volumes:",
-            f"      - {_json(path + ':' + CONTAINER_PATH)}",
-            f"      - {_json(shared_home + ':' + CONTAINER_SHARED_HOME)}",
-            "",
-        ])
-    compose.write_text("\n".join(lines).rstrip() + "\n")
+    with HostFileLock(compose.with_name(f".{compose.name}.lock")):
+        # Read the registry only after taking the render lock. Concurrent
+        # registrations therefore cannot leave an older compose snapshot last.
+        rows = _docker_installs(str(compose))
+        lines = ["name: silicon-runtime", "", "services:"]
+        shared_home = str(Path(cfg["shared_home"]).expanduser().resolve())
+        Path(shared_home).mkdir(parents=True, exist_ok=True)
+        if not rows:
+            lines.append("  # Services are added by `silicon new` or `silicon pull`.")
+        for inst in rows:
+            svc = inst.service or service_name(inst.name)
+            cname = inst.container_name or container_name(inst.name)
+            image = _require_runtime_image(
+                inst.image or cfg["image"],
+                context=f"Docker Silicon '{inst.name}'",
+            )
+            user = host_user()
+            path = str(Path(inst.path).expanduser().resolve())
+            fence_owner = str(
+                (update_fence_owners or {}).get(inst.name) or ""
+            )
+            lines.extend([
+                f"  {svc}:",
+                f"    image: {_json(image)}",
+                f"    container_name: {_json(cname)}",
+                "    restart: unless-stopped",
+                *([f"    user: {_json(user)}"] if user else []),
+                "    environment:",
+                f"      SILICON_INSTANCE_NAME: {_json(inst.name)}",
+                f"      SILICON_SHARED_HOME: {_json(CONTAINER_SHARED_HOME)}",
+                '      SILICON_CONTAINER_MODE: "1"',
+                *(
+                    [
+                        "      SILICON_LEGACY_UPDATE_FENCE_OWNER: "
+                        + _json(fence_owner)
+                    ]
+                    if fence_owner
+                    else []
+                ),
+                "    volumes:",
+                f"      - {_json(path + ':' + CONTAINER_PATH)}",
+                f"      - {_json(shared_home + ':' + CONTAINER_SHARED_HOME)}",
+                "",
+            ])
+        atomic_write_bytes(
+            compose,
+            ("\n".join(lines).rstrip() + "\n").encode("utf-8"),
+            mode=0o600,
+        )
     return compose
 
 
@@ -272,76 +382,38 @@ def _docker_cmd(config: dict | None = None) -> list[str]:
 
 
 def _manual_docker_steps() -> None:
-    ui.info("Install Docker manually, then rerun the same silicon command:")
-    ui.info("  curl -fsSL https://get.docker.com -o get-docker.sh")
-    ui.info("  sudo sh get-docker.sh")
-    ui.info("  sudo systemctl enable --now docker")
-    ui.info("  sudo usermod -aG docker $USER")
-    ui.info("Then log out/in, or run: newgrp docker")
-
-
-def _download_docker_installer() -> Path:
-    tmp = Path(tempfile.mkdtemp(prefix="silicon-docker-install-"))
-    script = tmp / "get-docker.sh"
-    with urllib.request.urlopen(DOCKER_INSTALL_URL, timeout=60) as resp:
-        script.write_bytes(resp.read())
-    script.chmod(0o700)
-    return script
+    ui.info(
+        "Install Docker Engine and the Compose v2 plugin from your operating "
+        "system's trusted package repository, then rerun the same command."
+    )
+    ui.info("Vendor instructions: https://docs.docker.com/engine/install/")
+    ui.info(
+        "Verify the repository signing key/fingerprint using Docker's "
+        "published instructions before installing packages."
+    )
+    ui.info("After installation, enable the daemon with your service manager.")
 
 
 def _install_docker_engine() -> bool:
-    if not _is_linux():
-        ui.error("Automatic Docker Engine install is only supported on Linux servers.")
-        ui.info("Install Docker Desktop or Docker Engine for this OS, then rerun the same silicon command.")
-        return False
-
-    auto_install = _truthy(os.environ.get("SILICON_DOCKER_AUTO_INSTALL"))
-    if not auto_install and ui.interactive():
-        auto_install = ui.confirm(
-            "Docker is required for Silicon runtime. Install Docker Engine now using Docker's official installer?",
-            default_yes=True,
-        )
-    if not auto_install:
-        _manual_docker_steps()
-        return False
-
-    sudo = _sudo_prefix()
-    if sudo is None:
-        ui.error("sudo was not found, so the CLI cannot install Docker automatically.")
-        _manual_docker_steps()
-        return False
-
-    try:
-        script = _download_docker_installer()
-    except Exception as e:
-        ui.error(f"Could not download Docker installer: {e}")
-        _manual_docker_steps()
-        return False
-
-    ui.info("Installing Docker Engine...")
-    result = _run([*sudo, "sh", str(script)])
-    if result.returncode != 0:
-        ui.error("Docker installer failed.")
-        _manual_docker_steps()
-        return False
-
-    if shutil.which("systemctl"):
-        _run([*sudo, "systemctl", "enable", "--now", "docker"])
-
-    user = os.environ.get("SUDO_USER") or os.environ.get("USER") or os.environ.get("LOGNAME") or ""
-    if user and user != "root":
-        _run([*sudo, "usermod", "-aG", "docker", user])
-        ui.warn("Added this user to the docker group. A new login shell may be needed for non-sudo Docker access.")
-    return True
+    # Never download and execute a mutable network script as root. Even an
+    # explicit legacy auto-install environment variable cannot weaken this
+    # trust boundary.
+    ui.error(
+        "Silicon does not automatically install Docker or execute "
+        "get.docker.com as root."
+    )
+    _manual_docker_steps()
+    return False
 
 
 def _ensure_docker_binary(install: bool) -> None:
     if shutil.which("docker"):
         return
-    if install and _install_docker_engine() and shutil.which("docker"):
-        return
+    if install:
+        _install_docker_engine()
+    else:
+        _manual_docker_steps()
     ui.error("Docker was not found on PATH.")
-    _manual_docker_steps()
     sys.exit(127)
 
 
@@ -386,27 +458,59 @@ def _ensure_daemon(config: dict) -> dict:
 
 
 def _ensure_image(config: dict, *, refresh: bool = False) -> None:
-    image = config.get("image") or DEFAULT_IMAGE
+    image = _require_runtime_image(
+        config.get("image") or DEFAULT_IMAGE,
+        context="Docker runtime",
+    )
+    pinned = runtime_image_is_pinned(image)
 
     def local_image_exists() -> bool:
-        return _cmd([*_docker_cmd(config), "image", "inspect", image]).returncode == 0
+        if not pinned:
+            return (
+                _cmd(
+                    [*_docker_cmd(config), "image", "inspect", image]
+                ).returncode
+                == 0
+            )
+        inspected = _cmd(
+            [
+                *_docker_cmd(config),
+                "image",
+                "inspect",
+                "--format",
+                "{{json .RepoDigests}}",
+                image,
+            ]
+        )
+        if inspected.returncode != 0:
+            return False
+        try:
+            digests = json.loads(str(inspected.stdout or ""))
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return isinstance(digests, list) and image in digests
 
-    if not refresh and local_image_exists():
+    local_before = local_image_exists()
+    # Refreshing an immutable digest cannot yield different content.
+    if local_before and (pinned or not refresh):
         return
 
-    ui.info(f"{'Refreshing' if refresh else 'Pulling'} Silicon runtime image: {image}")
+    qualifier = "immutable " if pinned else ""
+    ui.info(f"Pulling {qualifier}Silicon runtime image: {image}")
     pulled = _run([*_docker_cmd(config), "pull", image])
-    if pulled.returncode == 0:
+    if pulled.returncode == 0 and local_image_exists():
         return
-    if refresh and local_image_exists():
-        ui.warn(f"Could not refresh Docker image: {image}")
-        ui.info("Using the cached local image. Rerun `silicon docker doctor` to retry the refresh.")
+    if local_before:
+        ui.warn(f"Could not re-pull Docker image: {image}")
+        if pinned:
+            ui.info("Using the already verified immutable local image.")
+        else:
+            ui.info("Using the existing local-development image.")
         return
-    ui.error(f"Could not pull Docker image: {image}")
-    ui.info("If this is a private or not-yet-published image, build or login first, then rerun the same command.")
-    ui.info("  docker login ghcr.io")
-    ui.info(f"  docker build -f docker/runtime/Dockerfile -t {DEFAULT_IMAGE} .")
-    sys.exit(pulled.returncode or 1)
+    raise RuntimeError(
+        f"Could not pull and verify the signed Docker image: {image}. "
+        "Authenticate to its registry if it is private, then retry."
+    )
 
 
 def ensure_ready(
@@ -418,8 +522,9 @@ def ensure_ready(
     image: str | None = None,
     refresh_image: bool = False,
     quiet: bool = False,
+    write_compose: bool = True,
 ) -> dict:
-    """Make Docker usable for Silicon commands, installing/initializing when allowed."""
+    """Check Docker and initialize the Silicon runtime when requested."""
     if _truthy(os.environ.get("SILICON_CONTAINER_MODE")):
         return load_config()
     if runtime_opted_out():
@@ -447,15 +552,232 @@ def ensure_ready(
             shared_home=cfg.get("shared_home"),
             docker_sudo=bool(cfg.get("docker_sudo")),
             quiet=quiet,
+            write_compose=write_compose,
         )
         cfg = load_config(required=True)
     else:
         _save_config({**cfg, "enabled": True})
-        render_compose(cfg)
+        if write_compose:
+            render_compose(cfg)
 
     if pull_image:
         _ensure_image(cfg, refresh=refresh_image)
     return cfg
+
+
+def prepare_release_image(image: str) -> dict:
+    """Pull and verify a signed image without changing active runtime state."""
+
+    pinned = str(image or "").strip()
+    if not runtime_image_is_pinned(pinned):
+        raise RuntimeError(
+            "Docker releases require a signed immutable runtime image digest; "
+            "unsigned Git releases cannot select a Docker runtime"
+        )
+    cfg = {**load_config(required=True), "image": pinned}
+    _ensure_image(cfg)
+    return cfg
+
+
+def inspect_runtime_contract(config: dict, image: str) -> dict:
+    """Inspect a runtime image without treating an outdated package as fatal."""
+
+    selected = str(image or "").strip()
+    if not selected or len(selected) > 512 or any(
+        character in selected for character in "\x00\r\n"
+    ):
+        raise RuntimeError("Silicon runtime image identity is invalid")
+    result = _run(
+        [
+            *_docker_cmd(config),
+            "run",
+            "--rm",
+            "--entrypoint",
+            "/opt/silicon-runtime/bin/python",
+            selected,
+            "-I",
+            "-c",
+            runtime_contract.DOCKER_PROBE_SCRIPT,
+            runtime_contract.docker_contract_json(),
+        ],
+        capture=True,
+    )
+    stdout = str(getattr(result, "stdout", "") or "")
+    payload: dict = {}
+    for line in reversed(stdout.splitlines()):
+        try:
+            candidate = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            payload = candidate
+            break
+    if not payload:
+        raw = str(
+            getattr(result, "stderr", "")
+            or stdout
+            or f"Docker exited with {result.returncode}"
+        ).strip()
+        raise RuntimeError(
+            "the Silicon runtime dependency probe returned no inventory: "
+            + raw[-2000:]
+        )
+    payload["returncode"] = int(result.returncode)
+    return payload
+
+
+def verify_runtime_contract(config: dict, image: str) -> dict[str, str]:
+    """Prove the signed image contains the complete supported toolchain."""
+
+    selected = _require_runtime_image(
+        image,
+        context="Silicon runtime dependency verification",
+    )
+    payload = inspect_runtime_contract(config, selected)
+    failures = payload.get("failures") if isinstance(payload, dict) else None
+    if payload.get("returncode") != 0 or not isinstance(failures, list) or failures:
+        if isinstance(failures, list) and failures:
+            detail = "; ".join(str(item) for item in failures)
+        else:
+            detail = "the runtime probe failed without structured diagnostics"
+        raise RuntimeError(
+            "the signed Silicon runtime image is missing or has outdated "
+            f"required dependencies: {detail}. Publish a fresh runtime image "
+            "containing Silicon CLI, Silicon Browser, Silicon Extend, Silicon "
+            "Interface CLI, Claude Code, Codex, Node 22+, Python, and Git; "
+            "then publish that digest in the signed Silicon release."
+        )
+    versions = payload.get("versions")
+    if not isinstance(versions, dict):
+        raise RuntimeError(
+            "the signed Silicon runtime dependency probe returned no version "
+            "inventory"
+        )
+    ui.success("Verified the complete signed Silicon runtime toolchain.")
+    return {
+        str(name): str(version)
+        for name, version in versions.items()
+    }
+
+
+def bind_release_runtime(
+    image: str,
+    *,
+    installs: Iterable[registry.Install] = (),
+    pull: bool = True,
+) -> dict:
+    """Verify and persist the exact image authenticated by a release.
+
+    The image is pulled and content-address verified before either config or
+    registry metadata changes. With no selected install this establishes the
+    bootstrap default. With one selected install it changes only that row, so
+    a rolling update cannot move unrelated Silicons to the candidate digest.
+    Writes are atomic and retrying converges on the same digest.
+    """
+
+    pinned = str(image or "").strip()
+    if pull:
+        candidate = {
+            **prepare_release_image(pinned),
+            "enabled": True,
+        }
+    else:
+        if not runtime_image_is_pinned(pinned):
+            raise RuntimeError(
+                "Docker releases require a signed immutable runtime image "
+                "digest"
+            )
+        candidate = {
+            **load_config(required=True),
+            "enabled": True,
+            "image": pinned,
+        }
+    selected = [inst for inst in installs if inst.is_docker]
+    if len(selected) > 1:
+        raise RuntimeError(
+            "bind_release_runtime activates one Docker Silicon at a time"
+        )
+    if selected:
+        inst = selected[0]
+        registered = registry.find(inst.name)
+        if (
+            registered is None
+            or Path(registered.path).expanduser().resolve()
+            != Path(inst.path).expanduser().resolve()
+        ):
+            raise RuntimeError(
+                f"could not bind runtime image for unregistered Silicon "
+                f"'{inst.name}'"
+            )
+        if not registry.update_install(inst.name, image=pinned):
+            raise RuntimeError(
+                f"could not bind runtime image for unregistered Silicon "
+                f"'{inst.name}'"
+            )
+        inst.image = pinned
+        # Keep the global/default digest unchanged. Compose resolves this
+        # target from its registry row and every other target from its own row.
+        render_compose(load_config(required=True))
+    else:
+        _save_config(candidate)
+        render_compose(candidate)
+    return candidate
+
+
+def active_generation_runtime_image(inst: registry.Install) -> str:
+    """Return the signed image bound to the selected code generation."""
+
+    from .updater.generation import GenerationError, GenerationStore
+
+    try:
+        value = GenerationStore(Path(inst.path)).current()
+    except (OSError, GenerationError, ValueError) as exc:
+        raise RuntimeError(
+            f"'{inst.name}' has an invalid active generation; refusing to "
+            "select a Docker runtime image"
+        ) from exc
+    if value.get("kind") == "legacy-flat":
+        return ""
+    image = str(value.get("runtime_image") or "")
+    return image if runtime_image_is_pinned(image) else ""
+
+
+def maintenance_coordinator_available(inst: registry.Install) -> bool:
+    """Inspect the selected host-mounted code without starting a container."""
+
+    from .config import active_release_root
+
+    coordinator = active_release_root(inst.path) / "core" / "maintenance.py"
+    return coordinator.is_file() and not coordinator.is_symlink()
+
+
+def _legacy_offline_fence_owner(inst: registry.Install) -> str:
+    marker = (
+        Path(inst.path).expanduser().resolve()
+        / ".silicon"
+        / "maintenance"
+        / "legacy-offline.json"
+    )
+    if not marker.exists() and not marker.is_symlink():
+        return ""
+    if marker.is_symlink() or not marker.is_file():
+        raise RuntimeError("legacy Docker update fence is unsafe")
+    try:
+        value = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("legacy Docker update fence is corrupt") from exc
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema", "update_id", "created_at"}
+        or value.get("schema") != 1
+        or not isinstance(value.get("update_id"), str)
+        or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", value["update_id"])
+        or not isinstance(value.get("created_at"), (int, float))
+        or isinstance(value.get("created_at"), bool)
+        or not math.isfinite(value["created_at"])
+    ):
+        raise RuntimeError("legacy Docker update fence is invalid")
+    return value["update_id"]
 
 
 def _auth_path(config: dict) -> Path:
@@ -514,6 +836,10 @@ def _auth_container(config: dict, provider: str) -> int:
     shared_home = Path(config["shared_home"]).expanduser().resolve()
     shared_home.mkdir(parents=True, exist_ok=True)
     user = host_user()
+    image = _require_runtime_image(
+        config.get("image"),
+        context="Docker authentication runtime",
+    )
     cmd = [
         *_docker_cmd(config),
         "run",
@@ -526,7 +852,7 @@ def _auth_container(config: dict, provider: str) -> int:
         f"{shared_home}:{CONTAINER_SHARED_HOME}",
         "--entrypoint",
         "/usr/local/bin/silicon-runtime-entrypoint",
-        config.get("image") or DEFAULT_IMAGE,
+        image,
         "auth",
         provider,
     ]
@@ -540,6 +866,10 @@ def _shared_tool_container(config: dict, tool: str, args: list[str]) -> int:
     shared_home = Path(config["shared_home"]).expanduser().resolve()
     shared_home.mkdir(parents=True, exist_ok=True)
     user = host_user()
+    image = _require_runtime_image(
+        config.get("image"),
+        context=f"Docker {tool} runtime",
+    )
     command = [tool, *args] if args else [tool]
     cmd = [
         *_docker_cmd(config),
@@ -553,7 +883,7 @@ def _shared_tool_container(config: dict, tool: str, args: list[str]) -> int:
         f"{shared_home}:{CONTAINER_SHARED_HOME}",
         "--entrypoint",
         "/usr/local/bin/silicon-runtime-entrypoint",
-        config.get("image") or DEFAULT_IMAGE,
+        image,
         "shared",
         *command,
     ]
@@ -615,8 +945,16 @@ def ensure_pull_runtime() -> bool:
     if runtime_opted_out():
         ui.info("SILICON_RUNTIME is set to local/host; pulling without Docker runtime.")
         return False
-    cfg = ensure_ready(auto_init=True, install=True, pull_image=True, refresh_image=True)
-    maybe_prompt_login(cfg)
+    # At this point no authenticated release has been fetched yet, so there is
+    # deliberately no image to pull. ``stemcell.prepare_hydration`` binds the
+    # digest from the verified signed manifest before any target or secret is
+    # written.
+    ensure_ready(
+        auto_init=True,
+        install=True,
+        pull_image=False,
+        write_compose=False,
+    )
     return True
 
 
@@ -638,12 +976,18 @@ def _compose_args(inst: registry.Install) -> list[str]:
     return [*_docker_cmd(cfg), "compose", "-f", cfg["compose_file"]]
 
 
-def _exec_args(inst: registry.Install, command: Iterable[str]) -> list[str]:
+def _exec_args(
+    inst: registry.Install,
+    command: Iterable[str],
+    *,
+    workdir: str = CONTAINER_PATH,
+    extra_environment: Iterable[str] = (),
+) -> list[str]:
     return [
         *_docker_cmd(config_for_install(inst)),
         "exec",
         "-w",
-        CONTAINER_PATH,
+        workdir,
         "-e",
         f"HOME={CONTAINER_HOME}",
         "-e",
@@ -654,6 +998,11 @@ def _exec_args(inst: registry.Install, command: Iterable[str]) -> list[str]:
         "SILICON_CONTAINER_MODE=1",
         "-e",
         f"SILICON_SHARED_HOME={CONTAINER_SHARED_HOME}",
+        *[
+            item
+            for value in extra_environment
+            for item in ("-e", value)
+        ],
         inst.container_name or container_name(inst.name),
         *command,
     ]
@@ -666,14 +1015,216 @@ def container_running(inst: registry.Install) -> bool:
 
 
 def silicon_running(inst: registry.Install) -> bool:
+    if silicon_child_status(inst) is not None:
+        return True
+    metadata = Path(inst.path).expanduser().resolve() / ".silicon.pid.meta.json"
+    if metadata.exists() or metadata.is_symlink():
+        # A current supervisor published metadata but it failed validation:
+        # never downgrade that evidence to the legacy watchdog-only signal.
+        return False
     if not container_running(inst):
         return False
-    result = _run(_exec_args(inst, [
-        "sh",
-        "-lc",
-        'test -s /silicon/.silicon.pid && kill -0 "$(cat /silicon/.silicon.pid)"',
-    ]), capture=True)
+    result = _run(
+        _exec_args(
+            inst,
+            [
+                "sh",
+                "-lc",
+                'test -s /silicon/.silicon.pid '
+                '&& kill -0 "$(cat /silicon/.silicon.pid)"',
+            ],
+        ),
+        capture=True,
+    )
+    # Pre-metadata runtime images remain conservatively "running" so an update
+    # still drains their work instead of stopping a potentially active task.
     return result.returncode == 0
+
+
+def silicon_child_status(inst: registry.Install) -> dict | None:
+    """Return validated main-child health from inside the PID namespace."""
+
+    if not container_running(inst):
+        return None
+    script = (
+        r"""
+import json
+import os
+import stat
+import subprocess
+import time
+from pathlib import Path
+
+"""
+        + _CONTAINER_PROCESS_IDENTITY_HELPER
+        + r"""
+root = Path("/silicon").resolve()
+pid_path = root / ".silicon.pid"
+meta_path = root / ".silicon.pid.meta.json"
+try:
+    if pid_path.is_symlink() or meta_path.is_symlink():
+        raise ValueError("linked health file")
+    pid_metadata = pid_path.stat()
+    meta_metadata = meta_path.stat()
+    if (
+        not stat.S_ISREG(pid_metadata.st_mode)
+        or pid_metadata.st_size > 128
+    ):
+        raise ValueError("invalid supervisor pid file")
+    if (
+        not stat.S_ISREG(meta_metadata.st_mode)
+        or meta_metadata.st_size > 16 * 1024
+    ):
+        raise ValueError("invalid child metadata file")
+    supervisor = int(pid_path.read_text(encoding="utf-8").strip())
+    value = json.loads(meta_path.read_text(encoding="utf-8"))
+    child = int(value["child_pid"])
+    recorded_supervisor = int(value["supervisor_pid"])
+    supervisor_identity = str(value["supervisor_identity"])
+    child_identity = str(value["child_identity"])
+    started_at = float(value["started_at"])
+    generation = Path(str(value["generation"])).resolve(strict=True)
+    if (
+        value.get("schema") != 1
+        or supervisor <= 0
+        or child <= 0
+        or recorded_supervisor != supervisor
+        or not supervisor_identity
+        or not child_identity
+    ):
+        raise ValueError("invalid child metadata")
+    os.kill(supervisor, 0)
+    os.kill(child, 0)
+    if (
+        _process_birth_identity(supervisor) != supervisor_identity
+        or _process_birth_identity(child) != child_identity
+    ):
+        raise ValueError("process birth identity changed")
+    pointer = root / ".silicon" / "current.json"
+    if pointer.exists():
+        selected = json.loads(pointer.read_text(encoding="utf-8"))
+        active = Path(str(selected["release_path"]))
+        if not active.is_absolute():
+            active = root / active
+        active = active.resolve(strict=True)
+        releases = (root / ".silicon" / "releases").resolve()
+        if (
+            selected.get("kind") != "immutable-release"
+            or releases not in active.parents
+            or not (active / "main.py").is_file()
+        ):
+            raise ValueError("invalid active generation")
+    else:
+        active = root
+    if generation != active:
+        raise ValueError("child belongs to a stale generation")
+    now = time.time()
+    if started_at > now + 5:
+        raise ValueError("child start time is in the future")
+    readiness = {}
+    health_path = root / ".silicon" / "runtime-health.json"
+    try:
+        if (
+            health_path.is_symlink()
+            or not stat.S_ISREG(health_path.stat().st_mode)
+            or health_path.stat().st_size > 16 * 1024
+        ):
+            raise ValueError("invalid readiness file")
+        health = json.loads(health_path.read_text(encoding="utf-8"))
+        health_pid = int(health["pid"])
+        health_root = Path(str(health["code_root"])).resolve(strict=True)
+        ready_at = float(health["ready_at"])
+        heartbeat_at = float(health["heartbeat_at"])
+        if (
+            health.get("schema") == 1
+            and health.get("ready") is True
+            and health_pid == child
+            and health_root == generation
+            and ready_at <= heartbeat_at
+        ):
+            readiness = {
+                "application_ready": True,
+                "ready_at": ready_at,
+                "heartbeat_at": heartbeat_at,
+                "phase": str(health.get("phase") or ""),
+            }
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        readiness = {}
+    print(
+        json.dumps(
+            {
+                "supervisor_pid": supervisor,
+                "child_pid": child,
+                "generation": str(generation),
+                "started_at": started_at,
+                "uptime_seconds": max(0.0, now - started_at),
+                **readiness,
+            },
+            sort_keys=True,
+        )
+    )
+except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+"""
+    )
+    result = _run(
+        _exec_args(inst, ["python3", "-c", script]),
+        capture=True,
+    )
+    lines = result.stdout.strip().splitlines()
+    if result.returncode or not lines:
+        return None
+    try:
+        value = json.loads(lines[-1])
+        if (
+            not isinstance(value, dict)
+            or int(value["supervisor_pid"]) <= 0
+            or int(value["child_pid"]) <= 0
+            or float(value["started_at"]) < 0
+            or float(value["uptime_seconds"]) < 0
+            or not str(value["generation"])
+        ):
+            return None
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return value
+
+
+def silicon_healthy(
+    inst: registry.Install, *, min_uptime: float = 5.0
+) -> bool:
+    status = silicon_child_status(inst)
+    return bool(
+        status is not None
+        and float(status["uptime_seconds"]) >= max(0.0, float(min_uptime))
+    )
+
+
+def silicon_ready(
+    inst: registry.Install,
+    *,
+    min_uptime: float = 5.0,
+    max_heartbeat_age: float = 5.0,
+) -> bool:
+    """Require a stable child plus a fresh app-owned readiness heartbeat."""
+
+    status = silicon_child_status(inst)
+    if (
+        status is None
+        or float(status["uptime_seconds"]) < max(0.0, float(min_uptime))
+        or status.get("application_ready") is not True
+    ):
+        return False
+    try:
+        heartbeat_at = float(status["heartbeat_at"])
+        ready_at = float(status["ready_at"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    age = time.time() - heartbeat_at
+    return bool(
+        0 <= age <= max(0.1, float(max_heartbeat_age))
+        and ready_at <= heartbeat_at
+    )
 
 
 def _wait_for_container(inst: registry.Install, seconds: float = 20.0) -> bool:
@@ -689,9 +1240,25 @@ def _exec_silicon(inst: registry.Install, args: list[str], *, check: bool = Fals
     return _run(_exec_args(inst, ["silicon", *args]), check=check)
 
 
-def maintenance_silicon(inst: registry.Install, args: list[str], *, check: bool = False) -> subprocess.CompletedProcess:
+def maintenance_command(
+    inst: registry.Install,
+    command: list[str],
+    *,
+    check: bool = False,
+    capture: bool = False,
+) -> subprocess.CompletedProcess:
+    """Run an arbitrary command in a short-lived runtime container.
+
+    The instance and shared authentication home are mounted exactly as they are
+    for the long-running service.  This is used to stage Linux dependencies on
+    the host's behalf without coupling them to the host Python/OS.
+    """
+
     cfg = config_for_install(inst)
-    image = inst.image or cfg.get("image") or DEFAULT_IMAGE
+    image = _require_runtime_image(
+        inst.image or cfg.get("image") or DEFAULT_IMAGE,
+        context=f"Docker Silicon '{inst.name}'",
+    )
     shared_home = Path(cfg["shared_home"]).expanduser().resolve()
     shared_home.mkdir(parents=True, exist_ok=True)
     env = [
@@ -715,32 +1282,562 @@ def maintenance_silicon(inst: registry.Install, args: list[str], *, check: bool 
         *volume,
         image,
         "run",
-        "silicon",
-        *args,
+        *command,
     ]
-    return _run(cmd, check=check)
+    return _run(cmd, check=check, capture=capture)
 
 
-def start_one(inst: registry.Install) -> None:
-    ensure_ready(auto_init=False, install=True, pull_image=False, quiet=True)
-    _ensure_image(config_for_install(inst))
-    render_compose(config_for_install(inst))
-    svc = inst.service or service_name(inst.name)
-    ui.info(f"Starting Docker service '{svc}' for '{inst.name}'...")
-    _run([*_compose_args(inst), "up", "-d", svc], check=True)
-    if not _wait_for_container(inst):
-        ui.error(f"Container for '{inst.name}' did not become healthy enough to exec into.")
+def _ephemeral_command(
+    inst: registry.Install,
+    command: list[str],
+    *,
+    workdir: str = CONTAINER_PATH,
+    extra_environment: Iterable[str] = (),
+    image: str | None = None,
+    check: bool = False,
+    capture: bool = False,
+) -> subprocess.CompletedProcess:
+    """Run a mounted-instance command without starting the service entrypoint."""
+
+    cfg = config_for_install(inst)
+    selected_image = _require_runtime_image(
+        image or inst.image or cfg.get("image") or DEFAULT_IMAGE,
+        context=f"Docker Silicon '{inst.name}'",
+    )
+    shared_home = Path(cfg["shared_home"]).expanduser().resolve()
+    shared_home.mkdir(parents=True, exist_ok=True)
+    user = host_user()
+    cmd = [
+        *_docker_cmd(cfg),
+        "run",
+        "--rm",
+        "--entrypoint",
+        command[0],
+        *(["--user", user] if user else []),
+        "-w",
+        workdir,
+        "-e",
+        f"HOME={CONTAINER_HOME}",
+        "-e",
+        f"SILICON_HOME={CONTAINER_HOME}/.silicon",
+        "-e",
+        f"SILICON_BROWSER_HOME={CONTAINER_PATH}/.silicon-browser",
+        "-e",
+        "SILICON_CONTAINER_MODE=1",
+        "-e",
+        f"SILICON_SHARED_HOME={CONTAINER_SHARED_HOME}",
+        *[
+            item
+            for value in extra_environment
+            for item in ("-e", value)
+        ],
+        "-v",
+        f"{Path(inst.path).expanduser().resolve()}:{CONTAINER_PATH}",
+        "-v",
+        f"{shared_home}:{CONTAINER_SHARED_HOME}",
+        selected_image,
+        *command[1:],
+    ]
+    return _run(cmd, check=check, capture=capture)
+
+
+def maintenance_silicon(
+    inst: registry.Install,
+    args: list[str],
+    *,
+    check: bool = False,
+) -> subprocess.CompletedProcess:
+    return maintenance_command(inst, ["silicon", *args], check=check)
+
+
+def _container_path(inst: registry.Install, host_path: str | Path) -> str:
+    root = Path(inst.path).expanduser().resolve()
+    resolved = Path(host_path).expanduser().resolve(strict=False)
+    try:
+        relative = resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Docker instance command path escaped {root}: {resolved}"
+        ) from exc
+    return str(Path(CONTAINER_PATH) / relative)
+
+
+def _host_path(inst: registry.Install, container_path: str | Path) -> Path:
+    root = Path(inst.path).expanduser().resolve()
+    raw = Path(container_path)
+    if not raw.is_absolute():
+        raw = Path(CONTAINER_PATH) / raw
+    try:
+        relative = raw.relative_to(CONTAINER_PATH)
+    except ValueError as exc:
+        raise ValueError(
+            f"Docker command path escaped {CONTAINER_PATH}: {raw}"
+        ) from exc
+    resolved = (root / relative).resolve(strict=False)
+    if resolved != root and root not in resolved.parents:
+        raise ValueError(f"Docker command path escaped {root}: {resolved}")
+    return resolved
+
+
+def _active_container_python(inst: registry.Install) -> str:
+    from .config import active_environment_python
+
+    environment_python = active_environment_python(inst.path)
+    if environment_python:
+        return _container_path(inst, environment_python)
+    legacy_python = (
+        Path(inst.path).expanduser().resolve() / ".venv" / "bin" / "python"
+    )
+    if legacy_python.is_file():
+        return f"{CONTAINER_PATH}/.venv/bin/python"
+    return "python3"
+
+
+def run_active_python(
+    inst: registry.Install,
+    arguments: list[str],
+    *,
+    capture: bool = True,
+) -> subprocess.CompletedProcess:
+    """Run active Stemcell code in the live or an isolated runtime container."""
+
+    from .config import active_release_root
+
+    release = active_release_root(inst.path)
+    container_release = _container_path(inst, release)
+    command = [_active_container_python(inst), *arguments]
+    extra_environment = (
+        f"SILICON_DATA_ROOT={CONTAINER_PATH}",
+        f"SILICON_RELEASE_ROOT={container_release}",
+    )
+    if container_running(inst):
+        return _run(
+            _exec_args(
+                inst,
+                command,
+                workdir=container_release,
+                extra_environment=extra_environment,
+            ),
+            capture=capture,
+        )
+    return _ephemeral_command(
+        inst,
+        command,
+        workdir=container_release,
+        extra_environment=extra_environment,
+        capture=capture,
+    )
+
+
+def verify_silicon_extend(inst: registry.Install) -> None:
+    """Require the active Docker Python environment to expose Extend."""
+
+    script = r"""
+from importlib import metadata
+import sys
+
+expected = sys.argv[1]
+try:
+    installed = metadata.version("silicon-extend")
+    package = __import__("silicon_extend")
+    entries = metadata.entry_points()
+    if hasattr(entries, "select"):
+        commands = entries.select(group="console_scripts", name="silicon-extend")
+    else:
+        commands = [
+            entry
+            for entry in entries.get("console_scripts", ())
+            if entry.name == "silicon-extend"
+        ]
+except Exception:
+    raise SystemExit(1)
+if (
+    installed != expected
+    or getattr(package, "__version__", "") != expected
+    or not tuple(commands)
+):
+    raise SystemExit(1)
+"""
+    result = run_active_python(
+        inst,
+        ["-I", "-c", script, SILICON_EXTEND_VERSION],
+        capture=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Docker Silicon '{inst.name}' does not have the required "
+            f"Silicon Extend {SILICON_EXTEND_VERSION} runtime. Ensure the "
+            "signed runtime image and Stemcell requirements lock include it, "
+            "then rerun the same pull."
+        )
+
+
+def prepare_environment(
+    inst: registry.Install,
+    release: str | Path,
+    *,
+    image: str | None = None,
+) -> Path | None:
+    """Prepare a Linux dependency generation before the task drain begins."""
+
+    release_path = Path(release).expanduser().resolve()
+    lockfile = release_path / "requirements.lock"
+    requirements = release_path / "requirements.txt"
+    if not lockfile.is_file():
+        if requirements.is_file():
+            raise RuntimeError(
+                "signed Docker release has requirements.txt but no "
+                "hash-pinned requirements.lock"
+            )
+        return None
+    container_release = _container_path(inst, release_path)
+    script = r"""
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import sysconfig
+from pathlib import Path
+
+release = Path(sys.argv[1]).resolve()
+root = Path("/silicon").resolve()
+releases = (root / ".silicon" / "releases").resolve()
+if releases not in release.parents:
+    raise SystemExit("candidate release escaped the immutable generation root")
+requirements = release / "requirements.lock"
+if not requirements.is_file():
+    raise SystemExit("candidate has no hash-pinned requirements.lock")
+digest = hashlib.sha256(requirements.read_bytes()).hexdigest()
+implementation = str(getattr(sys.implementation, "name", "") or "python")
+cache_tag = str(getattr(sys.implementation, "cache_tag", "") or "")
+soabi = str(sysconfig.get_config_var("SOABI") or "")
+abi_flags = str(getattr(sys, "abiflags", "") or "")
+machine = str(platform.machine() or "unknown")
+platform_tag = str(sysconfig.get_platform() or sys.platform)
+descriptor = "|".join(
+    (implementation, cache_tag, soabi, abi_flags, machine, platform_tag)
+)
+readable = "-".join(
+    part
+    for part in (implementation, cache_tag, soabi, machine, platform_tag)
+    if part
+).lower()
+readable = re.sub(r"[^a-z0-9._-]+", "-", readable).strip(".-_")
+platform_key = (
+    f"{(readable or 'python-runtime')[:120]}-"
+    f"{hashlib.sha256(descriptor.encode()).hexdigest()[:16]}"
+)
+runtime_identity = {
+    "implementation": implementation,
+    "cache_tag": cache_tag,
+    "soabi": soabi,
+    "abi_flags": abi_flags,
+    "machine": machine,
+    "platform": platform_tag,
+    "key": platform_key,
+}
+environment_root = root / ".silicon" / "environments"
+environment_root.mkdir(parents=True, exist_ok=True)
+if environment_root.is_symlink() or root not in environment_root.resolve().parents:
+    raise SystemExit("dependency environment root is unsafe")
+environment = environment_root / f"{digest}-{platform_key}"
+marker = environment / ".silicon-environment.json"
+if environment.is_symlink():
+    raise SystemExit("dependency environment target is unsafe")
+
+def ready():
+    try:
+        if marker.is_symlink():
+            return False
+        value = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return (
+        value.get("requirements_sha256") == digest
+        and value.get("requirements_file") == "requirements.lock"
+        and value.get("require_hashes") is True
+        and value.get("runtime") == runtime_identity
+        and (environment / "bin" / "python").is_file()
+    )
+
+if not ready():
+    temporary = environment.with_name(f".{environment.name}.{os.getpid()}.tmp")
+    shutil.rmtree(temporary, ignore_errors=True)
+    if environment.exists() or environment.is_symlink():
+        if environment.is_symlink() or not environment.is_dir():
+            raise SystemExit("dependency environment target is unsafe")
+        shutil.rmtree(environment)
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "venv", str(temporary)],
+            check=True,
+        )
+        subprocess.run(
+            [
+                str(temporary / "bin" / "python"),
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--require-hashes",
+                "-r",
+                str(requirements),
+            ],
+            check=True,
+        )
+        marker_tmp = temporary / ".silicon-environment.json.tmp"
+        marker_tmp.write_text(
+            json.dumps(
+                {
+                    "requirements_sha256": digest,
+                    "requirements_file": "requirements.lock",
+                    "require_hashes": True,
+                    "runtime": runtime_identity,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(marker_tmp, temporary / ".silicon-environment.json")
+        os.replace(temporary, environment)
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+
+print(json.dumps({"environment_path": str(environment)}))
+"""
+    result = _ephemeral_command(
+        inst,
+        ["python3", "-c", script, container_release],
+        workdir=container_release,
+        extra_environment=(
+            f"SILICON_DATA_ROOT={CONTAINER_PATH}",
+            f"SILICON_RELEASE_ROOT={container_release}",
+        ),
+        image=image,
+        capture=True,
+    )
+    lines = result.stdout.strip().splitlines()
+    if result.returncode or not lines:
+        raise RuntimeError(
+            "could not prepare Docker dependency environment: "
+            + (result.stderr.strip() or result.stdout.strip() or "no response")
+        )
+    try:
+        value = json.loads(lines[-1])
+        environment = _host_path(inst, str(value["environment_path"]))
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "Docker dependency builder returned an invalid environment path"
+        ) from exc
+    environment_root = (
+        Path(inst.path).expanduser().resolve() / ".silicon" / "environments"
+    ).resolve()
+    if environment_root not in environment.parents:
+        raise RuntimeError("Docker dependency environment escaped its safe root")
+    return environment
+
+
+def glass_agent_running(inst: registry.Install) -> bool:
+    if not container_running(inst):
+        return False
+    script = (
+        r"""
+import json
+import os
+import stat
+import subprocess
+from pathlib import Path
+
+"""
+        + _CONTAINER_PROCESS_IDENTITY_HELPER
+        + r"""
+root = Path("/silicon").resolve()
+pid_path = root / ".glass_agent.pid"
+meta_path = root / ".glass_agent.pid.meta.json"
+try:
+    if pid_path.is_symlink():
+        raise ValueError("linked sidecar pid file")
+    pid_metadata = pid_path.stat()
+    if (
+        not stat.S_ISREG(pid_metadata.st_mode)
+        or pid_metadata.st_size <= 0
+        or pid_metadata.st_size > 128
+    ):
+        raise ValueError("invalid sidecar pid file")
+    process_id = int(pid_path.read_text(encoding="utf-8").strip())
+    if process_id <= 0:
+        raise ValueError("invalid sidecar pid")
+    current_identity = _process_birth_identity(process_id)
+    if not current_identity:
+        raise ValueError("sidecar is not alive")
+    if meta_path.exists() or meta_path.is_symlink():
+        if meta_path.is_symlink():
+            raise ValueError("linked sidecar identity file")
+        identity_metadata = meta_path.stat()
+        if (
+            not stat.S_ISREG(identity_metadata.st_mode)
+            or identity_metadata.st_size <= 0
+            or identity_metadata.st_size > 16 * 1024
+        ):
+            raise ValueError("invalid sidecar identity file")
+        value = json.loads(meta_path.read_text(encoding="utf-8"))
+        recorded_identity = str(value["identity"])
+        if (
+            value.get("schema") != 1
+            or int(value["pid"]) != process_id
+            or not recorded_identity
+            or recorded_identity != current_identity
+        ):
+            raise ValueError("sidecar process birth identity changed")
+except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+"""
+    )
+    result = _run(
+        _exec_args(
+            inst,
+            ["python3", "-c", script],
+        ),
+        capture=True,
+    )
+    return result.returncode == 0
+
+
+def start_one(
+    inst: registry.Install,
+    *,
+    start_main: bool = True,
+    start_agent: bool = True,
+    reconcile: bool = True,
+    allow_legacy_fence: bool = False,
+) -> None:
+    ensure_ready(
+        auto_init=False,
+        install=True,
+        pull_image=False,
+        quiet=True,
+        write_compose=False,
+    )
+    if reconcile:
+        # Normal starts must converge any interrupted transaction before the
+        # container can accept new work. Updater-owned restores explicitly
+        # pass reconcile=False to avoid recursion while resuming that same
+        # transaction.
+        from . import update
+
+        update.reconcile_before_start(inst)
+    fence_owner = _legacy_offline_fence_owner(inst)
+    if fence_owner and not allow_legacy_fence:
+        ui.error(
+            f"'{inst.name}' has a legacy offline update in progress; run "
+            f"'silicon update resume {inst.name}' before starting it."
+        )
         return
-    # If the container is already alive but its Silicon was stopped, restart just the
-    # Silicon process. If entrypoint already started it, this prints "already running".
-    for _ in range(5):
-        if silicon_running(inst):
-            break
-        result = _exec_silicon(inst, ["start", inst.name])
-        if result.returncode == 0 or silicon_running(inst):
-            break
-        time.sleep(2)
+    active_image = active_generation_runtime_image(inst)
+    if active_image and active_image != inst.image:
+        bind_release_runtime(active_image, installs=[inst])
+    cfg = config_for_install(inst)
+    _ensure_image(cfg)
+    render_compose(
+        cfg,
+        update_fence_owners=(
+            {inst.name: fence_owner}
+            if fence_owner and allow_legacy_fence
+            else None
+        ),
+    )
+    svc = inst.service or service_name(inst.name)
+    suspend_marker = (
+        Path(inst.path).expanduser().resolve()
+        / ".silicon"
+        / "docker-start-suspended"
+    )
+    was_running = container_running(inst)
+    if not start_main and not was_running:
+        suspend_marker.parent.mkdir(parents=True, exist_ok=True)
+        suspend_marker.touch()
+    ui.info(f"Starting Docker service '{svc}' for '{inst.name}'...")
+    try:
+        _run([*_compose_args(inst), "up", "-d", svc], check=True)
+        if not _wait_for_container(inst):
+            ui.error(
+                f"Container for '{inst.name}' did not become healthy enough "
+                "to exec into."
+            )
+            return
+        if not start_main and not was_running:
+            acknowledgement_deadline = time.monotonic() + 20.0
+            while (
+                suspend_marker.exists()
+                and container_running(inst)
+                and time.monotonic() < acknowledgement_deadline
+            ):
+                time.sleep(0.1)
+            if suspend_marker.exists():
+                raise RuntimeError(
+                    f"Container for '{inst.name}' did not acknowledge its "
+                    "transactional start suspension"
+                )
+        if start_main:
+            # If the container was already alive but its Silicon was stopped,
+            # restart just the Silicon process. If the entrypoint already
+            # started it, this is a no-op.
+            for _ in range(5):
+                if silicon_running(inst):
+                    break
+                result = _exec_silicon(inst, ["start", inst.name])
+                if result.returncode == 0 or silicon_running(inst):
+                    break
+                time.sleep(2)
+        elif silicon_running(inst):
+            _exec_silicon(inst, ["stop", inst.name])
+
+        if start_agent:
+            if not glass_agent_running(inst):
+                _exec_silicon(inst, ["agent", "start", inst.name])
+        elif glass_agent_running(inst):
+            _exec_silicon(inst, ["agent", "stop", inst.name])
+    finally:
+        if fence_owner and allow_legacy_fence:
+            # Keep the durable Compose source fail-closed. The created
+            # container retains the transaction-scoped owner only for this
+            # controlled start/restart.
+            render_compose(config_for_install(inst))
+        # A failed compose start must not accidentally suppress a later,
+        # unrelated normal start. A live container owns the marker until its
+        # entrypoint acknowledges and removes it.
+        if not container_running(inst):
+            suspend_marker.unlink(missing_ok=True)
     ui.success(f"'{inst.name}' Docker service is running.")
+
+
+def restore_one(
+    inst: registry.Install,
+    *,
+    container: bool,
+    main: bool,
+    glass_agent: bool,
+    reconcile: bool = False,
+    allow_legacy_fence: bool = False,
+) -> None:
+    """Restore the exact Docker/service state observed before maintenance."""
+
+    if not container:
+        if container_running(inst):
+            stop_one(inst, full=True)
+        return
+    start_one(
+        inst,
+        start_main=main,
+        start_agent=glass_agent,
+        reconcile=reconcile,
+        allow_legacy_fence=allow_legacy_fence,
+    )
 
 
 def stop_one(inst: registry.Install, *, full: bool = False) -> None:
@@ -829,13 +1926,55 @@ def parse_init_args(args: list[str]) -> tuple[str | None, str | None, str | None
 
 def cmd_docker(args: list[str]) -> None:
     sub = args[0] if args else "status"
-    if sub in {"init", "bootstrap", "doctor"}:
+    if sub in {"init", "bootstrap"}:
         root, image, shared_home = parse_init_args(args[1:])
-        cfg = ensure_ready(auto_init=True, install=True, pull_image=True, refresh_image=True, root=root, image=image)
+        cfg = ensure_ready(
+            auto_init=True,
+            install=True,
+            pull_image=False,
+            root=root,
+            image=image,
+            write_compose=False,
+        )
         if shared_home:
-            init(cfg["root"], cfg["image"], shared_home=shared_home, docker_sudo=bool(cfg.get("docker_sudo")))
-        if sub == "doctor":
-            ui.success("Docker runtime is ready.")
+            init(
+                cfg["root"],
+                cfg["image"],
+                shared_home=shared_home,
+                docker_sudo=bool(cfg.get("docker_sudo")),
+                write_compose=False,
+            )
+            cfg = load_config(required=True)
+        if image:
+            cfg = bind_release_runtime(image)
+        elif runtime_image_is_pinned(cfg.get("image")):
+            _ensure_image(cfg)
+            render_compose(cfg)
+        else:
+            ui.info(
+                "Docker prerequisites are ready. The next signed `silicon "
+                "pull` binds and pulls its immutable runtime image digest."
+            )
+        return
+    if sub == "doctor":
+        root, image, shared_home = parse_init_args(args[1:])
+        cfg = ensure_ready(
+            auto_init=False,
+            install=False,
+            pull_image=False,
+            root=root,
+            image=image,
+            write_compose=False,
+        )
+        if shared_home:
+            ui.error("--shared-home is only supported by silicon docker init")
+            raise SystemExit(1)
+        if image:
+            cfg = bind_release_runtime(image)
+        else:
+            _ensure_image(cfg)
+            render_compose(cfg)
+        ui.success("Docker runtime and immutable image digest are ready.")
         return
     if sub == "login":
         login(args[1:])

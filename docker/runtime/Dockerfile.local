@@ -1,0 +1,23 @@
+# syntax=docker/dockerfile:1.7
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# The three named contexts contain prebuilt wheels. Keeping the local overlay
+# separate from the production Dockerfile makes rapid CLI/browser iteration
+# reproducible without publishing any package first.
+COPY --from=silicon_cli_wheel / /tmp/silicon-cli-wheel/
+COPY --from=silicon_browser_wheel / /tmp/silicon-browser-wheel/
+COPY --from=silicon_extend_wheel / /tmp/silicon-extend-wheel/
+
+RUN /opt/silicon-runtime/bin/pip install \
+      --no-cache-dir \
+      --force-reinstall \
+      /tmp/silicon-cli-wheel/*.whl \
+      /tmp/silicon-browser-wheel/*.whl \
+      /tmp/silicon-extend-wheel/*.whl \
+    && /opt/silicon-runtime/bin/pip check \
+    && rm -rf \
+      /tmp/silicon-cli-wheel \
+      /tmp/silicon-browser-wheel \
+      /tmp/silicon-extend-wheel

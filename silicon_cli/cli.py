@@ -5,13 +5,23 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import docker_runtime, glassagent, process, registry, stemcell, sync, ui, update
-from .config import python_run_cmd
+from . import (
+    docker_runtime,
+    glassagent,
+    package_manager,
+    process,
+    registry,
+    stemcell,
+    sync,
+    ui,
+    update,
+)
+from .config import active_release_root, python_run_cmd, runtime_environment
 
 COMMANDS = ["start", "stop", "restart", "status", "browser", "debug", "attach",
             "pull", "push", "backup", "update", "update-check", "check-update",
             "browser-profile", "list", "install", "new", "help", "script", "agent",
-            "docker", "claude", "codex"]
+            "docker", "claude", "codex", "package"]
 
 
 def _parse_pull_args(args: list[str]) -> tuple[str | None, sync.PullOpts]:
@@ -33,15 +43,22 @@ def _parse_pull_args(args: list[str]) -> tuple[str | None, sync.PullOpts]:
         if a in ("-y", "--yes"):
             opts.assume_yes = True
         elif a == "--brain" and i + 1 < len(args):
-            opts.brain = args[i + 1].strip().lower(); i += 1
+            opts.brain = args[i + 1].strip().lower()
+            i += 1
         elif a == "--brain-order" and i + 1 < len(args):
-            opts.brain_order = [b.strip().lower() for b in args[i + 1].split(",") if b.strip()]; i += 1
+            opts.brain_order = [
+                b.strip().lower()
+                for b in args[i + 1].split(",")
+                if b.strip()
+            ]
+            i += 1
         elif a == "--backup":
             opts.backup = True
         elif a == "--no-backup":
             opts.backup = False
         elif a == "--name" and i + 1 < len(args):
-            opts.name = args[i + 1].strip(); i += 1
+            opts.name = args[i + 1].strip()
+            i += 1
         elif a == "--runtime" and i + 1 < len(args):
             rt = args[i + 1].strip().lower()
             import os
@@ -108,7 +125,15 @@ def cmd_browser(target: str | None) -> None:
         docker_runtime.run_silicon(inst, ["browser", inst.name])
         return
     ui.info(f"Opening browser for '{inst.name}'...")
-    subprocess.run([python_run_cmd(inst.path), "main.py", "browser"], cwd=inst.path)
+    subprocess.run(
+        [
+            python_run_cmd(inst.path),
+            str(active_release_root(inst.path) / "main.py"),
+            "browser",
+        ],
+        cwd=inst.path,
+        env=runtime_environment(inst.path),
+    )
 
 
 def cmd_debug(target: str | None) -> None:
@@ -182,8 +207,11 @@ def cmd_agent(subcmd: str | None, target: str | None) -> None:
         glassagent.stop(inst.path)
     elif subcmd == "status":
         if glassagent.status(inst.path):
-            pid = (Path(inst.path) / ".glass_agent.pid").read_text().strip()
-            print(f"{ui.GREEN}●{ui.RESET} Glass agent running (PID {pid})")
+            agent_pid = glassagent.pid(inst.path)
+            print(
+                f"{ui.GREEN}●{ui.RESET} Glass agent running "
+                f"(PID {agent_pid})"
+            )
         else:
             print(f"{ui.DIM}○{ui.RESET} Glass agent stopped")
     else:
@@ -193,13 +221,20 @@ def cmd_agent(subcmd: str | None, target: str | None) -> None:
 
 def cmd_new(target: str | None) -> None:
     if docker_runtime.enabled():
-        docker_runtime.ensure_ready(auto_init=False, install=True, pull_image=True, quiet=True)
+        docker_runtime.ensure_ready(
+            auto_init=False,
+            install=True,
+            pull_image=False,
+            quiet=True,
+            write_compose=False,
+        )
         docker_target = docker_runtime.target_path(target)
         stemcell.hydrate(
             str(docker_target),
             install_deps=False,
             setup_interface=False,
             register_install=False,
+            bind_docker_runtime=True,
         )
         name = docker_target.name
         sj = docker_target / "silicon.json"
@@ -240,9 +275,10 @@ def cmd_help() -> None:
   silicon agent <start|stop|status> [name]  Manage glass agent
   silicon status [name]       Show instance status
   silicon browser [name]      Open headed browser for login
-  silicon browser-profile setup <token>
-                             Create a cloud browser profile through Glass
-  silicon browser-profile finish <token> <session_id> [before_ids_csv]
+  silicon browser-profile setup
+                             Create a cloud browser profile through Glass;
+                             paste the token into the hidden prompt
+  silicon browser-profile finish <session_id>
                              Finish a browser profile setup session
   silicon debug [name]        Attach to running instance (live logs)
   silicon attach [path]       Register an existing silicon instance
@@ -253,17 +289,28 @@ def cmd_help() -> None:
   silicon push [name]         Start daily 23:59 GMT backup loop to Glass
   silicon push [name] now     Push a one-time backup to Glass
   silicon push [name] stop    Stop the daily backup loop
-  silicon backup [name] [now|stop] Alias for silicon push
-  silicon update <target>     Update silicon(s) to latest. target = name, *, all, 1,2,4, or name,name
+  silicon push [name] status  Show supervisor health and next attempt
+  silicon backup [name] [now|stop|status] Alias for silicon push
+  silicon update <target>     Stage, drain, checkpoint, update, validate, and restart
+  silicon update --dry-run <target>  Show the exact merge/update plan
+  silicon update --allow-unsigned-git <target>  Explicit compatibility source
+  silicon update status [name]       Show generation and transaction state
+  silicon update cancel [name]       Cancel an update before its stop boundary
+  silicon update resume [name]       Resume an interrupted transaction
+  silicon update history [name]      Show durable update history
+  silicon update rollback [name]     Task-safely reactivate the prior generation
   silicon update check [name] Trigger this silicon's system update check now
   silicon update-check [name] Trigger this silicon's system update check now
   silicon list                List all instances
-  silicon docker init         Install/check Docker and enable Docker-backed installs
+  silicon docker init         Check Docker and enable Docker-backed installs
   silicon docker doctor       Repair/check Docker runtime setup
   silicon docker login        Set up shared Claude/Codex auth for Docker silicons
   silicon claude [args...]    Run Claude Code with shared Docker auth
   silicon codex [args...]     Run Codex with shared Docker auth
   silicon script update       Update the silicon CLI itself
+  silicon package inventory   List host, Docker, and per-instance package versions
+  silicon package update <package>
+                              Safely update every selected copy of a package
   silicon install             Install a new instance
   silicon help                Show this help
 """)
@@ -293,8 +340,19 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     if cmd == "_backup_loop":  # internal: the scheduled manifest backup loop
-        sync.backup_loop(a1 or ".", a2)
+        sync.backup_loop(a1 or ".", a2, argv[3] if len(argv) > 3 else None)
         return
+
+    if cmd == "_maintenance_reconcile":
+        from .updater.maintenance import reconcile_pending_terminal
+
+        reconcile_pending_terminal(Path(a1 or "."))
+        return
+
+    # A durable schedule intent survives host restarts even though its detached
+    # process does not. Any normal CLI startup repairs missing supervisors.
+    if cmd not in {"push", "backup"}:
+        sync.reconcile_backup_schedules(quiet=True)
 
     if cmd == "start":
         process.start(a1)
@@ -335,10 +393,7 @@ def main(argv: list[str] | None = None) -> None:
     elif cmd in ("push", "backup"):
         sync.push(a1, a2)
     elif cmd == "update":
-        if a1 in ("check", "trigger"):
-            update.trigger_update_check(a2)
-        else:
-            update.update_instance(a1)
+        update.update_command(argv[1:])
     elif cmd in ("update-check", "check-update"):
         update.trigger_update_check(a1)
     elif cmd in ("list", "ls"):
@@ -351,6 +406,12 @@ def main(argv: list[str] | None = None) -> None:
         else:
             ui.error(f"Unknown script command: {a1}. Did you mean: silicon script update?")
             sys.exit(1)
+    elif cmd == "package":
+        try:
+            package_manager.package_command(argv[1:])
+        except RuntimeError as exc:
+            ui.error(str(exc))
+            sys.exit(2)
     elif cmd == "new":
         cmd_new(a1)
     elif cmd == "install":

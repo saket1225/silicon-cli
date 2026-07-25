@@ -80,22 +80,182 @@ prepare_runtime() {
   prepare_shared_auth
   cd "$SILICON_ROOT"
 
-  if [ -f requirements.txt ]; then
+  # Resolve the same atomically selected generation as silicon-cli.  Generation
+  # pointers are instance-relative so the host path and /silicon mount can
+  # differ without making the active code or requirements disappear.
+  local release_root
+  local environment_python
+  local -a runtime_paths
+  mapfile -d '' -t runtime_paths < <(python3 - "$SILICON_ROOT" <<'PY'
+import hashlib
+import json
+import platform
+import re
+import sys
+import sysconfig
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+pointer = root / ".silicon" / "current.json"
+if not pointer.exists():
+    sys.stdout.write(str(root) + "\0\0")
+    raise SystemExit(0)
+value = json.loads(pointer.read_text(encoding="utf-8"))
+candidate = Path(str(value.get("release_path") or ""))
+if not candidate.is_absolute():
+    candidate = root / candidate
+candidate = candidate.resolve()
+releases = (root / ".silicon" / "releases").resolve()
+if (
+    value.get("kind") != "immutable-release"
+    or releases not in candidate.parents
+    or not (candidate / "main.py").is_file()
+):
+    raise SystemExit("invalid active Silicon generation pointer")
+environment_python = ""
+environment_value = str(value.get("environment_path") or "")
+if environment_value:
+    environment = Path(environment_value)
+    if not environment.is_absolute():
+        environment = root / environment
+    if environment.is_symlink():
+        raise SystemExit("active Silicon environment must not be a symlink")
+    environment = environment.resolve()
+    environments = (root / ".silicon" / "environments").resolve()
+    python = environment / "bin" / "python"
+    if environments not in environment.parents or not python.is_file():
+        raise SystemExit("invalid active Silicon environment pointer")
+    lockfile = candidate / "requirements.lock"
+    marker = environment / ".silicon-environment.json"
+    try:
+        marker_value = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise SystemExit("active Silicon environment has no valid ready marker")
+    lock_digest = hashlib.sha256(lockfile.read_bytes()).hexdigest()
+    implementation = str(getattr(sys.implementation, "name", "") or "python")
+    cache_tag = str(getattr(sys.implementation, "cache_tag", "") or "")
+    soabi = str(sysconfig.get_config_var("SOABI") or "")
+    abi_flags = str(getattr(sys, "abiflags", "") or "")
+    machine = str(platform.machine() or "unknown")
+    platform_tag = str(sysconfig.get_platform() or sys.platform)
+    descriptor = "|".join(
+        (implementation, cache_tag, soabi, abi_flags, machine, platform_tag)
+    )
+    readable = "-".join(
+        part
+        for part in (
+            implementation,
+            cache_tag,
+            soabi,
+            machine,
+            platform_tag,
+        )
+        if part
+    ).lower()
+    readable = re.sub(r"[^a-z0-9._-]+", "-", readable).strip(".-_")
+    runtime_key = (
+        f"{(readable or 'python-runtime')[:120]}-"
+        f"{hashlib.sha256(descriptor.encode()).hexdigest()[:16]}"
+    )
+    runtime_identity = {
+        "implementation": implementation,
+        "cache_tag": cache_tag,
+        "soabi": soabi,
+        "abi_flags": abi_flags,
+        "machine": machine,
+        "platform": platform_tag,
+        "key": runtime_key,
+    }
+    if (
+        marker.is_symlink()
+        or not isinstance(marker_value, dict)
+        or set(marker_value)
+        != {
+            "requirements_sha256",
+            "requirements_file",
+            "require_hashes",
+            "runtime",
+        }
+        or marker_value.get("requirements_sha256") != lock_digest
+        or marker_value.get("requirements_file") != "requirements.lock"
+        or marker_value.get("require_hashes") is not True
+        or marker_value.get("runtime") != runtime_identity
+    ):
+        raise SystemExit("active Silicon environment does not match requirements.lock")
+    environment_python = str(python)
+sys.stdout.write(str(candidate) + "\0" + environment_python + "\0")
+PY
+)
+  release_root="${runtime_paths[0]}"
+  environment_python="${runtime_paths[1]:-}"
+
+  local dependency_file=""
+  local -a pip_integrity_args=()
+  if [ -f "$release_root/requirements.lock" ]; then
+    dependency_file="$release_root/requirements.lock"
+    pip_integrity_args=(--require-hashes)
+  elif [ -f "$release_root/requirements.txt" ]; then
+    if [ -f "$SILICON_ROOT/.silicon/current.json" ]; then
+      log "active immutable generation has no hash-pinned requirements.lock"
+      exit 1
+    fi
+    # Bootstrap-only compatibility for a legacy flat installation.
+    dependency_file="$release_root/requirements.txt"
+  fi
+
+  if [ -n "$environment_python" ]; then
+    log "using pre-staged active-generation dependency environment"
+  elif [ -n "$dependency_file" ]; then
     local venv_python="$SILICON_ROOT/.venv/bin/python"
     local req_hash
     local marker="$SILICON_ROOT/.venv/.silicon_requirements.sha256"
-    req_hash="$(hash_file requirements.txt)"
+    req_hash="$(hash_file "$dependency_file")"
     if [ ! -x "$venv_python" ]; then
       log "creating instance venv"
       python3 -m venv "$SILICON_ROOT/.venv"
     fi
     if [ ! -f "$marker" ] || [ "$(cat "$marker" 2>/dev/null || true)" != "$req_hash" ]; then
-      log "installing instance Python dependencies"
+      log "installing active-generation Python dependencies"
       "$venv_python" -m pip install --upgrade pip >/dev/null
-      "$venv_python" -m pip install -r requirements.txt
+      "$venv_python" -m pip install "${pip_integrity_args[@]}" -r "$dependency_file"
       printf '%s\n' "$req_hash" > "$marker"
     fi
   fi
+
+  if [ -n "$environment_python" ]; then
+    export PATH="$(dirname "$environment_python"):$PATH"
+  elif [ -x "$SILICON_ROOT/.venv/bin/python" ]; then
+    export PATH="$SILICON_ROOT/.venv/bin:$PATH"
+  fi
+
+  python - "${SILICON_EXTEND_REQUIRED_VERSION:-0.1.1}" <<'PY'
+from importlib import metadata
+import sys
+
+expected = sys.argv[1]
+try:
+    installed = metadata.version("silicon-extend")
+    package = __import__("silicon_extend")
+    entries = metadata.entry_points()
+    if hasattr(entries, "select"):
+        commands = entries.select(group="console_scripts", name="silicon-extend")
+    else:
+        commands = [
+            entry
+            for entry in entries.get("console_scripts", ())
+            if entry.name == "silicon-extend"
+        ]
+except Exception:
+    raise SystemExit("Silicon Extend is not installed in the active runtime")
+if (
+    installed != expected
+    or getattr(package, "__version__", "") != expected
+    or not tuple(commands)
+):
+    raise SystemExit(
+        f"active Silicon Extend does not match required version {expected}"
+    )
+PY
 
   if command -v silicon-interface >/dev/null 2>&1; then
     if [ ! -x "$SILICON_ROOT/.silicon-interface/bin/si" ]; then
@@ -122,6 +282,12 @@ PY
 stop_runtime() {
   log "stopping Silicon"
   silicon stop --full "$INSTANCE_NAME" || true
+}
+
+terminate_runtime() {
+  trap - TERM INT
+  stop_runtime
+  exit 0
 }
 
 if [ "${1:-}" = "auth" ]; then
@@ -173,16 +339,68 @@ if [ "${1:-}" = "shell" ]; then
   exec "${SHELL:-/bin/bash}" "$@"
 fi
 
+# A legacy Silicon without the task-safe coordinator is updated only while
+# fully offline. Refuse direct Compose/Docker restarts during that transaction.
+# The host updater can recreate the service with the exact fence owner for its
+# controlled health check; ordinary starts never receive that value.
+python3 - "$SILICON_ROOT" <<'PY'
+import json
+import math
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+marker = root / ".silicon" / "maintenance" / "legacy-offline.json"
+try:
+    metadata = marker.lstat()
+except FileNotFoundError:
+    raise SystemExit(0)
+if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+    raise SystemExit("legacy offline update fence is unsafe; run silicon update resume")
+try:
+    value = json.loads(marker.read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    raise SystemExit("legacy offline update fence is corrupt; run silicon update resume")
+owner = value.get("update_id") if isinstance(value, dict) else None
+if (
+    not isinstance(value, dict)
+    or set(value) != {"schema", "update_id", "created_at"}
+    or value.get("schema") != 1
+    or not isinstance(owner, str)
+    or re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", owner) is None
+    or not isinstance(value.get("created_at"), (int, float))
+    or isinstance(value.get("created_at"), bool)
+    or not math.isfinite(value["created_at"])
+):
+    raise SystemExit("legacy offline update fence is invalid; run silicon update resume")
+if os.environ.get("SILICON_LEGACY_UPDATE_FENCE_OWNER", "") != owner:
+    raise SystemExit(
+        "legacy offline update is in progress; run silicon update resume before starting"
+    )
+PY
+
 prepare_runtime
 
 # PIDs are namespaced to each container boot. Stale files from a previous
 # container can point at an unrelated new process, so remove them before start.
-rm -f "$SILICON_ROOT/.silicon.pid" "$SILICON_ROOT/.glass_agent.pid"
+rm -f \
+  "$SILICON_ROOT/.silicon.pid" \
+  "$SILICON_ROOT/.silicon.pid.meta.json" \
+  "$SILICON_ROOT/.glass_agent.pid" \
+  "$SILICON_ROOT/.silicon/runtime-health.json"
 
-trap stop_runtime TERM INT
+trap terminate_runtime TERM INT
 
 log "starting $INSTANCE_NAME"
-silicon start "$INSTANCE_NAME" || log "initial start returned non-zero; container stays alive for inspection"
+if [ -f "$SILICON_ROOT/.silicon/docker-start-suspended" ]; then
+  rm -f "$SILICON_ROOT/.silicon/docker-start-suspended"
+  log "service start suspended for transactional state restoration"
+else
+  silicon start "$INSTANCE_NAME" || log "initial start returned non-zero; container stays alive for inspection"
+fi
 
 while true; do
   sleep 3600 &

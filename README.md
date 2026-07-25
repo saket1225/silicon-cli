@@ -13,10 +13,11 @@ over unchanged.
 ## Install
 
 ```bash
-pip install silicon-cli
+pip install --upgrade silicon-cli
 ```
 
-(Zero runtime dependencies — stdlib only.)
+The package has a small runtime dependency footprint and installs the complete
+`silicon` team-management command.
 
 ## Commands
 
@@ -30,17 +31,23 @@ silicon restart <target>     Restart silicon(s). target = name, *, all, 1,2,4, o
 silicon agent <start|stop|status> [name]   Manage the per-silicon glass agent
 silicon status [name]        Show instance status
 silicon browser [name]       Open a headed browser for login
-silicon browser-profile setup <token>  Create a Steel browser profile through Glass
-silicon browser-profile finish <token> <session_id> [before_ids_csv]  Finish profile setup
+silicon browser-profile setup          Create a cloud browser profile through Glass
+silicon browser-profile finish <session_id>  Finish profile setup
 silicon debug [name]         Tail a running instance's logs
 silicon attach [path]        Register an existing silicon directory
 silicon pull [api_token]     Pull a Glass team or silicon into local folders
-silicon push [name] [now|stop]   Daily 23:59 GMT backups to Glass (now = one-shot, stop = end loop)
-silicon backup [name] [now|stop] Alias for silicon push
-silicon update <target>      Update silicon(s) from the latest stemcell
+silicon push [name] [now|stop|status]   Daily 23:59 GMT backups to Glass
+silicon backup [name] [now|stop|status] Alias for silicon push
+silicon update <target>      Task-safely update silicon(s) from the latest stemcell
+silicon update --dry-run <target>  Verify and show the exact update/merge plan
+silicon update status [name]       Show active generation and transaction state
+silicon update cancel [name]       Cancel before the service-stop boundary
+silicon update resume [name]       Recover an interrupted transaction
+silicon update history [name]      Show durable transaction history
+silicon update rollback [name]     Task-safely reactivate the prior generation
 silicon list                 List all instances
-silicon docker init [--root ~/silicons] [--image ghcr.io/teamofsilicons/silicon-runtime:latest]
-                             Install/check Docker and enable one-container-per-Silicon runtime
+silicon docker init [--root ~/silicons] [--image registry/repository@sha256:<digest>]
+                             Check Docker and enable one-container-per-Silicon runtime
 silicon docker doctor        Check/repair Docker runtime setup
 silicon docker login [claude|codex|all]
                              Set up shared Claude/Codex auth for Docker silicons
@@ -48,8 +55,20 @@ silicon docker compose       Print generated Compose file path
 silicon claude [args...]     Run Claude Code with shared Docker auth
 silicon codex [args...]      Run Codex with shared Docker auth
 silicon script update        Update this CLI itself
+silicon package inventory --json
+                             Report host, Docker, and per-instance package versions
+silicon package update <package> [--silicon-id ID]
+                             Safely update every selected copy of one package
 silicon help                 Show help
 ```
+
+`silicon package update` accepts `silicon`, `silicon-cli`,
+`silicon-browser`, `silicon-extend`, `silicon-interface`, `claude`, or
+`codex`. Shared pip/npm copies update once on the host. Local instance copies
+update only across a safe stop boundary, and Docker copies move through the
+signed runtime release instead of being modified inside a running container.
+Glass uses the JSON form of these commands to provide team-scoped inventory
+and durable update jobs.
 
 ## Configuration (env vars)
 
@@ -57,8 +76,10 @@ silicon help                 Show help
 | --- | --- | --- |
 | `SILICON_HOME` | `~/.silicon` | registry + CLI state |
 | `GLASS_SERVER_URL` | `https://glass.teamofsilicons.com` | Glass sync server (pull/push) |
+| `SILICON_RELEASE_MANIFEST_URL` | `<GLASS_SERVER_URL>/api/v1/silicon-release/latest.json` | signed schema-1 release manifest |
+| `SILICON_RELEASE_TRUSTED_KEYS` | packaged production keys | JSON map of key id to base64 raw Ed25519 public key; additive for self-hosting/key rotation |
+| `SILICON_UPDATE_ALLOW_UNSIGNED_GIT` | *(empty)* | explicit compatibility opt-in; select exact-revision Git instead of the signed channel |
 | `SILICON_STEMCELL_REPO` | `teamofsilicons/silicon-stemcell` | base for `new` |
-| `SILICON_GLASS_CLI_REPO` | `teamofsilicons/glass` | glass backup CLI |
 | `SILICON_PYTHON` | `python3` | interpreter used to run a silicon's `main.py` |
 | `SILICON_INTERFACE_CLI_PACKAGE` | `@teamofsilicons/silicon-interface-cli` | npm package used to install the Silicon Interface CLI |
 | `SILICON_INTERFACE_CLI_TARBALL` | versioned npm tarball | fallback package URL if registry metadata is briefly unavailable |
@@ -66,12 +87,13 @@ silicon help                 Show help
 | `SILICON_INTERFACE_CLI_SKIP` | *(empty)* | set to `1` to skip interface CLI setup |
 | `SILICON_INTERFACE_DAEMON_SKIP` | *(empty)* | set to `1` to install the CLI without starting its listener daemon |
 | `SILICON_RUNTIME` | *(empty)* | default pull uses Docker; set to `local` to opt out |
-| `SILICON_RUNTIME_IMAGE` | `ghcr.io/teamofsilicons/silicon-runtime:latest` | runtime image for Docker-backed silicons |
+| `SILICON_RUNTIME_IMAGE` | signed release manifest | bootstrap-only exact digest when no runtime digest is persisted; it cannot retarget an installed release |
 | `SILICON_DOCKER_ROOT` | `~/silicons` | Docker-backed instance root |
 | `SILICON_DOCKER_COMPOSE` | `<root>/compose.yml` | generated Compose file path |
 | `SILICON_DOCKER_SHARED_HOME` | `<root>/.shared-home` | VM-wide Claude/Codex auth home mounted into every container |
 | `SILICON_DOCKER_SUDO` | *(empty)* | set to `1` to run Docker commands through `sudo docker` |
-| `SILICON_DOCKER_AUTO_INSTALL` | *(empty)* | set to `1` to allow non-interactive Docker install attempts |
+| `SILICON_DOCKER_ALLOW_UNPINNED_IMAGE` | *(empty)* | unsafe local-development-only escape hatch; production must leave this unset |
+| `SILICON_UPDATE_RETAIN_GENERATIONS` | `3` | bounded number of immutable update generations to retain (minimum safety floor: 2) |
 
 ## Docker runtime
 
@@ -86,16 +108,20 @@ on the VM. The shared auth home defaults to `~/silicons/.shared-home` and is
 mounted into every container. During an interactive `silicon pull`, the CLI asks
 whether to set up Claude Code, Codex, or both before installing the team.
 
-On a fresh Linux server, the host only needs Python and this CLI. `silicon pull`
-checks Docker Engine, Docker Compose v2, the daemon, current-user access, runtime
-config, and the runtime image. When Docker is missing on Linux, it can install
-Docker Engine through Docker's official `get.docker.com` installer, start the
-daemon, and continue.
+On a fresh server, install Docker Engine and Compose v2 from the operating
+system's trusted package repository, verifying the vendor repository key as
+documented by Docker. The CLI never downloads or executes `get.docker.com` (or
+any other mutable installer) as root.
 
-`silicon pull`, `silicon docker bootstrap`, and `silicon docker doctor` refresh
-the configured runtime image with `docker pull` even when a local `latest` image
-already exists. If the refresh fails but a cached image is available, the CLI
-continues with the cached image and tells you to rerun `silicon docker doctor`.
+`silicon pull` first checks Docker and Compose without selecting an image. It
+then verifies the signed Silicon release manifest, reads the exact
+`registry/repository@sha256:<digest>` runtime identity covered by that signature,
+pulls it, and verifies Docker reports that same repository digest before any
+instance or credential is created. The digest is persisted on each instance and
+generation; updates switch it only at activation, and rollback restores the
+prior generation's digest. A cached image is reusable only when that exact
+digest verifies. Pull completes only after each active Docker Silicon exposes
+the pinned Silicon Extend package and its `silicon-extend` command.
 
 ```bash
 pip install silicon-cli
@@ -105,7 +131,7 @@ silicon pull sct_live_...
 To run the same checks explicitly:
 
 ```bash
-silicon docker bootstrap --root ~/silicons --image ghcr.io/teamofsilicons/silicon-runtime:latest
+silicon docker bootstrap --root ~/silicons
 silicon docker doctor
 ```
 
@@ -131,17 +157,26 @@ silicon claude --version
 silicon codex --version
 ```
 
-The runtime image contains the Silicon runtime dependencies: Python tooling, git,
-Node, Silicon Browser, Silicon Interface CLI, Claude Code, and Codex. Each
-container creates `/silicon/.venv` and installs that Silicon's `requirements.txt`
-inside the mounted instance folder, so per-Silicon Python dependencies do not
-pollute the host.
+The runtime image contains the complete Silicon runtime contract: Silicon CLI,
+Silicon Browser, Silicon Extend, Silicon Interface CLI, Claude Code, Codex,
+Node 22+, Python tooling, and Git. `silicon pull` verifies every command,
+minimum supported version, and the Python dependency graph in the exact signed
+image digest before it asks Glass to claim or register a Silicon. Immutable
+releases use the updater's pre-staged, hash-locked dependency environment. Only
+a legacy flat installation falls back to creating `/silicon/.venv` from its
+`requirements.txt`, so per-Silicon Python dependencies do not pollute the host.
 
 To force the older host-local install path:
 
 ```bash
 SILICON_RUNTIME=local silicon pull sct_live_...
 ```
+
+Local mode deliberately bypasses the bundled image, so the pull verifies Node
+22+, npm, Python, Git, Silicon Browser, Silicon Extend, and the selected
+Claude/Codex CLI on the host. It installs and verifies the per-Silicon Interface
+CLI while the pull is still staged; a missing prerequisite aborts the pending
+Glass claim with an actionable update command.
 
 After that, the normal commands continue to work:
 
@@ -162,10 +197,31 @@ it with:
 silicon docker compose
 ```
 
-Build the runtime image from this repo:
+Build and publish the runtime image from this repo, then record the registry's
+immutable digest in Glass as `SILICON_RELEASE_RUNTIME_IMAGE` before publishing
+the matching Stemcell release:
 
 ```bash
-docker build -f docker/runtime/Dockerfile -t ghcr.io/teamofsilicons/silicon-runtime:latest .
+docker build -f docker/runtime/Dockerfile -t ghcr.io/teamofsilicons/silicon-runtime:<version> .
+docker push ghcr.io/teamofsilicons/silicon-runtime:<version>
+docker image inspect --format '{{json .RepoDigests}}' ghcr.io/teamofsilicons/silicon-runtime:<version>
+```
+
+For local CLI, Silicon Browser, and Silicon Extend development, build their
+wheels into separate directories and layer them over the published runtime
+without publishing first:
+
+```bash
+python -m pip wheel . --no-deps --wheel-dir /tmp/silicon-cli-wheel
+(cd ../silicon-browser && uv build --wheel --out-dir /tmp/silicon-browser-wheel)
+(cd ../silicon-extend && uv build --wheel --out-dir /tmp/silicon-extend-wheel)
+docker build \
+  --build-arg BASE_IMAGE=ghcr.io/teamofsilicons/silicon-runtime@sha256:<digest> \
+  --build-context silicon_cli_wheel=/tmp/silicon-cli-wheel \
+  --build-context silicon_browser_wheel=/tmp/silicon-browser-wheel \
+  --build-context silicon_extend_wheel=/tmp/silicon-extend-wheel \
+  -f docker/runtime/Dockerfile.local \
+  -t silicon-runtime:v2-local .
 ```
 
 ## Silicon Interface CLI
@@ -188,10 +244,21 @@ silicon pull
 silicon pull sct_live_...
 ```
 
-The command validates the token with Glass, mints one local silicon API key per
-team silicon, creates one folder per silicon, hydrates the stemcell, writes
-`.glass.json`, `.env`, and `env.py`, registers each instance, regenerates Compose
-for Docker-backed installs, and starts each silicon process.
+The command validates the token with Glass and opens one idempotent,
+time-bounded credential claim for the entire team. An ambiguous retry replays
+that same encrypted claim instead of minting duplicate valid Silicon keys.
+Every target name is preflighted first; hydration then happens in hidden
+owner-only staging directories. Only after every generation and secret-file
+permission verifies does the CLI atomically rename the stages into place,
+commit the Glass claim, register the exact identities, regenerate Compose for
+Docker-backed installs, and start each Silicon.
+
+Pull progress is journaled without credentials under
+`~/.silicon/pull-transactions/` using owner-only files. A crash before commit
+resumes the same hidden stages and release identity. A normal pre-commit failure
+removes only transaction-marked stages and asks Glass to revoke the abandoned
+claim keys. A crash after a rename resumes registration/start without creating
+duplicate registry, service, or container identities.
 
 During team pull, setup asks for the default brain/fallback settings once. You
 can apply those settings to every silicon, or select specific silicons that
@@ -227,20 +294,108 @@ SILICON_INTERFACE_CLI_SOURCE=../silicon-interface/packages/silicon-interface-cli
 ## Backups
 
 `silicon push <name> now` and `silicon backup <name> now` use the
-`.backupsilicon` manifest when the instance has one. The CLI archives those
-paths and uploads them to Glass via `/api/v1/silicon-backups/` with the
-instance's `.glass.json` API key. If no manifest exists, the command falls back
-to the legacy `glass push` snapshot flow.
+active immutable Stemcell generation's canonical backup implementation. First,
+the host CLI captures all current source and DNA customizations against the
+exact cached upstream release into `.silicon/overlays`, and records a verified
+`latest.json` reference that is included in the protected-data snapshot. The
+Stemcell then snapshots its mandatory policy plus any additive
+`.backupsilicon` paths and uploads the verified snapshot to Glass. Instances
+that predate the canonical backup module must first be stopped and updated with
+`silicon update <name>`; the CLI does not install or fall back to a second
+backup implementation.
 
 `silicon push <name>` starts the background loop. Scheduled manifest backups run
-daily at 23:59 GMT; `now` remains available for one-shot manual backups.
+daily at 23:59 GMT and retry transient failures with bounded backoff. The
+host-owned supervisor also covers Docker instances, maintains a durable
+heartbeat, and refuses duplicate loops. Its enabled/disabled intent survives a
+host reboot; normal Silicon startup and every regular CLI startup reconcile a
+missing supervisor, while `silicon backup <name> stop` persists an explicit
+opt-out. Use `silicon backup <name> status` to inspect it; `now` remains
+available for one-shot manual backups.
 
-## How it differs from the bash version
+## Transactional updates
 
-- Pure Python package with a `silicon` console entry point (installed in an
-  isolated venv), instead of a single bash script.
+`silicon update <name>` stages and validates a complete immutable generation
+while the current Silicon keeps working. It then asks the running Stemcell to
+enter maintenance and waits until active work reaches a safe boundary. New
+Carbon messages remain durably accepted by Glass during this window; the sender
+sees that the Silicon is updating and that the message is queued, without
+needing to resend it.
+
+Before stopping anything, the updater verifies a canonical recovery snapshot.
+It records the exact services that were running, atomically switches the active
+generation, restores that service state, and requires stable health checks
+before committing. A failure after the stop boundary automatically reactivates
+an authenticated reconstruction of the prior generation rather than trusting a
+writable dormant directory. The mutable data root, memory, credentials,
+conversations, and local customization overlay are kept outside immutable
+release generations.
+
+Updates are journaled and crash-resumable. A second update cannot overlap an
+unfinished transaction:
+
+```bash
+silicon update --dry-run ada
+silicon update --deadline 30m ada
+silicon update status ada
+silicon update cancel ada
+silicon update resume ada
+silicon update history ada
+silicon update rollback ada
+```
+
+Cancellation is accepted only before the service-stop boundary. `resume`
+finishes or safely recovers an interrupted update according to its fsynced
+journal; it never guesses from a partially copied directory. Retention keeps
+the active, prior-known-good, and every nonterminal transaction generation even
+when old unreferenced generations are pruned. A durable highest-accepted signed
+release sequence remains in force even after an explicit runtime rollback.
+
+The default release channel accepts only an expiry-checked HTTPS manifest with
+at least one valid Ed25519 signature from a pinned public key. The manifest pins
+the exact content-addressed artifact and every extracted file; candidate code is
+never executed to perform or validate the update. Key rotation is additive:
+ship a new `key_id` and raw 32-byte public key in the CLI keyring before Glass
+begins signing with it, retain the old public key through the supported-client
+window, then remove it in a later CLI release. A self-hosted public-only keyring
+uses this operator-ready format:
+
+```bash
+export SILICON_RELEASE_TRUSTED_KEYS='{"release-2026-01":"<base64 of the raw 32-byte Ed25519 public key>"}'
+```
+
+The matching private key belongs only in Glass's secret store as
+`SILICON_RELEASE_SIGNING_PRIVATE_KEY`; it must never be placed in this CLI,
+an instance directory, or the JSON above. Until the production key is securely
+provisioned and its public half is packaged, signed updates fail closed.
+
+Production release-key handoff is deliberately explicit:
+
+1. Generate the Ed25519 keypair offline or in an HSM.
+2. Put only the standard-base64 raw 32-byte public key, under a stable key ID,
+   in `silicon_cli/release_trust_anchors.json`.
+3. Run
+   `python -m silicon_cli.updater.signatures --check-packaged`; a clean source
+   tree intentionally fails this gate until a real production anchor exists.
+4. Build and publish the wheel, then configure Glass's release signer with the
+   matching private key from its secret store/HSM.
+5. For rotation, ship and deploy the new public anchor before Glass uses it,
+   and retain the previous anchor until every supported CLI has crossed the
+   overlap window.
+
+For a deliberate compatibility operation,
+`--allow-unsigned-git` (or `SILICON_UPDATE_ALLOW_UNSIGNED_GIT=1`) selects the
+exact-revision Git source. It is never an automatic downgrade. That mode pins a
+single commit and verifies the downloaded tree and archive by SHA-256, but it
+cannot authenticate the publisher and always emits a warning.
+
+## Implementation notes
+
+- The PyPI package provides the `silicon` console entry point.
 - The auto-restart watchdog runs as `silicon _watchdog` (a detached supervisor
-  process) rather than a backgrounded bash function — same crash-loop detection,
-  `.silicon.stop` sentinel, and `.silicon.pid`/`.silicon.log` behavior.
-- `silicon script update` reinstalls the package via pip from its recorded source.
+  process) with crash-loop detection and `.silicon.stop`,
+  `.silicon.pid`, and `.silicon.log` state.
+- `silicon script update` runs
+  `python -m pip install --upgrade silicon-cli` with the interpreter that owns
+  the current command.
 - Everything (server, stemcell repo) is env-overridable.

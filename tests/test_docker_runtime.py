@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
-from silicon_cli import docker_runtime, registry, ui
+from silicon_cli import config, docker_runtime, process, registry, ui
+from silicon_cli.updater.cache import runtime_platform_identity
 
 
 class DockerRuntimeTests(unittest.TestCase):
@@ -29,10 +35,14 @@ class DockerRuntimeTests(unittest.TestCase):
                 "SILICON_RUNTIME_IMAGE",
                 "SILICON_DOCKER_SUDO",
                 "SILICON_DOCKER_AUTO_INSTALL",
+                "SILICON_DOCKER_ALLOW_UNPINNED_IMAGE",
             )
         }
         for key in self.old_env:
             os.environ.pop(key, None)
+        # Most legacy command-shape tests use a short local tag. Production
+        # defaults remain fail-closed; dedicated trust tests below clear this.
+        os.environ["SILICON_DOCKER_ALLOW_UNPINNED_IMAGE"] = "1"
         registry.REGISTRY_DIR = self.root / ".silicon"
         registry.REGISTRY_FILE = registry.REGISTRY_DIR / "registry.json"
         docker_runtime.CONFIG_FILE = registry.REGISTRY_DIR / "docker.json"
@@ -60,10 +70,230 @@ class DockerRuntimeTests(unittest.TestCase):
         docker_runtime.CONFIG_FILE.write_text(json.dumps(cfg))
         return cfg
 
+    def write_generation_pointer(
+        self,
+        instance: Path,
+        *,
+        generation_id: str = "generation-1",
+        environment_path: str = "",
+    ) -> None:
+        tree = "a" * 64
+        (instance / ".silicon" / "current.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "kind": "immutable-release",
+                    "generation_id": generation_id,
+                    "release_path": (
+                        f".silicon/releases/{generation_id}"
+                    ),
+                    "upstream_tree_sha256": tree,
+                    "materialized_tree_sha256": tree,
+                    "environment_path": environment_path,
+                    "release": {
+                        "version": "2.0.0",
+                        "revision": "b" * 64,
+                        "sequence": 2,
+                        "tree_sha256": tree,
+                        "artifact_sha256": "c" * 64,
+                        "source": "glass",
+                        "trust": "signed-ed25519",
+                    },
+                    "overlay_root_hash": "d" * 64,
+                    "activated_at": 1,
+                }
+            )
+        )
+
     def test_default_runtime_image_uses_published_registry(self):
         cfg = docker_runtime.load_config()
 
-        self.assertEqual(cfg["image"], "ghcr.io/teamofsilicons/silicon-runtime:latest")
+        self.assertEqual(cfg["image"], "")
+
+    def test_generation_pointer_symlinks_never_downgrade_to_flat_code(self):
+        instance = self.root / "silicons" / "ada"
+        state = instance / ".silicon"
+        state.mkdir(parents=True)
+        (instance / "main.py").write_text("print('stale flat code')\n")
+        pointer = state / "current.json"
+        external = self.root / "external-pointer.json"
+        external.write_text("{}\n")
+        inst = registry.Install(
+            0,
+            "ada",
+            str(instance),
+            str(instance / ".silicon.pid"),
+            "docker",
+        )
+
+        for target in (external, self.root / "missing-pointer.json"):
+            try:
+                pointer.symlink_to(target)
+            except OSError:
+                self.skipTest("symlinks are unavailable")
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "invalid Silicon generation pointer",
+            ):
+                config.active_release_root(instance)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "invalid Silicon generation environment",
+            ):
+                config.active_environment_python(instance)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "invalid active generation",
+            ):
+                docker_runtime.active_generation_runtime_image(inst)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "invalid Silicon generation pointer",
+            ):
+                docker_runtime.maintenance_coordinator_available(inst)
+            pointer.unlink()
+
+    def test_unpinned_runtime_image_fails_closed_without_dev_opt_in(self):
+        os.environ.pop("SILICON_DOCKER_ALLOW_UNPINNED_IMAGE", None)
+        with self.assertRaisesRegex(RuntimeError, "immutable runtime image"):
+            docker_runtime._require_runtime_image(
+                "ghcr.io/teamofsilicons/silicon-runtime:latest",
+                context="test runtime",
+            )
+
+    def test_environment_cannot_retarget_a_persisted_runtime_digest(self):
+        persisted = (
+            "ghcr.io/teamofsilicons/silicon-runtime@sha256:" + "a" * 64
+        )
+        override = (
+            "ghcr.io/teamofsilicons/silicon-runtime@sha256:" + "b" * 64
+        )
+        self.write_docker_config(image=persisted)
+        os.environ["SILICON_RUNTIME_IMAGE"] = override
+
+        self.assertEqual(docker_runtime.load_config()["image"], persisted)
+
+    def test_environment_digest_is_bootstrap_only_when_config_is_unbound(self):
+        bootstrap = (
+            "ghcr.io/teamofsilicons/silicon-runtime@sha256:" + "c" * 64
+        )
+        self.write_docker_config(image="")
+        os.environ["SILICON_RUNTIME_IMAGE"] = bootstrap
+
+        self.assertEqual(docker_runtime.load_config()["image"], bootstrap)
+
+    def test_bind_release_runtime_persists_exact_digest_after_verified_pull(self):
+        os.environ.pop("SILICON_DOCKER_ALLOW_UNPINNED_IMAGE", None)
+        cfg = self.write_docker_config(image="")
+        image = (
+            "ghcr.io/teamofsilicons/silicon-runtime@sha256:" + "a" * 64
+        )
+        instance = self.root / "silicons" / "ada"
+        instance.mkdir(parents=True)
+        registry.register(
+            "ada",
+            str(instance),
+            runtime="docker",
+            service="silicon-ada",
+            compose_file=cfg["compose_file"],
+            image="",
+            container_name="silicon-ada",
+        )
+        inspected = [
+            SimpleNamespace(returncode=1, stdout="", stderr=""),
+            SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([image]),
+                stderr="",
+            ),
+        ]
+        with (
+            mock.patch.object(docker_runtime, "_cmd", side_effect=inspected),
+            mock.patch.object(
+                docker_runtime,
+                "_run",
+                return_value=SimpleNamespace(returncode=0),
+            ) as run,
+        ):
+            bound = docker_runtime.bind_release_runtime(
+                image,
+                installs=[registry.find("ada")],
+            )
+
+        self.assertEqual(bound["image"], image)
+        self.assertEqual(
+            json.loads(docker_runtime.CONFIG_FILE.read_text())["image"],
+            "",
+        )
+        self.assertEqual(registry.find("ada").image, image)
+        self.assertIn(image, Path(cfg["compose_file"]).read_text())
+        self.assertEqual(run.call_args.args[0], ["docker", "pull", image])
+
+    def test_target_runtime_binding_does_not_switch_other_silicons(self):
+        os.environ.pop("SILICON_DOCKER_ALLOW_UNPINNED_IMAGE", None)
+        prior = (
+            "ghcr.io/teamofsilicons/silicon-runtime@sha256:" + "1" * 64
+        )
+        candidate = (
+            "ghcr.io/teamofsilicons/silicon-runtime@sha256:" + "2" * 64
+        )
+        cfg = self.write_docker_config(image=prior)
+        for name in ("ada", "grace"):
+            path = self.root / "silicons" / name
+            path.mkdir(parents=True)
+            registry.register(
+                name,
+                str(path),
+                runtime="docker",
+                service=f"silicon-{name}",
+                compose_file=cfg["compose_file"],
+                image=prior,
+                container_name=f"silicon-{name}",
+            )
+
+        with mock.patch.object(
+            docker_runtime,
+            "prepare_release_image",
+            return_value={**cfg, "image": candidate},
+        ):
+            docker_runtime.bind_release_runtime(
+                candidate,
+                installs=[registry.find("ada")],
+            )
+
+        self.assertEqual(registry.find("ada").image, candidate)
+        self.assertEqual(registry.find("grace").image, prior)
+        self.assertEqual(
+            json.loads(docker_runtime.CONFIG_FILE.read_text())["image"],
+            prior,
+        )
+        compose = Path(cfg["compose_file"]).read_text()
+        self.assertIn(f'image: "{candidate}"', compose)
+        self.assertIn(f'image: "{prior}"', compose)
+
+    def test_digest_pull_fails_if_daemon_cannot_verify_repo_digest(self):
+        os.environ.pop("SILICON_DOCKER_ALLOW_UNPINNED_IMAGE", None)
+        cfg = self.write_docker_config(
+            "ghcr.io/teamofsilicons/silicon-runtime@sha256:" + "b" * 64
+        )
+        with (
+            mock.patch.object(
+                docker_runtime,
+                "_cmd",
+                return_value=SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps(["ghcr.io/other/image@sha256:" + "b" * 64]),
+                    stderr="",
+                ),
+            ),
+            mock.patch.object(
+                docker_runtime,
+                "_run",
+                return_value=SimpleNamespace(returncode=0),
+            ),
+            self.assertRaisesRegex(RuntimeError, "pull and verify"),
+        ):
+            docker_runtime._ensure_image(cfg)
 
     def test_legacy_registry_rows_load_as_local(self):
         registry.REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -127,7 +357,7 @@ class DockerRuntimeTests(unittest.TestCase):
 
         docker_runtime._run = fake_run
         try:
-            docker_runtime.maintenance_silicon(inst, ["update", "ada"])
+            docker_runtime.maintenance_silicon(inst, ["status", "ada"])
         finally:
             docker_runtime._run = old_run
 
@@ -137,7 +367,7 @@ class DockerRuntimeTests(unittest.TestCase):
         self.assertIn("/usr/local/bin/silicon-runtime-entrypoint", cmd)
         self.assertIn("SILICON_SHARED_HOME=/silicon-shared-home", cmd)
         self.assertIn(f'{Path(self.root / "silicons" / ".shared-home").resolve()}:/silicon-shared-home', cmd)
-        self.assertEqual(cmd[-4:], ["run", "silicon", "update", "ada"])
+        self.assertEqual(cmd[-4:], ["run", "silicon", "status", "ada"])
 
     def test_maintenance_run_uses_sudo_docker_when_configured(self):
         self.write_docker_config()
@@ -166,7 +396,7 @@ class DockerRuntimeTests(unittest.TestCase):
 
         docker_runtime._run = fake_run
         try:
-            docker_runtime.maintenance_silicon(inst, ["update", "ada"])
+            docker_runtime.maintenance_silicon(inst, ["status", "ada"])
         finally:
             docker_runtime._run = old_run
 
@@ -197,6 +427,927 @@ class DockerRuntimeTests(unittest.TestCase):
         self.assertIn("SILICON_CONTAINER_MODE=1", cmd)
         self.assertIn("SILICON_SHARED_HOME=/silicon-shared-home", cmd)
         self.assertEqual(cmd[-4:], ["silicon-ada", "silicon", "start", "ada"])
+
+    def test_local_dockerfile_installs_and_checks_wheel_dependencies(self):
+        dockerfile = (
+            Path(__file__).resolve().parents[1]
+            / "docker"
+            / "runtime"
+            / "Dockerfile.local"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("--no-deps", dockerfile)
+        self.assertIn(
+            "COPY --from=silicon_extend_wheel",
+            dockerfile,
+        )
+        self.assertIn("/tmp/silicon-extend-wheel/*.whl", dockerfile)
+        self.assertIn("/opt/silicon-runtime/bin/pip check", dockerfile)
+
+    def test_production_dockerfile_installs_exact_extend_release(self):
+        dockerfile = (
+            Path(__file__).resolve().parents[1]
+            / "docker"
+            / "runtime"
+            / "Dockerfile"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "ARG SILICON_EXTEND_SPEC=silicon-extend==0.1.1",
+            dockerfile,
+        )
+        self.assertIn('"${SILICON_EXTEND_SPEC}"', dockerfile)
+        self.assertIn("/opt/silicon-runtime/bin/pip check", dockerfile)
+
+    def test_production_runtime_build_inputs_are_immutable(self):
+        root = Path(__file__).resolve().parents[1]
+        dockerfile = (root / "docker" / "runtime" / "Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        for exact_input in (
+            "# syntax=docker/dockerfile:1.24.0@sha256:"
+            "87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89",
+            "FROM node:22-bookworm-slim@sha256:"
+            "6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3",
+            "ARG SILICON_CLI_SPEC=silicon-cli==1.0.20",
+            "ARG SILICON_BROWSER_SPEC=silicon-browser==1.0.7",
+            "ARG SILICON_EXTEND_SPEC=silicon-extend==0.1.1",
+            "ARG SILICON_INTERFACE_CLI_SPEC="
+            "@teamofsilicons/silicon-interface-cli@2.0.0",
+            "ARG CLAUDE_CODE_SPEC=@anthropic-ai/claude-code@2.1.220",
+            "ARG CODEX_SPEC=@openai/codex@0.145.0",
+            "ARG PIP_SPEC=pip==26.1.2",
+            "ARG SETUPTOOLS_SPEC=setuptools==83.0.0",
+            "ARG WHEEL_SPEC=wheel==0.47.0",
+        ):
+            self.assertIn(exact_input, dockerfile)
+
+        workflow = (
+            root / ".github" / "workflows" / "publish-runtime.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("runs-on: ubuntu-24.04", workflow)
+        self.assertNotIn("runs-on: ubuntu-latest", workflow)
+        self.assertNotIn("uses: actions/checkout@v4", workflow)
+        self.assertNotIn("uses: docker/setup-qemu-action@v3", workflow)
+        self.assertNotIn("uses: docker/setup-buildx-action@v3", workflow)
+        self.assertNotIn("uses: docker/login-action@v3", workflow)
+        self.assertNotIn("uses: docker/build-push-action@v6", workflow)
+        self.assertIn(
+            '"${IMAGE_NAME}@${{ steps.build.outputs.digest }}"',
+            workflow,
+        )
+
+    def test_silicon_health_requires_live_generation_child_metadata(self):
+        self.write_docker_config()
+        instance = self.root / "silicons" / "ada"
+        instance.mkdir(parents=True)
+        inst = registry.Install(
+            0,
+            "ada",
+            str(instance),
+            str(instance / ".silicon.pid"),
+            "docker",
+            "silicon-ada",
+            str(self.root / "silicons" / "compose.yml"),
+            "example/silicon:latest",
+            "silicon-ada",
+        )
+        now = time.time()
+        status = {
+            "supervisor_pid": 10,
+            "child_pid": 11,
+            "generation": "/silicon/.silicon/releases/generation-1",
+            "started_at": now - 8,
+            "uptime_seconds": 8.0,
+            "application_ready": True,
+            "ready_at": now - 7,
+            "heartbeat_at": now,
+        }
+
+        with (
+            mock.patch.object(docker_runtime, "container_running", return_value=True),
+            mock.patch.object(
+                docker_runtime,
+                "_run",
+                return_value=SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps(status) + "\n",
+                    stderr="",
+                ),
+            ) as run,
+        ):
+            self.assertTrue(docker_runtime.silicon_running(inst))
+            self.assertTrue(
+                docker_runtime.silicon_healthy(inst, min_uptime=5.0)
+            )
+            self.assertTrue(
+                docker_runtime.silicon_ready(
+                    inst, min_uptime=5.0, max_heartbeat_age=5.0
+                )
+            )
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[:2], ["docker", "exec"])
+        self.assertIn(".silicon.pid.meta.json", command[-1])
+        self.assertIn("child_pid", command[-1])
+        self.assertIn("stale generation", command[-1])
+        self.assertIn("runtime-health.json", command[-1])
+
+    @unittest.skipIf(
+        os.name == "nt",
+        "the embedded Docker probe runs in a Linux PID namespace",
+    )
+    def test_container_main_liveness_rejects_reused_pid_birth_identity(self):
+        self.write_docker_config()
+        instance = self.root / "silicons" / "ada"
+        instance.mkdir(parents=True)
+        inst = registry.Install(
+            0,
+            "ada",
+            str(instance),
+            str(instance / ".silicon.pid"),
+            "docker",
+            "silicon-ada",
+            str(self.root / "silicons" / "compose.yml"),
+            "example/silicon:latest",
+            "silicon-ada",
+        )
+        process_id = os.getpid()
+        identity = process._process_identity(process_id)
+        self.assertTrue(identity)
+        (instance / ".silicon.pid").write_text(f"{process_id}\n")
+        metadata = {
+            "schema": 1,
+            "supervisor_pid": process_id,
+            "supervisor_identity": identity,
+            "child_pid": process_id,
+            "child_identity": identity,
+            "started_at": time.time() - 10,
+            "generation": str(instance),
+        }
+        metadata_path = instance / ".silicon.pid.meta.json"
+        metadata_path.write_text(json.dumps(metadata))
+
+        def execute_script(command, *, check=False, capture=False):
+            script = command[-1].replace(
+                'Path("/silicon")',
+                f"Path({str(instance)!r})",
+                1,
+            )
+            return subprocess.run(
+                [sys.executable, "-c", script],
+                check=check,
+                capture_output=True,
+                text=True,
+            )
+
+        with (
+            mock.patch.object(
+                docker_runtime, "container_running", return_value=True
+            ),
+            mock.patch.object(
+                docker_runtime, "_run", side_effect=execute_script
+            ),
+        ):
+            self.assertIsNotNone(docker_runtime.silicon_child_status(inst))
+            metadata["supervisor_identity"] = "linux:reused-pid:1"
+            metadata_path.write_text(json.dumps(metadata))
+            self.assertIsNone(docker_runtime.silicon_child_status(inst))
+            metadata["supervisor_identity"] = identity
+            metadata["child_identity"] = "linux:reused-pid:1"
+            metadata_path.write_text(json.dumps(metadata))
+            self.assertIsNone(docker_runtime.silicon_child_status(inst))
+
+    @unittest.skipIf(
+        os.name == "nt",
+        "the embedded Docker probe runs in a Linux PID namespace",
+    )
+    def test_container_glass_liveness_rejects_reused_pid_birth_identity(self):
+        self.write_docker_config()
+        instance = self.root / "silicons" / "ada"
+        instance.mkdir(parents=True)
+        inst = registry.Install(
+            0,
+            "ada",
+            str(instance),
+            str(instance / ".silicon.pid"),
+            "docker",
+            "silicon-ada",
+            str(self.root / "silicons" / "compose.yml"),
+            "example/silicon:latest",
+            "silicon-ada",
+        )
+        process_id = os.getpid()
+        identity = process._process_identity(process_id)
+        self.assertTrue(identity)
+        (instance / ".glass_agent.pid").write_text(f"{process_id}\n")
+        metadata = {
+            "schema": 1,
+            "pid": process_id,
+            "identity": identity,
+        }
+        metadata_path = instance / ".glass_agent.pid.meta.json"
+        metadata_path.write_text(json.dumps(metadata))
+
+        def execute_script(command, *, check=False, capture=False):
+            script = command[-1].replace(
+                'Path("/silicon")',
+                f"Path({str(instance)!r})",
+                1,
+            )
+            return subprocess.run(
+                [sys.executable, "-c", script],
+                check=check,
+                capture_output=True,
+                text=True,
+            )
+
+        with (
+            mock.patch.object(
+                docker_runtime, "container_running", return_value=True
+            ),
+            mock.patch.object(
+                docker_runtime, "_run", side_effect=execute_script
+            ),
+        ):
+            self.assertTrue(docker_runtime.glass_agent_running(inst))
+            metadata["identity"] = "linux:reused-pid:1"
+            metadata_path.write_text(json.dumps(metadata))
+            self.assertFalse(docker_runtime.glass_agent_running(inst))
+
+    def test_silicon_health_rejects_supervisor_only_or_unstable_runtime(self):
+        self.write_docker_config()
+        instance = self.root / "silicons" / "ada"
+        instance.mkdir(parents=True)
+        inst = registry.Install(
+            0,
+            "ada",
+            str(instance),
+            str(instance / ".silicon.pid"),
+            "docker",
+            "silicon-ada",
+            str(self.root / "silicons" / "compose.yml"),
+            "example/silicon:latest",
+            "silicon-ada",
+        )
+
+        with (
+            mock.patch.object(docker_runtime, "container_running", return_value=True),
+            mock.patch.object(
+                docker_runtime,
+                "_run",
+                return_value=SimpleNamespace(returncode=1, stdout="", stderr=""),
+            ),
+        ):
+            self.assertFalse(docker_runtime.silicon_running(inst))
+
+        status = {
+            "supervisor_pid": 10,
+            "child_pid": 11,
+            "generation": "/silicon",
+            "started_at": 100.0,
+            "uptime_seconds": 1.0,
+        }
+        with (
+            mock.patch.object(docker_runtime, "container_running", return_value=True),
+            mock.patch.object(
+                docker_runtime,
+                "_run",
+                return_value=SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps(status) + "\n",
+                    stderr="",
+                ),
+            ),
+        ):
+            self.assertTrue(docker_runtime.silicon_running(inst))
+            self.assertFalse(
+                docker_runtime.silicon_healthy(inst, min_uptime=5.0)
+            )
+
+        status["uptime_seconds"] = 10.0
+        status["application_ready"] = True
+        status["ready_at"] = time.time() - 10
+        status["heartbeat_at"] = time.time() - 30
+        with (
+            mock.patch.object(docker_runtime, "container_running", return_value=True),
+            mock.patch.object(
+                docker_runtime,
+                "_run",
+                return_value=SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps(status) + "\n",
+                    stderr="",
+                ),
+            ),
+        ):
+            self.assertFalse(
+                docker_runtime.silicon_ready(
+                    inst, min_uptime=5.0, max_heartbeat_age=5.0
+                )
+            )
+
+    def test_legacy_supervisor_is_conservatively_running_for_safe_drain(self):
+        self.write_docker_config()
+        instance = self.root / "silicons" / "ada"
+        instance.mkdir(parents=True)
+        inst = registry.Install(
+            0,
+            "ada",
+            str(instance),
+            str(instance / ".silicon.pid"),
+            "docker",
+            "silicon-ada",
+            str(self.root / "silicons" / "compose.yml"),
+            "example/silicon:latest",
+            "silicon-ada",
+        )
+        with (
+            mock.patch.object(docker_runtime, "container_running", return_value=True),
+            mock.patch.object(
+                docker_runtime,
+                "_run",
+                side_effect=[
+                    SimpleNamespace(returncode=1, stdout="", stderr=""),
+                    SimpleNamespace(returncode=0, stdout="", stderr=""),
+                ],
+            ),
+        ):
+            self.assertTrue(docker_runtime.silicon_running(inst))
+
+        (instance / ".silicon.pid.meta.json").write_text("{}")
+        with (
+            mock.patch.object(docker_runtime, "container_running", return_value=True),
+            mock.patch.object(
+                docker_runtime,
+                "_run",
+                return_value=SimpleNamespace(returncode=1, stdout="", stderr=""),
+            ),
+        ):
+            self.assertFalse(docker_runtime.silicon_running(inst))
+
+    def test_active_python_uses_portable_generation_and_data_root(self):
+        self.write_docker_config()
+        instance = self.root / "silicons" / "ada"
+        release = instance / ".silicon" / "releases" / "generation-1"
+        release.mkdir(parents=True)
+        (release / "main.py").write_text("print('ok')\n")
+        (instance / ".venv" / "bin").mkdir(parents=True)
+        (instance / ".venv" / "bin" / "python").write_text("")
+        self.write_generation_pointer(instance)
+        inst = registry.Install(
+            0,
+            "ada",
+            str(instance),
+            str(instance / ".silicon.pid"),
+            "docker",
+            "silicon-ada",
+            str(self.root / "silicons" / "compose.yml"),
+            "example/silicon:latest",
+            "silicon-ada",
+        )
+        captured = {}
+        old_run = docker_runtime._run
+        old_container_running = docker_runtime.container_running
+
+        def fake_run(cmd, *, check=False, capture=False):
+            captured["cmd"] = cmd
+            captured["capture"] = capture
+            return SimpleNamespace(returncode=0, stdout="{}\n", stderr="")
+
+        docker_runtime._run = fake_run
+        docker_runtime.container_running = lambda _inst: True
+        try:
+            docker_runtime.run_active_python(
+                inst,
+                ["-m", "core.maintenance", "--root", "/silicon", "status"],
+            )
+        finally:
+            docker_runtime._run = old_run
+            docker_runtime.container_running = old_container_running
+
+        cmd = captured["cmd"]
+        self.assertIn("/silicon/.silicon/releases/generation-1", cmd)
+        self.assertIn("SILICON_DATA_ROOT=/silicon", cmd)
+        self.assertIn(
+            "SILICON_RELEASE_ROOT=/silicon/.silicon/releases/generation-1",
+            cmd,
+        )
+        self.assertEqual(
+            cmd[-6:],
+            [
+                "/silicon/.venv/bin/python",
+                "-m",
+                "core.maintenance",
+                "--root",
+                "/silicon",
+                "status",
+            ],
+        )
+        self.assertTrue(captured["capture"])
+
+    def test_active_python_uses_generation_environment_and_ephemeral_container(self):
+        self.write_docker_config()
+        instance = self.root / "silicons" / "ada"
+        release = instance / ".silicon" / "releases" / "generation-1"
+        environment = instance / ".silicon" / "environments" / "env-1"
+        (environment / "bin").mkdir(parents=True)
+        (environment / "bin" / "python").write_text("")
+        release.mkdir(parents=True)
+        (release / "main.py").write_text("print('ok')\n")
+        lock = release / "requirements.lock"
+        lock.write_text("certifi==1 --hash=sha256:" + "a" * 64 + "\n")
+        (
+            environment / ".silicon-environment.json"
+        ).write_text(
+            json.dumps(
+                {
+                    "requirements_sha256": hashlib.sha256(
+                        lock.read_bytes()
+                    ).hexdigest(),
+                    "requirements_file": "requirements.lock",
+                    "require_hashes": True,
+                    "runtime": runtime_platform_identity(),
+                }
+            )
+        )
+        self.write_generation_pointer(
+            instance,
+            environment_path=".silicon/environments/env-1",
+        )
+        inst = registry.Install(
+            0,
+            "ada",
+            str(instance),
+            str(instance / ".silicon.pid"),
+            "docker",
+            "silicon-ada",
+            str(self.root / "silicons" / "compose.yml"),
+            "example/silicon:latest",
+            "silicon-ada",
+        )
+
+        with (
+            mock.patch.object(docker_runtime, "container_running", return_value=False),
+            mock.patch.object(
+                docker_runtime,
+                "_run",
+                return_value=SimpleNamespace(
+                    returncode=0, stdout='{"phase":"available"}\n', stderr=""
+                ),
+            ) as run,
+        ):
+            docker_runtime.run_active_python(
+                inst,
+                ["-m", "core.maintenance", "--root", "/silicon", "status"],
+            )
+
+        cmd = run.call_args.args[0]
+        self.assertEqual(cmd[:3], ["docker", "run", "--rm"])
+        entrypoint = cmd.index("--entrypoint")
+        self.assertEqual(
+            cmd[entrypoint + 1],
+            "/silicon/.silicon/environments/env-1/bin/python",
+        )
+        self.assertNotIn("silicon-runtime-entrypoint", " ".join(cmd))
+        self.assertIn("SILICON_DATA_ROOT=/silicon", cmd)
+        self.assertEqual(
+            cmd[-5:],
+            ["-m", "core.maintenance", "--root", "/silicon", "status"],
+        )
+
+    def test_verify_silicon_extend_checks_active_runtime_package_and_command(self):
+        inst = registry.Install(
+            0,
+            "ada",
+            str(self.root / "silicons" / "ada"),
+            str(self.root / "silicons" / "ada" / ".silicon.pid"),
+            "docker",
+        )
+        with mock.patch.object(
+            docker_runtime,
+            "run_active_python",
+            return_value=SimpleNamespace(returncode=0),
+        ) as active_python:
+            docker_runtime.verify_silicon_extend(inst)
+
+        active_python.assert_called_once()
+        arguments = active_python.call_args.args[1]
+        self.assertEqual(arguments[:2], ["-I", "-c"])
+        self.assertEqual(
+            arguments[-1],
+            docker_runtime.SILICON_EXTEND_VERSION,
+        )
+        self.assertIn('metadata.version("silicon-extend")', arguments[2])
+        self.assertIn('name="silicon-extend"', arguments[2])
+        self.assertTrue(active_python.call_args.kwargs["capture"])
+
+    def test_verify_silicon_extend_fails_closed_for_incomplete_runtime(self):
+        inst = registry.Install(
+            0,
+            "ada",
+            str(self.root / "silicons" / "ada"),
+            str(self.root / "silicons" / "ada" / ".silicon.pid"),
+            "docker",
+        )
+        with (
+            mock.patch.object(
+                docker_runtime,
+                "run_active_python",
+                return_value=SimpleNamespace(returncode=1),
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"required Silicon Extend 0\.1\.1 runtime",
+            ),
+        ):
+            docker_runtime.verify_silicon_extend(inst)
+
+    def test_prepare_environment_returns_confined_host_path(self):
+        self.write_docker_config()
+        instance = self.root / "silicons" / "ada"
+        release = instance / ".silicon" / "releases" / "generation-1"
+        release.mkdir(parents=True)
+        (release / "requirements.lock").write_text(
+            "certifi==2026.1.4 --hash=sha256:" + "a" * 64 + "\n"
+        )
+        inst = registry.Install(
+            0,
+            "ada",
+            str(instance),
+            str(instance / ".silicon.pid"),
+            "docker",
+            "silicon-ada",
+            str(self.root / "silicons" / "compose.yml"),
+            "example/silicon:latest",
+            "silicon-ada",
+        )
+        expected = instance / ".silicon" / "environments" / "abc-py313-linux"
+
+        with mock.patch.object(
+            docker_runtime,
+            "_ephemeral_command",
+            return_value=SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    '{"environment_path":'
+                    '"/silicon/.silicon/environments/abc-py313-linux"}\n'
+                ),
+                stderr="",
+            ),
+        ) as command:
+            actual = docker_runtime.prepare_environment(inst, release)
+
+        self.assertEqual(actual, expected.resolve())
+        args = command.call_args.args
+        self.assertEqual(args[0], inst)
+        self.assertEqual(args[1][:2], ["python3", "-c"])
+        self.assertEqual(
+            args[1][-1], "/silicon/.silicon/releases/generation-1"
+        )
+        self.assertTrue(command.call_args.kwargs["capture"])
+
+    def test_prepare_environment_requires_hash_pinned_lockfile(self):
+        self.write_docker_config()
+        instance = self.root / "silicons" / "ada"
+        release = instance / ".silicon" / "releases" / "generation-1"
+        release.mkdir(parents=True)
+        (release / "requirements.txt").write_text("certifi\n")
+        inst = registry.Install(
+            0,
+            "ada",
+            str(instance),
+            str(instance / ".silicon.pid"),
+            "docker",
+            "silicon-ada",
+            str(self.root / "silicons" / "compose.yml"),
+            "example/silicon:latest",
+            "silicon-ada",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "requirements.lock"):
+            docker_runtime.prepare_environment(inst, release)
+
+    def test_prepare_environment_rejects_container_path_escape(self):
+        self.write_docker_config()
+        instance = self.root / "silicons" / "ada"
+        release = instance / ".silicon" / "releases" / "generation-1"
+        release.mkdir(parents=True)
+        (release / "requirements.lock").write_text("")
+        inst = registry.Install(
+            0,
+            "ada",
+            str(instance),
+            str(instance / ".silicon.pid"),
+            "docker",
+            "silicon-ada",
+            str(self.root / "silicons" / "compose.yml"),
+            "example/silicon:latest",
+            "silicon-ada",
+        )
+
+        with (
+            mock.patch.object(
+                docker_runtime,
+                "_ephemeral_command",
+                return_value=SimpleNamespace(
+                    returncode=0,
+                    stdout='{"environment_path":"/silicon/../etc"}\n',
+                    stderr="",
+                ),
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            docker_runtime.prepare_environment(inst, release)
+
+    def test_runtime_entrypoint_term_handler_stops_and_exits(self):
+        entrypoint = (
+            Path(__file__).resolve().parents[1]
+            / "docker"
+            / "runtime"
+            / "runtime-entrypoint.sh"
+        )
+        subprocess.run(["bash", "-n", str(entrypoint)], check=True)
+        text = entrypoint.read_text()
+        self.assertIn("terminate_runtime()", text)
+        self.assertIn("trap terminate_runtime TERM INT", text)
+        handler = text.split("terminate_runtime()", 1)[1].split("}", 1)[0]
+        self.assertIn("stop_runtime", handler)
+        self.assertIn("exit 0", handler)
+
+    def test_runtime_entrypoint_refuses_unowned_legacy_update_fence(self):
+        entrypoint = (
+            Path(__file__).resolve().parents[1]
+            / "docker"
+            / "runtime"
+            / "runtime-entrypoint.sh"
+        )
+        instance = self.root / "silicons" / "ada"
+        marker = (
+            instance
+            / ".silicon"
+            / "maintenance"
+            / "legacy-offline.json"
+        )
+        marker.parent.mkdir(parents=True)
+        marker.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "update_id": "tx-1",
+                    "created_at": 123.5,
+                }
+            )
+        )
+        environment = {
+            **os.environ,
+            "SILICON_ROOT": str(instance),
+            "SILICON_INSTANCE_NAME": "ada",
+        }
+
+        refused = subprocess.run(
+            ["bash", str(entrypoint)],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn(
+            "legacy offline update is in progress",
+            refused.stderr,
+        )
+
+        environment["SILICON_LEGACY_UPDATE_FENCE_OWNER"] = "tx-1"
+        owned = subprocess.run(
+            ["bash", str(entrypoint)],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(owned.returncode, 0)
+        self.assertNotIn("legacy offline update is in progress", owned.stderr)
+        self.assertIn("does not look like a Silicon instance", owned.stderr)
+
+    def test_legacy_offline_fence_requires_strict_finite_metadata(self):
+        instance = self.root / "silicons" / "ada"
+        marker = (
+            instance
+            / ".silicon"
+            / "maintenance"
+            / "legacy-offline.json"
+        )
+        marker.parent.mkdir(parents=True)
+        inst = registry.Install(
+            0,
+            "ada",
+            str(instance),
+            str(instance / ".silicon.pid"),
+            "docker",
+        )
+        marker.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "update_id": "tx-1",
+                    "created_at": 123.5,
+                }
+            )
+        )
+        self.assertEqual(
+            docker_runtime._legacy_offline_fence_owner(inst),
+            "tx-1",
+        )
+
+        for invalid_created_at in (True, float("nan"), float("inf")):
+            marker.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "update_id": "tx-1",
+                        "created_at": invalid_created_at,
+                    }
+                )
+            )
+            with self.assertRaisesRegex(RuntimeError, "fence is invalid"):
+                docker_runtime._legacy_offline_fence_owner(inst)
+
+    def test_normal_start_reconciles_then_refuses_active_legacy_fence(self):
+        from silicon_cli import update
+
+        instance = self.root / "silicons" / "ada"
+        instance.mkdir(parents=True)
+        inst = registry.Install(
+            0,
+            "ada",
+            str(instance),
+            str(instance / ".silicon.pid"),
+            "docker",
+            "silicon-ada",
+            str(self.root / "silicons" / "compose.yml"),
+            "example/silicon:latest",
+            "silicon-ada",
+        )
+        with (
+            mock.patch.object(docker_runtime, "ensure_ready"),
+            mock.patch.object(
+                update, "reconcile_before_start"
+            ) as reconcile,
+            mock.patch.object(
+                docker_runtime,
+                "_legacy_offline_fence_owner",
+                return_value="tx-1",
+            ),
+            mock.patch.object(docker_runtime, "_run") as run,
+            mock.patch.object(ui, "error"),
+        ):
+            docker_runtime.start_one(inst)
+
+        reconcile.assert_called_once_with(inst)
+        run.assert_not_called()
+
+    def test_updater_owned_start_uses_fence_owner_only_for_recreation(self):
+        instance = self.root / "silicons" / "ada"
+        instance.mkdir(parents=True)
+        cfg = self.write_docker_config()
+        inst = registry.Install(
+            0,
+            "ada",
+            str(instance),
+            str(instance / ".silicon.pid"),
+            "docker",
+            "silicon-ada",
+            cfg["compose_file"],
+            cfg["image"],
+            "silicon-ada",
+        )
+        with (
+            mock.patch.object(docker_runtime, "ensure_ready"),
+            mock.patch.object(
+                docker_runtime,
+                "_legacy_offline_fence_owner",
+                return_value="tx-1",
+            ),
+            mock.patch.object(
+                docker_runtime,
+                "active_generation_runtime_image",
+                return_value="",
+            ),
+            mock.patch.object(
+                docker_runtime, "config_for_install", return_value=cfg
+            ),
+            mock.patch.object(docker_runtime, "_ensure_image"),
+            mock.patch.object(
+                docker_runtime, "render_compose"
+            ) as render,
+            mock.patch.object(
+                docker_runtime, "container_running", return_value=True
+            ),
+            mock.patch.object(
+                docker_runtime,
+                "_run",
+                return_value=SimpleNamespace(returncode=0),
+            ),
+            mock.patch.object(
+                docker_runtime, "_wait_for_container", return_value=True
+            ),
+            mock.patch.object(
+                docker_runtime, "silicon_running", return_value=True
+            ),
+            mock.patch.object(
+                docker_runtime, "glass_agent_running", return_value=True
+            ),
+            mock.patch.object(ui, "info"),
+            mock.patch.object(ui, "success"),
+        ):
+            docker_runtime.start_one(
+                inst,
+                reconcile=False,
+                allow_legacy_fence=True,
+            )
+
+        self.assertEqual(
+            render.call_args_list[0],
+            mock.call(
+                cfg,
+                update_fence_owners={"ada": "tx-1"},
+            ),
+        )
+        self.assertEqual(render.call_args_list[-1], mock.call(cfg))
+
+    def test_start_binds_only_the_active_generation_digest(self):
+        instance = self.root / "silicons" / "ada"
+        instance.mkdir(parents=True)
+        cfg = self.write_docker_config()
+        inst = registry.Install(
+            0,
+            "ada",
+            str(instance),
+            str(instance / ".silicon.pid"),
+            "docker",
+            "silicon-ada",
+            cfg["compose_file"],
+            cfg["image"],
+            "silicon-ada",
+        )
+        active = (
+            "ghcr.io/teamofsilicons/silicon-runtime@sha256:" + "3" * 64
+        )
+
+        def bind(image, *, installs, pull=True):
+            self.assertEqual(image, active)
+            self.assertEqual(installs, [inst])
+            inst.image = image
+            return {**cfg, "image": image}
+
+        with (
+            mock.patch.object(docker_runtime, "ensure_ready"),
+            mock.patch.object(
+                docker_runtime,
+                "_legacy_offline_fence_owner",
+                return_value="",
+            ),
+            mock.patch.object(
+                docker_runtime,
+                "active_generation_runtime_image",
+                return_value=active,
+            ),
+            mock.patch.object(
+                docker_runtime,
+                "bind_release_runtime",
+                side_effect=bind,
+            ) as bind_runtime,
+            mock.patch.object(
+                docker_runtime,
+                "config_for_install",
+                return_value={**cfg, "image": active},
+            ),
+            mock.patch.object(docker_runtime, "_ensure_image"),
+            mock.patch.object(docker_runtime, "render_compose"),
+            mock.patch.object(
+                docker_runtime, "container_running", return_value=True
+            ),
+            mock.patch.object(
+                docker_runtime,
+                "_run",
+                return_value=SimpleNamespace(returncode=0),
+            ),
+            mock.patch.object(
+                docker_runtime, "_wait_for_container", return_value=True
+            ),
+            mock.patch.object(
+                docker_runtime, "silicon_running", return_value=True
+            ),
+            mock.patch.object(
+                docker_runtime, "glass_agent_running", return_value=True
+            ),
+            mock.patch.object(ui, "info"),
+            mock.patch.object(ui, "success"),
+        ):
+            docker_runtime.start_one(inst, reconcile=False)
+
+        bind_runtime.assert_called_once_with(active, installs=[inst])
 
     def test_ensure_ready_auto_initializes_and_pulls_image(self):
         calls = []
@@ -293,8 +1444,10 @@ class DockerRuntimeTests(unittest.TestCase):
             docker_runtime._cmd = old_cmd
             docker_runtime._run = old_run
 
-        self.assertEqual(calls[0][0], "run")
-        self.assertEqual(calls[0][1], ["docker", "pull", "example/silicon:latest"])
+        self.assertEqual(calls[0][0], "cmd")
+        self.assertEqual(calls[1][0], "run")
+        self.assertEqual(calls[1][1], ["docker", "pull", "example/silicon:latest"])
+        self.assertEqual(calls[2][0], "cmd")
 
     def test_refresh_runtime_image_uses_cache_when_pull_fails(self):
         cfg = self.write_docker_config()
@@ -318,8 +1471,8 @@ class DockerRuntimeTests(unittest.TestCase):
             docker_runtime._cmd = old_cmd
             docker_runtime._run = old_run
 
-        self.assertEqual(calls[0][0], "run")
-        self.assertEqual(calls[1][0], "cmd")
+        self.assertEqual(calls[0][0], "cmd")
+        self.assertEqual(calls[1][0], "run")
 
     def test_pull_runtime_can_be_opted_out(self):
         os.environ["SILICON_RUNTIME"] = "local"
@@ -334,28 +1487,19 @@ class DockerRuntimeTests(unittest.TestCase):
         finally:
             docker_runtime.ensure_ready = old_ensure
 
-    def test_noninteractive_docker_install_requires_explicit_env_opt_in(self):
-        old_is_linux = docker_runtime._is_linux
-        old_interactive = ui.interactive
+    def test_docker_install_never_downloads_or_executes_root_script(self):
         old_manual = docker_runtime._manual_docker_steps
-        old_download = docker_runtime._download_docker_installer
+        old_run = docker_runtime._run
         calls = []
 
-        docker_runtime._is_linux = lambda: True
-        ui.interactive = lambda: False
         docker_runtime._manual_docker_steps = lambda: calls.append("manual")
-
-        def fail_download():
-            raise AssertionError("installer should not be downloaded without opt-in")
-
-        docker_runtime._download_docker_installer = fail_download
+        docker_runtime._run = lambda *_args, **_kwargs: calls.append("run")
+        os.environ["SILICON_DOCKER_AUTO_INSTALL"] = "1"
         try:
             self.assertFalse(docker_runtime._install_docker_engine())
         finally:
-            docker_runtime._is_linux = old_is_linux
-            ui.interactive = old_interactive
             docker_runtime._manual_docker_steps = old_manual
-            docker_runtime._download_docker_installer = old_download
+            docker_runtime._run = old_run
 
         self.assertEqual(calls, ["manual"])
 
