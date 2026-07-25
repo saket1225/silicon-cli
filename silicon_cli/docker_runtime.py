@@ -592,6 +592,8 @@ def inspect_runtime_contract(config: dict, image: str) -> dict:
             *_docker_cmd(config),
             "run",
             "--rm",
+            "--pull",
+            "never",
             "--entrypoint",
             "/opt/silicon-runtime/bin/python",
             selected,

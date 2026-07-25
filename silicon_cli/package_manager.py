@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import urllib.parse
@@ -125,7 +126,7 @@ def _http_json(url: str) -> dict:
             "User-Agent": "silicon-cli-package-inventory/1",
         },
     )
-    context = __import__("ssl").create_default_context(cafile=certifi.where())
+    context = ssl.create_default_context(cafile=certifi.where())
     with urllib.request.urlopen(request, timeout=12, context=context) as response:
         raw = response.read(MAX_HTTP_BYTES + 1)
     if len(raw) > MAX_HTTP_BYTES:
@@ -434,10 +435,13 @@ def inventory(*, silicon_ids: set[str] | None = None) -> dict:
     docker_cache: dict[str, dict] = {}
     installs = _selected_installs(selected_ids)
     for install in installs:
-        if install.is_docker:
-            rows.extend(_docker_rows(install, latest, docker_cache))
-        else:
-            rows.extend(_local_rows(install, latest))
+        try:
+            if install.is_docker:
+                rows.extend(_docker_rows(install, latest, docker_cache))
+            else:
+                rows.extend(_local_rows(install, latest))
+        except (OSError, RuntimeError) as exc:
+            errors.append(f"{install.name}: {str(exc)[:300]}")
     summary = {
         "total": len(rows),
         "current": 0,

@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 MINIMUM_PYTHON_PACKAGES = {
-    "silicon-cli": "1.0.20",
+    "silicon-cli": "1.0.21",
     "silicon-browser": "1.0.7",
     "silicon-extend": "0.1.1",
 }

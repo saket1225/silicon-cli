@@ -469,7 +469,7 @@ class DockerRuntimeTests(unittest.TestCase):
             "87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89",
             "FROM node:22-bookworm-slim@sha256:"
             "6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3",
-            "ARG SILICON_CLI_SPEC=silicon-cli==1.0.20",
+            "ARG SILICON_CLI_SPEC=silicon-cli==1.0.21",
             "ARG SILICON_BROWSER_SPEC=silicon-browser==1.0.7",
             "ARG SILICON_EXTEND_SPEC=silicon-extend==0.1.1",
             "ARG SILICON_INTERFACE_CLI_SPEC="
