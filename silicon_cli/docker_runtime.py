@@ -1581,7 +1581,7 @@ if not ready():
         shutil.rmtree(environment)
     try:
         subprocess.run(
-            [sys.executable, "-m", "venv", str(temporary)],
+            [sys.executable, "-m", "venv", "--copies", str(temporary)],
             check=True,
         )
         subprocess.run(

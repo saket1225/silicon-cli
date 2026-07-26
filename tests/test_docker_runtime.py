@@ -1005,6 +1005,10 @@ class DockerRuntimeTests(unittest.TestCase):
         self.assertEqual(
             args[1][-1], "/silicon/.silicon/releases/generation-1"
         )
+        self.assertIn(
+            '[sys.executable, "-m", "venv", "--copies", str(temporary)]',
+            args[1][2],
+        )
         self.assertTrue(command.call_args.kwargs["capture"])
 
     def test_prepare_environment_requires_hash_pinned_lockfile(self):
