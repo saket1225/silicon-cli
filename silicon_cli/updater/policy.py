@@ -23,6 +23,7 @@ RUNTIME_EXACT = {
     ".silicon.pid",
     ".silicon.pid.meta.json",
     ".silicon.stop",
+    "node_modules",
     "env.py",
     "silicon.json",
     "prompts/CONTACTS.md",

@@ -446,6 +446,38 @@ class PlannerAndRecoveryTests(unittest.TestCase):
             self.assertEqual(actions["main.py"], "update-upstream")
             self.assertNotIn("prompts/MEMORY.md", actions)
 
+    def test_plan_ignores_generated_node_modules_and_their_symlinks(self):
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = Fixture(Path(raw))
+            project = fixture.instance / "work" / "deck"
+            project.mkdir(parents=True)
+            Fixture._write(
+                fixture.instance,
+                "work/deck/package.json",
+                '{"scripts":{"build":"vite"}}\n',
+            )
+            outside = Path(raw) / "generated-node-modules"
+            outside.mkdir()
+            try:
+                (project / "node_modules").symlink_to(
+                    outside,
+                    target_is_directory=True,
+                )
+            except OSError:
+                self.skipTest("symlinks are unavailable")
+
+            plan = build_plan(fixture.old, fixture.instance, fixture.new)
+
+            self.assertFalse(plan.conflicts)
+            actions = {action.path: action.action for action in plan.actions}
+            self.assertEqual(
+                actions["work/deck/package.json"],
+                "preserve-local",
+            )
+            self.assertFalse(
+                any("node_modules" in path for path in actions),
+            )
+
     def test_identical_independent_addition_preserves_local_executable_mode(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

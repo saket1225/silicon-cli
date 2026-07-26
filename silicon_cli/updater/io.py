@@ -134,17 +134,17 @@ def regular_files(
         for name in sorted(directories):
             path = base / name
             rel = path.relative_to(root).as_posix()
-            mode = os.lstat(path).st_mode
-            if stat.S_ISLNK(mode):
-                raise UnsafePathError(f"symlinked directory is forbidden: {path}")
-            if not stat.S_ISDIR(mode):
-                raise UnsafePathError(f"special directory entry is forbidden: {path}")
             if (
                 name in names
                 or rel in names
                 or any((rel + "/").startswith(p) for p in prefixes)
             ):
                 continue
+            mode = os.lstat(path).st_mode
+            if stat.S_ISLNK(mode):
+                raise UnsafePathError(f"symlinked directory is forbidden: {path}")
+            if not stat.S_ISDIR(mode):
+                raise UnsafePathError(f"special directory entry is forbidden: {path}")
             kept.append(name)
         directories[:] = kept
         for name in sorted(files):
