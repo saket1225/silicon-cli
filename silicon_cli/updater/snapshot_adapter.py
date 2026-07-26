@@ -72,6 +72,12 @@ RESTORE_PRESERVE_EXACT = {
 RELEASE_SEQUENCE_FLOOR = ".silicon/release-sequence-floor.json"
 RELEASE_SEQUENCE_FLOOR_LOCK = ".silicon/release-sequence-floor.lock"
 MAX_RELEASE_SEQUENCE_FLOOR_BYTES = 4096
+GENERATED_DIRECTORY_NAMES = {
+    ".git",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+}
 
 
 class BootstrapSnapshotError(RuntimeError):
@@ -349,14 +355,12 @@ def _inventory(root: Path) -> list[tuple[str, Path]]:
             path = base / name
             relative = path.relative_to(root).as_posix()
             if (
-                name == "__pycache__"
+                name in GENERATED_DIRECTORY_NAMES
                 or relative
                 in {
-                    ".git",
                     ".home",
                     ".local",
                     ".tools",
-                    ".venv",
                     ".silicon/releases",
                     ".silicon/environments",
                     ".silicon/work",
@@ -379,6 +383,8 @@ def _inventory(root: Path) -> list[tuple[str, Path]]:
         for name in sorted(files):
             path = base / name
             relative = path.relative_to(root).as_posix()
+            if name in GENERATED_DIRECTORY_NAMES:
+                continue
             mode = os.lstat(path).st_mode
             if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
                 raise BootstrapSnapshotError(

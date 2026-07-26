@@ -56,6 +56,31 @@ def signed_release(sequence: int, tree_sha256: str) -> dict:
 
 
 class BootstrapSnapshotAdapterTests(unittest.TestCase):
+    def test_snapshot_excludes_generated_node_dependency_links(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            write(root, ".backupsilicon", "work/**\n")
+            write(root, "work/deck/package.json", '{"name":"deck"}\n')
+            generated = root / "work" / "deck" / "node_modules"
+            try:
+                generated.symlink_to(
+                    root / "missing-generated-dependencies",
+                    target_is_directory=True,
+                )
+            except OSError:
+                self.skipTest("symlinks are unavailable")
+
+            result = create_local_snapshot(root, release_id="legacy")
+            manifest = verify_local_snapshot(
+                Path(result["manifest_path"]),
+                store=Path(result["store"]),
+            )
+            paths = {entry["path"] for entry in manifest["files"]}
+            self.assertIn("work/deck/package.json", paths)
+            self.assertFalse(
+                any("node_modules" in path for path in paths)
+            )
+
     def test_writes_canonical_schema_and_never_snapshots_plaintext_secrets(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
