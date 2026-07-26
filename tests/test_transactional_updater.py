@@ -463,8 +463,15 @@ class PlannerAndRecoveryTests(unittest.TestCase):
                     outside,
                     target_is_directory=True,
                 )
+                (project / ".venv").symlink_to(
+                    outside,
+                    target_is_directory=True,
+                )
             except OSError:
                 self.skipTest("symlinks are unavailable")
+            cache = project / "__pycache__"
+            cache.mkdir()
+            (cache / "generated.cpython-314.pyc").write_bytes(b"generated")
 
             plan = build_plan(fixture.old, fixture.instance, fixture.new)
 
@@ -475,7 +482,11 @@ class PlannerAndRecoveryTests(unittest.TestCase):
                 "preserve-local",
             )
             self.assertFalse(
-                any("node_modules" in path for path in actions),
+                any(
+                    generated in path
+                    for path in actions
+                    for generated in ("node_modules", ".venv", "__pycache__")
+                ),
             )
 
     def test_identical_independent_addition_preserves_local_executable_mode(self):
