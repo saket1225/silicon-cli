@@ -71,14 +71,12 @@ prepare_runtime() {
     log "missing mount: $SILICON_ROOT"
     exit 1
   fi
-  if [ ! -f "$SILICON_ROOT/main.py" ]; then
-    log "$SILICON_ROOT does not look like a Silicon instance; expected main.py"
-    exit 1
-  fi
 
   mkdir -p "$HOME" "$SILICON_HOME" "$SILICON_BROWSER_HOME"
   prepare_shared_auth
   cd "$SILICON_ROOT"
+  local runtime_python
+  runtime_python="$(command -v python3)"
 
   # Resolve the same atomically selected generation as silicon-cli.  Generation
   # pointers are instance-relative so the host path and /silicon mount can
@@ -188,6 +186,10 @@ PY
 )
   release_root="${runtime_paths[0]}"
   environment_python="${runtime_paths[1]:-}"
+  if [ ! -f "$release_root/main.py" ]; then
+    log "$release_root does not look like a Silicon instance; expected main.py"
+    exit 1
+  fi
 
   local dependency_file=""
   local -a pip_integrity_args=()
@@ -264,7 +266,7 @@ PY
     fi
   fi
 
-  python - "$INSTANCE_NAME" "$SILICON_ROOT" <<'PY'
+  "$runtime_python" - "$INSTANCE_NAME" "$SILICON_ROOT" <<'PY'
 import sys
 from pathlib import Path
 

@@ -1075,6 +1075,23 @@ class DockerRuntimeTests(unittest.TestCase):
         self.assertIn("stop_runtime", handler)
         self.assertIn("exit 0", handler)
 
+    def test_runtime_entrypoint_validates_the_resolved_generation(self):
+        entrypoint = (
+            Path(__file__).resolve().parents[1]
+            / "docker"
+            / "runtime"
+            / "runtime-entrypoint.sh"
+        )
+        text = entrypoint.read_text()
+        self.assertNotIn('[ ! -f "$SILICON_ROOT/main.py" ]', text)
+        resolved = text.index('release_root="${runtime_paths[0]}"')
+        validated = text.index('[ ! -f "$release_root/main.py" ]')
+        self.assertGreater(validated, resolved)
+        self.assertIn(
+            '"$runtime_python" - "$INSTANCE_NAME" "$SILICON_ROOT"',
+            text,
+        )
+
     def test_runtime_entrypoint_refuses_unowned_legacy_update_fence(self):
         entrypoint = (
             Path(__file__).resolve().parents[1]
@@ -1103,6 +1120,7 @@ class DockerRuntimeTests(unittest.TestCase):
             **os.environ,
             "SILICON_ROOT": str(instance),
             "SILICON_INSTANCE_NAME": "ada",
+            "SILICON_SHARED_HOME": str(self.root / "shared-home"),
         }
 
         refused = subprocess.run(
@@ -1128,7 +1146,6 @@ class DockerRuntimeTests(unittest.TestCase):
         )
         self.assertNotEqual(owned.returncode, 0)
         self.assertNotIn("legacy offline update is in progress", owned.stderr)
-        self.assertIn("does not look like a Silicon instance", owned.stderr)
 
     def test_legacy_offline_fence_requires_strict_finite_metadata(self):
         instance = self.root / "silicons" / "ada"
