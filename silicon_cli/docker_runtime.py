@@ -301,10 +301,12 @@ def render_compose(
     config: dict | None = None,
     *,
     update_fence_owners: dict[str, str] | None = None,
+    pinned_targets: Iterable[str] = (),
 ) -> Path:
     cfg = config or load_config(required=True)
     compose = Path(cfg["compose_file"]).expanduser()
     compose.parent.mkdir(parents=True, exist_ok=True)
+    selected = set(pinned_targets)
     with HostFileLock(compose.with_name(f".{compose.name}.lock")):
         # Read the registry only after taking the render lock. Concurrent
         # registrations therefore cannot leave an older compose snapshot last.
@@ -317,10 +319,30 @@ def render_compose(
         for inst in rows:
             svc = inst.service or service_name(inst.name)
             cname = inst.container_name or container_name(inst.name)
-            image = _require_runtime_image(
-                inst.image or cfg["image"],
-                context=f"Docker Silicon '{inst.name}'",
-            )
+            configured_image = str(inst.image or cfg["image"] or "").strip()
+            if not selected or inst.name in selected:
+                image = _require_runtime_image(
+                    configured_image,
+                    context=f"Docker Silicon '{inst.name}'",
+                )
+            else:
+                # A targeted migration must not retarget or block unrelated
+                # legacy fleet members. Preserve their existing registry
+                # image verbatim while requiring the selected target to use
+                # a published immutable digest.
+                if (
+                    not configured_image
+                    or len(configured_image) > 512
+                    or any(
+                        character in configured_image
+                        for character in "\x00\r\n"
+                    )
+                ):
+                    raise RuntimeError(
+                        f"Docker Silicon '{inst.name}' has an invalid "
+                        "legacy runtime image"
+                    )
+                image = configured_image
             user = host_user()
             path = str(Path(inst.path).expanduser().resolve())
             fence_owner = str(
@@ -719,7 +741,10 @@ def bind_release_runtime(
         inst.image = pinned
         # Keep the global/default digest unchanged. Compose resolves this
         # target from its registry row and every other target from its own row.
-        render_compose(load_config(required=True))
+        render_compose(
+            load_config(required=True),
+            pinned_targets={inst.name},
+        )
     else:
         _save_config(candidate)
         render_compose(candidate)
@@ -1758,6 +1783,7 @@ def start_one(
             if fence_owner and allow_legacy_fence
             else None
         ),
+        pinned_targets={inst.name},
     )
     svc = inst.service or service_name(inst.name)
     suspend_marker = (
@@ -1835,7 +1861,10 @@ def start_one(
             # Keep the durable Compose source fail-closed. The created
             # container retains the transaction-scoped owner only for this
             # controlled start/restart.
-            render_compose(config_for_install(inst))
+            render_compose(
+                config_for_install(inst),
+                pinned_targets={inst.name},
+            )
         # A failed compose start must not accidentally suppress a later,
         # unrelated normal start. A live container owns the marker until its
         # entrypoint acknowledges and removes it.

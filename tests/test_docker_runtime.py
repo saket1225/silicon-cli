@@ -271,6 +271,45 @@ class DockerRuntimeTests(unittest.TestCase):
         self.assertIn(f'image: "{candidate}"', compose)
         self.assertIn(f'image: "{prior}"', compose)
 
+    def test_target_runtime_binding_preserves_unrelated_legacy_tag(self):
+        os.environ.pop("SILICON_DOCKER_ALLOW_UNPINNED_IMAGE", None)
+        prior = (
+            "ghcr.io/teamofsilicons/silicon-runtime@sha256:" + "1" * 64
+        )
+        candidate = (
+            "ghcr.io/teamofsilicons/silicon-runtime@sha256:" + "2" * 64
+        )
+        legacy = "ghcr.io/teamofsilicons/silicon-runtime:latest"
+        cfg = self.write_docker_config(image=prior)
+        for name, image in (("ada", prior), ("grace", legacy)):
+            path = self.root / "silicons" / name
+            path.mkdir(parents=True)
+            registry.register(
+                name,
+                str(path),
+                runtime="docker",
+                service=f"silicon-{name}",
+                compose_file=cfg["compose_file"],
+                image=image,
+                container_name=f"silicon-{name}",
+            )
+
+        with mock.patch.object(
+            docker_runtime,
+            "prepare_release_image",
+            return_value={**cfg, "image": candidate},
+        ):
+            docker_runtime.bind_release_runtime(
+                candidate,
+                installs=[registry.find("ada")],
+            )
+
+        self.assertEqual(registry.find("ada").image, candidate)
+        self.assertEqual(registry.find("grace").image, legacy)
+        compose = Path(cfg["compose_file"]).read_text()
+        self.assertIn(f'image: "{candidate}"', compose)
+        self.assertIn(f'image: "{legacy}"', compose)
+
     def test_digest_pull_fails_if_daemon_cannot_verify_repo_digest(self):
         os.environ.pop("SILICON_DOCKER_ALLOW_UNPINNED_IMAGE", None)
         cfg = self.write_docker_config(
@@ -1293,9 +1332,13 @@ class DockerRuntimeTests(unittest.TestCase):
             mock.call(
                 cfg,
                 update_fence_owners={"ada": "tx-1"},
+                pinned_targets={"ada"},
             ),
         )
-        self.assertEqual(render.call_args_list[-1], mock.call(cfg))
+        self.assertEqual(
+            render.call_args_list[-1],
+            mock.call(cfg, pinned_targets={"ada"}),
+        )
 
     def test_updater_owned_cold_start_bypasses_recursive_reconciliation(self):
         instance = self.root / "silicons" / "ada"
