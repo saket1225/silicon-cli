@@ -136,6 +136,40 @@ class DockerUpdateHookTests(unittest.TestCase):
 
         glass_begin.assert_not_called()
 
+    def test_schema_floor_error_falls_back_to_bootstrap_snapshot(self):
+        bootstrap = {
+            "manifest_path": str(self.root / "manifest.json"),
+            "store": str(self.root / ".silicon" / "snapshots"),
+            "root_hash": "a" * 64,
+            "provider": "silicon-cli-bootstrap",
+        }
+        failed = SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="Snapshot release sequence floor is invalid.",
+        )
+        with (
+            mock.patch.object(
+                update.docker_runtime,
+                "run_active_python",
+                return_value=failed,
+            ),
+            mock.patch(
+                "silicon_cli.updater.snapshot_adapter.create_local_snapshot",
+                return_value=bootstrap,
+            ) as create_local,
+        ):
+            created = update._hooks(self.install).create_checkpoint(
+                "tx-1",
+                "generation-0",
+            )
+
+        self.assertEqual(created, bootstrap)
+        create_local.assert_called_once_with(
+            self.root.resolve(),
+            release_id="generation-0:pre-update:tx-1",
+        )
+
     def test_health_requires_stable_application_readiness(self):
         with (
             mock.patch.object(

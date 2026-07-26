@@ -283,6 +283,7 @@ def _local_hooks(inst: registry.Install) -> EngineHooks:
                     "cannot import name 'create_local_snapshot'",
                     'cannot import name "create_local_snapshot"',
                     "No module named 'core.backup'",
+                    "Snapshot release sequence floor is invalid.",
                 )
             ):
                 raise
@@ -597,6 +598,7 @@ def _docker_hooks(inst: registry.Install) -> EngineHooks:
                     "cannot import name 'create_local_snapshot'",
                     'cannot import name "create_local_snapshot"',
                     "No module named 'core.backup'",
+                    "Snapshot release sequence floor is invalid.",
                 )
             ):
                 raise

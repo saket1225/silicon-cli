@@ -1293,6 +1293,115 @@ class DockerRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(render.call_args_list[-1], mock.call(cfg))
 
+    def test_updater_owned_cold_start_bypasses_recursive_reconciliation(self):
+        instance = self.root / "silicons" / "ada"
+        instance.mkdir(parents=True)
+        cfg = self.write_docker_config()
+        inst = registry.Install(
+            0,
+            "ada",
+            str(instance),
+            str(instance / ".silicon.pid"),
+            "docker",
+            "silicon-ada",
+            cfg["compose_file"],
+            cfg["image"],
+            "silicon-ada",
+        )
+        suspend_marker = instance / ".silicon" / "docker-start-suspended"
+
+        def acknowledge_start(_install):
+            suspend_marker.unlink()
+            return True
+
+        with (
+            mock.patch.object(docker_runtime, "ensure_ready"),
+            mock.patch.object(
+                docker_runtime,
+                "_legacy_offline_fence_owner",
+                return_value=None,
+            ),
+            mock.patch.object(
+                docker_runtime,
+                "active_generation_runtime_image",
+                return_value="",
+            ),
+            mock.patch.object(
+                docker_runtime, "config_for_install", return_value=cfg
+            ),
+            mock.patch.object(docker_runtime, "_ensure_image"),
+            mock.patch.object(docker_runtime, "render_compose"),
+            mock.patch.object(
+                docker_runtime,
+                "container_running",
+                side_effect=[False, True],
+            ),
+            mock.patch.object(
+                docker_runtime,
+                "_run",
+                return_value=SimpleNamespace(returncode=0),
+            ) as run,
+            mock.patch.object(
+                docker_runtime,
+                "_wait_for_container",
+                side_effect=acknowledge_start,
+            ),
+            mock.patch.object(
+                docker_runtime, "silicon_running", return_value=False
+            ),
+            mock.patch.object(
+                docker_runtime, "glass_agent_running", return_value=False
+            ),
+            mock.patch.object(docker_runtime, "_exec_silicon") as exec_silicon,
+            mock.patch.object(ui, "info"),
+            mock.patch.object(ui, "success"),
+        ):
+            docker_runtime.start_one(
+                inst,
+                start_agent=False,
+                reconcile=False,
+            )
+
+        exec_silicon.assert_not_called()
+        self.assertTrue(
+            any(
+                "process._start_one_unlocked" in " ".join(call.args[0])
+                for call in run.call_args_list
+            )
+        )
+        self.assertFalse(suspend_marker.exists())
+
+    def test_active_container_python_uses_generation_environment(self):
+        instance = self.root / "silicons" / "ada"
+        environment = instance / ".silicon" / "environments" / "env-1"
+        (environment / "bin").mkdir(parents=True)
+        (environment / "bin" / "python").write_bytes(b"python")
+        inst = registry.Install(
+            0,
+            "ada",
+            str(instance),
+            str(instance / ".silicon.pid"),
+            "docker",
+            "silicon-ada",
+            str(self.root / "silicons" / "compose.yml"),
+            "example/silicon:latest",
+            "silicon-ada",
+        )
+        store = mock.Mock()
+        store.current.return_value = {"generation_id": "generation-1"}
+        store.resolve_environment.return_value = environment
+
+        with mock.patch(
+            "silicon_cli.updater.generation.GenerationStore",
+            return_value=store,
+        ):
+            selected = docker_runtime._active_container_python(inst)
+
+        self.assertEqual(
+            selected,
+            "/silicon/.silicon/environments/env-1/bin/python",
+        )
+
     def test_start_binds_only_the_active_generation_digest(self):
         instance = self.root / "silicons" / "ada"
         instance.mkdir(parents=True)

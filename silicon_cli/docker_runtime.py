@@ -1381,13 +1381,20 @@ def _host_path(inst: registry.Install, container_path: str | Path) -> Path:
 
 
 def _active_container_python(inst: registry.Install) -> str:
-    from .config import active_environment_python
+    from .updater.generation import GenerationStore
 
-    environment_python = active_environment_python(inst.path)
-    if environment_python:
+    root = Path(inst.path).expanduser().resolve()
+    generations = GenerationStore(root)
+    environment = generations.resolve_environment(generations.current())
+    if environment is not None:
+        environment_python = environment / "bin" / "python"
+        if not environment_python.is_file():
+            raise RuntimeError(
+                "active Docker Silicon environment has no Python executable"
+            )
         return _container_path(inst, environment_python)
     legacy_python = (
-        Path(inst.path).expanduser().resolve() / ".venv" / "bin" / "python"
+        root / ".venv" / "bin" / "python"
     )
     if legacy_python.is_file():
         return f"{CONTAINER_PATH}/.venv/bin/python"
@@ -1759,7 +1766,8 @@ def start_one(
         / "docker-start-suspended"
     )
     was_running = container_running(inst)
-    if not start_main and not was_running:
+    suspend_start = not was_running and (not start_main or not reconcile)
+    if suspend_start:
         suspend_marker.parent.mkdir(parents=True, exist_ok=True)
         suspend_marker.touch()
     ui.info(f"Starting Docker service '{svc}' for '{inst.name}'...")
@@ -1771,7 +1779,7 @@ def start_one(
                 "to exec into."
             )
             return
-        if not start_main and not was_running:
+        if suspend_start:
             acknowledgement_deadline = time.monotonic() + 20.0
             while (
                 suspend_marker.exists()
@@ -1791,7 +1799,26 @@ def start_one(
             for _ in range(5):
                 if silicon_running(inst):
                     break
-                result = _exec_silicon(inst, ["start", inst.name])
+                if reconcile:
+                    result = _exec_silicon(inst, ["start", inst.name])
+                else:
+                    result = _run(
+                        _exec_args(
+                            inst,
+                            [
+                                "python3",
+                                "-c",
+                                (
+                                    "import sys;"
+                                    "from silicon_cli import process;"
+                                    "process._start_one_unlocked("
+                                    "sys.argv[1],start_agent=False,"
+                                    "reconcile_updates=False)"
+                                ),
+                                inst.name,
+                            ],
+                        )
+                    )
                 if result.returncode == 0 or silicon_running(inst):
                     break
                 time.sleep(2)
