@@ -629,6 +629,48 @@ class TransactionTests(unittest.TestCase):
                 "important memory\n",
             )
 
+    def test_legacy_seal_excludes_seed_data_from_recovery_source(self):
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = Fixture(Path(raw))
+            base = fixture.instance / ".silicon-upstream" / "base"
+            excluded = {
+                "prompts/CONTACTS.md": "seed contacts\n",
+                "prompts/LORE.md": "seed lore\n",
+                "prompts/MEMORY.md": "seed memory\n",
+                "prompts/memory/carbons/.gitkeep": "",
+                "prompts/memory/projects/.gitkeep": "",
+                "prompts/memory/silicons/.gitkeep": "",
+                "silicon.json": '{"address":"seed"}\n',
+            }
+            for relative, content in excluded.items():
+                Fixture._write(base, relative, content)
+
+            updater = TransactionalUpdater(
+                fixture.instance, fixture.cache, hooks=fixture.hooks()
+            )
+            updater.run(fixture.release)
+
+            sealed = updater.history()[0]["metadata"][
+                "sealed_prior_generation"
+            ]
+            sealed_root = fixture.instance / sealed["release_path"]
+            for relative in excluded:
+                self.assertFalse((sealed_root / relative).exists())
+            reconstructed = fixture.root / "reconstructed-legacy"
+            updater._materialize_authenticated_generation(
+                sealed, reconstructed
+            )
+            for relative in excluded:
+                self.assertFalse((reconstructed / relative).exists())
+            self.assertEqual(
+                (fixture.instance / "prompts/MEMORY.md").read_text(),
+                "important memory\n",
+            )
+            self.assertEqual(
+                (fixture.instance / "silicon.json").read_text(),
+                '{"address":"ada"}\n',
+            )
+
     def test_failed_health_check_rolls_back_and_restores_services(self):
         with tempfile.TemporaryDirectory() as raw:
             fixture = Fixture(Path(raw))

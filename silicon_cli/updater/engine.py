@@ -173,6 +173,24 @@ class TransactionalUpdater:
         )
         return digest
 
+    @staticmethod
+    def _prune_source_exclusions(root: Path) -> None:
+        """Remove living data and generated files from an immutable source tree."""
+
+        all_files = dict(regular_files(root))
+        source_files = {
+            relative
+            for relative, _path in regular_files(
+                root,
+                excluded_prefixes=RUNTIME_PREFIXES,
+                excluded_names=RUNTIME_EXACT,
+            )
+        }
+        for relative, path in all_files.items():
+            if relative not in source_files:
+                path.unlink()
+                fsync_dir(path.parent)
+
     def plan(self, release: FetchedRelease) -> dict[str, Any]:
         cached = self.cache.store(release)
         dry_id = f"dry-run-{os.getpid()}-{int(time.time() * 1000)}"
@@ -1283,11 +1301,24 @@ class TransactionalUpdater:
     ) -> dict[str, Any]:
         """Create a code-only immutable recovery source for a flat install."""
 
-        release, base = self._legacy_rollback_release(work)
+        release, _base = self._legacy_rollback_release(work)
         candidate = work / "sealed-legacy-prior"
         self.cache.materialize(release, candidate)
+        self._prune_source_exclusions(candidate)
+        sanitized_tree, _files = hash_tree(candidate)
+        if sanitized_tree != release.manifest.identity.tree_sha256:
+            sanitized_artifact = work / "legacy-code-base.tar"
+            release = self.cache.store(
+                create_artifact(
+                    candidate,
+                    sanitized_artifact,
+                    revision=sanitized_tree,
+                    source_label="legacy-cli-code-base",
+                    trust="legacy-cli-seed",
+                )
+            )
         overlay = self.overlays.capture(
-            base,
+            candidate,
             self.instance,
             base_tree_sha256=release.manifest.identity.tree_sha256,
         )
