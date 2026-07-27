@@ -283,8 +283,15 @@ The local wrappers are written to:
 
 For Glass-pulled silicons, those wrappers automatically use the folder's
 `.glass.json` (`server_url` + `api_key`) for conversation API auth.
-Docker startup compares these persisted wrappers with the CLI pinned in the
-runtime image and refreshes them before Silicon starts whenever they differ.
+Docker startup atomically rewrites these two small per-instance launchers on
+every boot. They export the instance root and execute the absolute Interface
+CLI bundled in the selected runtime image; the package itself is never copied
+over durable inbox or cursor state. Selecting an older runtime image therefore
+selects that image's Interface CLI as well, including the first rollback to
+the immediately preceding pre-fix image because both images expose the same
+absolute runtime command. Images older than the Interface runtime contract,
+which do not contain `/usr/local/bin/silicon-interface`, require a supported
+intermediate release rather than direct rollback.
 
 During local development, point `SILICON_INTERFACE_CLI_SOURCE` at the package:
 

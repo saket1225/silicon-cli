@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import tempfile
@@ -24,6 +25,23 @@ def _install(name: str, runtime: str = "local") -> registry.Install:
 
 
 class PackageManagerTests(unittest.TestCase):
+    def test_interface_release_asset_metadata_is_pinned(self):
+        spec = package_manager.PACKAGE_BY_KEY["silicon-interface"]
+
+        self.assertEqual(package_manager.SILICON_INTERFACE_CLI_VERSION, "2.0.2")
+        self.assertEqual(
+            package_manager.SILICON_INTERFACE_CLI_RELEASE_URL,
+            "https://github.com/teamofsilicons/silicon-interface-web/"
+            "releases/download/interface-cli-v2.0.2/"
+            "teamofsilicons-silicon-interface-cli-2.0.2.tgz",
+        )
+        self.assertEqual(
+            package_manager.SILICON_INTERFACE_CLI_RELEASE_SHA256,
+            "5f594958e8165dfaf87e19a71781a628"
+            "012b5debe0482dcdc24f28b308e710b2",
+        )
+        self.assertEqual(spec.latest_source, "embedded")
+
     def test_silicon_latest_version_comes_from_published_git_tags(self):
         with mock.patch.object(
             package_manager,
@@ -145,6 +163,240 @@ class PackageManagerTests(unittest.TestCase):
         self.assertEqual(result["status"], "partial")
         self.assertEqual(result["steps"][0]["status"], "blocked")
 
+    def test_interface_package_update_installs_verified_release_asset(self):
+        alpha = _install("alpha", "docker")
+        payload = b"immutable Interface CLI 2.0.2 release asset"
+        observed: dict[str, object] = {}
+
+        def urlopen(request, **kwargs):
+            observed["url"] = request.full_url
+            return io.BytesIO(payload)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            package_root = Path(temporary) / "lib" / "node_modules"
+            script = (
+                package_root
+                / "@teamofsilicons"
+                / "silicon-interface-cli"
+                / "bin"
+                / "silicon-interface.mjs"
+            )
+            script.parent.mkdir(parents=True)
+            script.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+
+            def run(command, **kwargs):
+                if command == ["/usr/bin/npm", "root", "-g"]:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=f"{package_root}\n",
+                        stderr="",
+                    )
+                if (
+                    command[0] == "/usr/bin/node"
+                    and Path(command[1]).resolve() == script.resolve()
+                    and command[2:] == ["--version"]
+                ):
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout="2.0.2\n",
+                        stderr="",
+                    )
+                observed["command"] = command
+                observed["artifact"] = Path(command[-1]).read_bytes()
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            def which(command):
+                return {
+                    "npm": "/usr/bin/npm",
+                    "node": "/usr/bin/node",
+                }.get(command)
+
+            with (
+                mock.patch.object(
+                    package_manager,
+                    "SILICON_INTERFACE_CLI_RELEASE_SHA256",
+                    hashlib.sha256(payload).hexdigest(),
+                ),
+                mock.patch.object(
+                    package_manager,
+                    "_selected_installs",
+                    return_value=[alpha],
+                ),
+                mock.patch.object(
+                    package_manager.registry,
+                    "installs",
+                    return_value=[alpha],
+                ),
+                mock.patch.object(package_manager.update, "update_instance"),
+                mock.patch.object(
+                    package_manager,
+                    "HostFileLock",
+                    return_value=nullcontext(),
+                ),
+                mock.patch.object(
+                    package_manager.shutil,
+                    "which",
+                    side_effect=which,
+                ),
+                mock.patch.object(
+                    package_manager.urllib.request,
+                    "urlopen",
+                    side_effect=urlopen,
+                ),
+                mock.patch.object(
+                    package_manager.subprocess,
+                    "run",
+                    side_effect=run,
+                ),
+            ):
+                result = package_manager.update_package(
+                    "silicon-interface"
+                )
+
+        command = observed["command"]
+        self.assertIsInstance(command, list)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(
+            observed["url"],
+            package_manager.SILICON_INTERFACE_CLI_RELEASE_URL,
+        )
+        self.assertEqual(observed["artifact"], payload)
+        self.assertEqual(
+            command[:-1],
+            [
+                "/usr/bin/npm",
+                "install",
+                "-g",
+                "--no-audit",
+                "--no-fund",
+            ],
+        )
+        self.assertTrue(command[-1].endswith("silicon-interface-cli-2.0.2.tgz"))
+        self.assertNotIn("@latest", " ".join(command))
+        self.assertNotIn(
+            package_manager.PACKAGE_BY_KEY["silicon-interface"].package,
+            command,
+        )
+
+    def test_interface_package_update_rejects_unverified_release_asset(self):
+        payload = b"tampered Interface CLI release asset"
+        with (
+            mock.patch.object(
+                package_manager.shutil,
+                "which",
+                return_value="/usr/bin/npm",
+            ),
+            mock.patch.object(
+                package_manager.urllib.request,
+                "urlopen",
+                return_value=io.BytesIO(payload),
+            ),
+            mock.patch.object(package_manager.subprocess, "run") as run,
+        ):
+            result = package_manager._update_host_package(
+                package_manager.PACKAGE_BY_KEY["silicon-interface"]
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("checksum mismatch", result["detail"])
+        run.assert_not_called()
+
+    def test_interface_update_reuses_verified_installer_for_local_copy(self):
+        alpha = _install("alpha")
+        verified = "/verified/lib/node_modules/@teamofsilicons/" \
+            "silicon-interface-cli/bin/silicon-interface.mjs"
+        with (
+            mock.patch.object(
+                package_manager,
+                "_selected_installs",
+                return_value=[alpha],
+            ),
+            mock.patch.object(
+                package_manager.registry,
+                "installs",
+                return_value=[alpha],
+            ),
+            mock.patch.object(
+                package_manager.process,
+                "install_is_running",
+                return_value=False,
+            ),
+            mock.patch.object(
+                package_manager,
+                "_update_host_package",
+                return_value={
+                    "step": "host:silicon-interface",
+                    "status": "done",
+                    "detail": "",
+                    "_verified_source_script": verified,
+                },
+            ),
+            mock.patch.object(
+                package_manager.interface_cli,
+                "setup",
+            ) as setup,
+            mock.patch.object(
+                package_manager,
+                "HostFileLock",
+                return_value=nullcontext(),
+            ),
+        ):
+            result = package_manager.update_package("silicon-interface")
+
+        self.assertEqual(result["status"], "succeeded")
+        setup.assert_called_once_with(
+            alpha.path,
+            required=True,
+            force=True,
+            source_script=verified,
+        )
+
+    def test_failed_verified_install_leaves_local_interface_intact(self):
+        alpha = _install("alpha")
+        with (
+            mock.patch.object(
+                package_manager,
+                "_selected_installs",
+                return_value=[alpha],
+            ),
+            mock.patch.object(
+                package_manager.registry,
+                "installs",
+                return_value=[alpha],
+            ),
+            mock.patch.object(
+                package_manager.process,
+                "install_is_running",
+                return_value=False,
+            ),
+            mock.patch.object(
+                package_manager,
+                "_update_host_package",
+                return_value={
+                    "step": "host:silicon-interface",
+                    "status": "failed",
+                    "detail": "checksum mismatch",
+                },
+            ),
+            mock.patch.object(
+                package_manager.interface_cli,
+                "setup",
+            ) as setup,
+            mock.patch.object(
+                package_manager,
+                "HostFileLock",
+                return_value=nullcontext(),
+            ),
+        ):
+            result = package_manager.update_package("silicon-interface")
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(
+            [step["status"] for step in result["steps"]],
+            ["failed", "blocked"],
+        )
+        setup.assert_not_called()
+
     def test_json_inventory_has_a_stable_marker(self):
         payload = {"schema": 1, "packages": []}
         output = io.StringIO()
@@ -186,6 +438,49 @@ class PackageManagerTests(unittest.TestCase):
         self.assertTrue(ready)
         stop.assert_called_once()
         run.assert_called_once()
+
+    def test_interface_setup_can_reuse_a_verified_installer(self):
+        installer = Path("/verified/bin/silicon-interface.mjs")
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                mock.patch.object(interface_cli, "_node_major", return_value=22),
+                mock.patch.object(
+                    interface_cli.shutil,
+                    "which",
+                    return_value="/usr/bin/node",
+                ),
+                mock.patch.object(interface_cli, "_stop_daemon"),
+                mock.patch.object(interface_cli, "_source_script") as source,
+                mock.patch.object(
+                    interface_cli,
+                    "_run",
+                    return_value=True,
+                ) as run,
+                mock.patch.object(
+                    interface_cli.runtime_contract,
+                    "verify_local_interface_install",
+                ),
+            ):
+                ready = interface_cli.setup(
+                    temporary,
+                    required=True,
+                    start_daemon=False,
+                    force=True,
+                    source_script=installer,
+                )
+
+        self.assertTrue(ready)
+        source.assert_not_called()
+        run.assert_called_once_with(
+            [
+                "/usr/bin/node",
+                str(installer),
+                "install",
+                str(Path(temporary).resolve()),
+                "--no-daemon",
+            ],
+            Path(temporary).resolve(),
+        )
 
 
 if __name__ == "__main__":

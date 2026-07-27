@@ -1,6 +1,7 @@
 """Fleet package inventory and safe, ownership-aware update orchestration."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -8,6 +9,7 @@ import shutil
 import ssl
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,6 +29,7 @@ from . import (
 )
 from .config import (
     REGISTRY_DIR,
+    SILICON_INTERFACE_CLI_RELEASE_SHA256,
     SILICON_INTERFACE_CLI_RELEASE_URL,
     SILICON_INTERFACE_CLI_VERSION,
     STEMCELL_GIT_URL,
@@ -39,6 +42,7 @@ from .updater.release import resolve_latest_published_git_release
 INVENTORY_MARKER = "SILICON_PACKAGE_INVENTORY="
 UPDATE_MARKER = "SILICON_PACKAGE_UPDATE="
 MAX_HTTP_BYTES = 2 * 1024 * 1024
+MAX_INTERFACE_CLI_BYTES = 16 * 1024 * 1024
 VERSION_RE = re.compile(r"(?<!\d)(\d+(?:\.\d+){1,3}(?:[-+][A-Za-z0-9_.-]+)?)(?!\d)")
 
 
@@ -483,6 +487,142 @@ def _run_step(command: list[str], label: str) -> dict:
     }
 
 
+def _download_verified_interface_cli(destination: Path) -> None:
+    request = urllib.request.Request(
+        SILICON_INTERFACE_CLI_RELEASE_URL,
+        headers={
+            "Accept": "application/octet-stream",
+            "User-Agent": "silicon-cli-package-update/1",
+        },
+    )
+    context = ssl.create_default_context(cafile=certifi.where())
+    digest = hashlib.sha256()
+    size = 0
+    with (
+        urllib.request.urlopen(request, timeout=30, context=context) as response,
+        destination.open("wb") as output,
+    ):
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_INTERFACE_CLI_BYTES:
+                raise RuntimeError(
+                    "Silicon Interface CLI release asset exceeded the size limit"
+                )
+            digest.update(chunk)
+            output.write(chunk)
+    actual = digest.hexdigest()
+    if actual != SILICON_INTERFACE_CLI_RELEASE_SHA256:
+        raise RuntimeError(
+            "Silicon Interface CLI release checksum mismatch: "
+            f"expected {SILICON_INTERFACE_CLI_RELEASE_SHA256}, got {actual}"
+        )
+
+
+def _verified_global_interface_script(npm: str) -> Path:
+    try:
+        root_result = subprocess.run(
+            [npm, "root", "-g"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(
+            f"could not locate the installed Interface CLI: {exc}"
+        ) from exc
+    roots = [
+        line.strip()
+        for line in root_result.stdout.splitlines()
+        if line.strip()
+    ]
+    if root_result.returncode != 0 or len(roots) != 1:
+        detail = (root_result.stderr or root_result.stdout).strip()
+        raise RuntimeError(
+            "could not locate the installed Interface CLI"
+            + (f": {detail}" if detail else "")
+        )
+    package_root = Path(roots[0]).expanduser().resolve(strict=True)
+    script = (
+        package_root
+        / "@teamofsilicons"
+        / "silicon-interface-cli"
+        / "bin"
+        / "silicon-interface.mjs"
+    )
+    if script.is_symlink() or not script.is_file():
+        raise RuntimeError(
+            "the checksum-verified Interface CLI package script is missing"
+        )
+    node = shutil.which("node")
+    if not node:
+        raise RuntimeError("node is not installed on the host")
+    try:
+        version_result = subprocess.run(
+            [node, str(script), "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(
+            f"could not verify the installed Interface CLI: {exc}"
+        ) from exc
+    installed = _numeric_version(
+        version_result.stdout or version_result.stderr
+    )
+    if (
+        version_result.returncode != 0
+        or installed != SILICON_INTERFACE_CLI_VERSION
+    ):
+        raise RuntimeError(
+            "installed Interface CLI does not match the verified release: "
+            f"found {installed or 'unknown'}, "
+            f"expected {SILICON_INTERFACE_CLI_VERSION}"
+        )
+    return script
+
+
+def _update_host_interface(npm: str, spec: PackageSpec) -> dict:
+    label = f"host:{spec.key}"
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="silicon-interface-update-"
+        ) as temporary:
+            artifact = Path(temporary) / (
+                f"teamofsilicons-silicon-interface-cli-"
+                f"{SILICON_INTERFACE_CLI_VERSION}.tgz"
+            )
+            _download_verified_interface_cli(artifact)
+            step = _run_step(
+                [
+                    npm,
+                    "install",
+                    "-g",
+                    "--no-audit",
+                    "--no-fund",
+                    str(artifact),
+                ],
+                label,
+            )
+            if step["status"] != "done":
+                return step
+            step["_verified_source_script"] = str(
+                _verified_global_interface_script(npm)
+            )
+            return step
+    except Exception as exc:
+        return {
+            "step": label,
+            "status": "failed",
+            "detail": str(exc),
+        }
+
+
 def _update_host_package(spec: PackageSpec) -> dict:
     if spec.manager == "pip":
         return _run_step(
@@ -503,6 +643,8 @@ def _update_host_package(spec: PackageSpec) -> dict:
             "status": "failed",
             "detail": "npm is not installed on the host",
         }
+    if spec.key == "silicon-interface":
+        return _update_host_interface(npm, spec)
     return _run_step(
         [npm, "install", "-g", f"{spec.package}@latest"],
         f"host:{spec.key}",
@@ -557,6 +699,7 @@ def _update_package_unlocked(
         else:
             steps.append({"step": "git-release", "status": "done"})
 
+    interface_source_script = ""
     if package_key != "silicon":
         running_local = [
             install.name
@@ -564,18 +707,21 @@ def _update_package_unlocked(
             if not install.is_docker and process.install_is_running(install)
         ]
         if running_local:
-            steps.append(
-                {
-                    "step": f"host:{package_key}",
-                    "status": "blocked",
-                    "detail": (
-                        "shared host package was not mutated while local "
-                        "Silicons are running: " + ", ".join(running_local)
-                    ),
-                }
-            )
+            host_step = {
+                "step": f"host:{package_key}",
+                "status": "blocked",
+                "detail": (
+                    "shared host package was not mutated while local "
+                    "Silicons are running: " + ", ".join(running_local)
+                ),
+            }
         else:
-            steps.append(_update_host_package(spec))
+            host_step = _update_host_package(spec)
+        if package_key == "silicon-interface":
+            interface_source_script = str(
+                host_step.pop("_verified_source_script", "")
+            )
+        steps.append(host_step)
 
     if package_key == "silicon-interface":
         for install in local_installs:
@@ -588,11 +734,24 @@ def _update_package_unlocked(
                     }
                 )
                 continue
+            if not interface_source_script:
+                steps.append(
+                    {
+                        "step": f"interface:{install.name}",
+                        "status": "blocked",
+                        "detail": (
+                            "the checksum-verified host Interface CLI was not "
+                            "installed; the per-instance copy was left intact"
+                        ),
+                    }
+                )
+                continue
             try:
                 interface_cli.setup(
                     install.path,
                     required=True,
                     force=True,
+                    source_script=interface_source_script,
                 )
             except Exception as exc:
                 steps.append(

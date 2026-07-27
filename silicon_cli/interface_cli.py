@@ -145,10 +145,38 @@ def _start_daemon(target: Path) -> bool:
     return ok
 
 
-def _stop_daemon(target: Path) -> None:
+def start_daemon(target: str | Path) -> bool:
+    """Best-effort start of this instance's Interface daemon."""
+
+    return _start_daemon(Path(target).resolve())
+
+
+def _stop_daemon(target: Path) -> bool:
     si = target / ".silicon-interface" / "bin" / "si"
     if si.exists():
-        _run([str(si), "daemon", "stop"], target, warn=False)
+        return _run([str(si), "daemon", "stop"], target, warn=False)
+    return not (target / ".silicon-interface" / "daemon.pid").exists()
+
+
+def stop_daemon(
+    target: str | Path,
+    *,
+    required: bool = False,
+) -> bool:
+    """Stop this instance's Interface daemon.
+
+    Transactional full stops use ``required=True`` so protected Interface
+    state is never checkpointed or restored while its listener may still be
+    writing to it.
+    """
+
+    target_path = Path(target).resolve()
+    ok = _stop_daemon(target_path)
+    if required and not ok:
+        raise RuntimeError(
+            "Silicon Interface daemon could not be stopped safely"
+        )
+    return ok
 
 
 def _unavailable(message: str, *, required: bool) -> bool:
@@ -172,11 +200,14 @@ def setup(
     required: bool = False,
     start_daemon: bool = True,
     force: bool = False,
+    source_script: str | Path | None = None,
 ) -> bool:
     """Install local si/silicon-interface wrappers into ``target``.
 
     Normal hydration remains best-effort. Transactional pulls pass
     ``required=True`` so a claim cannot commit without a working Interface CLI.
+    Package updates pass their checksum-verified global package script so
+    per-instance installation cannot perform a second unverified download.
     """
     if SILICON_INTERFACE_CLI_SKIP:
         return _unavailable(
@@ -206,12 +237,11 @@ def setup(
     if force:
         _stop_daemon(target_path)
 
-    script = _source_script()
     ui.info("Setting up Silicon Interface CLI...")
-    if script:
+    if source_script is not None:
         command = [
             shutil.which("node") or "node",
-            str(script),
+            str(source_script),
             "install",
             str(target_path),
         ]
@@ -219,23 +249,35 @@ def setup(
             command.append("--no-daemon")
         ok = _run(command, target_path)
     else:
-        commands = _npm_install_commands(
-            target_path,
-            start_daemon=start_daemon,
-        )
-        if not commands:
-            return _unavailable("npm was not found", required=required)
-        ok = False
-        for index, cmd in enumerate(commands):
-            final_attempt = index == len(commands) - 1
-            ok = _run(cmd, target_path, warn=final_attempt)
-            if ok:
-                break
-            if not final_attempt:
-                ui.warn(
-                    "Silicon Interface CLI package lookup failed; "
-                    "retrying with published tarball."
-                )
+        script = _source_script()
+        if script:
+            command = [
+                shutil.which("node") or "node",
+                str(script),
+                "install",
+                str(target_path),
+            ]
+            if not start_daemon:
+                command.append("--no-daemon")
+            ok = _run(command, target_path)
+        else:
+            commands = _npm_install_commands(
+                target_path,
+                start_daemon=start_daemon,
+            )
+            if not commands:
+                return _unavailable("npm was not found", required=required)
+            ok = False
+            for index, cmd in enumerate(commands):
+                final_attempt = index == len(commands) - 1
+                ok = _run(cmd, target_path, warn=final_attempt)
+                if ok:
+                    break
+                if not final_attempt:
+                    ui.warn(
+                        "Silicon Interface CLI package lookup failed; "
+                        "retrying with published tarball."
+                    )
 
     if ok:
         try:

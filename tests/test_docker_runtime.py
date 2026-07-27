@@ -540,26 +540,48 @@ class DockerRuntimeTests(unittest.TestCase):
             workflow,
         )
 
-    def test_runtime_entrypoint_refreshes_persisted_interface_cli(self):
+    def test_runtime_entrypoint_atomically_activates_persisted_interface_cli(self):
+        root = Path(__file__).resolve().parents[1]
         entrypoint = (
-            Path(__file__).resolve().parents[1]
+            root
             / "docker"
             / "runtime"
             / "runtime-entrypoint.sh"
         ).read_text()
+        dockerfile = (
+            root / "docker" / "runtime" / "Dockerfile"
+        ).read_text()
 
-        self.assertIn('local_interface="$SILICON_ROOT/.silicon-interface/bin/si"', entrypoint)
         self.assertIn(
-            '[ "$local_interface_version" != "$global_interface_version" ]',
+            'global_interface="/usr/local/bin/silicon-interface"',
             entrypoint,
         )
         self.assertIn(
-            '"$global_interface" install "$SILICON_ROOT"',
+            "/usr/local/libexec/silicon-activate-interface-cli.py",
+            entrypoint,
+        )
+        self.assertIn(
+            '--executable "$global_interface"',
             entrypoint,
         )
         self.assertIn(
             'die "Silicon Interface shim does not match the runtime image"',
             entrypoint,
+        )
+        self.assertNotIn(" daemon start", entrypoint)
+        self.assertIn(
+            "SILICON_INTERFACE_RESET_DAEMON_PID=1 "
+            'silicon start "$INSTANCE_NAME"',
+            entrypoint,
+        )
+        self.assertIn(
+            'state / "interface-daemon-reset-required"',
+            entrypoint,
+        )
+        self.assertIn(
+            "COPY docker/runtime/activate-interface-cli.py "
+            "/usr/local/libexec/silicon-activate-interface-cli.py",
+            dockerfile,
         )
 
     def test_silicon_health_requires_live_generation_child_metadata(self):
@@ -1439,6 +1461,8 @@ class DockerRuntimeTests(unittest.TestCase):
         self.assertTrue(
             any(
                 "process._start_one_unlocked" in " ".join(call.args[0])
+                and "SILICON_INTERFACE_RESET_DAEMON_PID=1"
+                in call.args[0]
                 for call in run.call_args_list
             )
         )

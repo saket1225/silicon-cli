@@ -1843,6 +1843,13 @@ def start_one(
                                 ),
                                 inst.name,
                             ],
+                            extra_environment=(
+                                (
+                                    "SILICON_INTERFACE_RESET_DAEMON_PID=1",
+                                )
+                                if not was_running
+                                else ()
+                            ),
                         )
                     )
                 if result.returncode == 0 or silicon_running(inst):

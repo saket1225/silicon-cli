@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from silicon_cli import process
+from silicon_cli import process, registry
 
 
 class RuntimeChildHealthTests(unittest.TestCase):
@@ -206,6 +206,220 @@ class RuntimeChildHealthTests(unittest.TestCase):
                 process._publish_stop_sentinel(root)
             self.assertEqual(target.read_text(encoding="utf-8"), "keep\n")
 
+    def test_interface_daemon_pid_is_reset_only_for_fresh_container_boot(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            interface_state = root / ".silicon-interface"
+            interface_state.mkdir()
+            daemon_pid = interface_state / "daemon.pid"
+            daemon_pid.write_text("123\n", encoding="utf-8")
+            inst = registry.Install(
+                0,
+                "ada",
+                str(root),
+                str(root / ".silicon.pid"),
+            )
+
+            with (
+                mock.patch.dict(
+                    process.os.environ,
+                    {"SILICON_CONTAINER_MODE": "1"},
+                    clear=True,
+                ),
+                mock.patch.object(
+                    process.interface_cli,
+                    "start_daemon",
+                ) as start_daemon,
+            ):
+                process._start_interface_daemon(inst)
+
+            self.assertTrue(daemon_pid.exists())
+            start_daemon.assert_called_once_with(str(root))
+
+            with (
+                mock.patch.dict(
+                    process.os.environ,
+                    {
+                        "SILICON_CONTAINER_MODE": "1",
+                        "SILICON_INTERFACE_RESET_DAEMON_PID": "1",
+                    },
+                    clear=True,
+                ),
+                mock.patch.object(
+                    process.interface_cli,
+                    "start_daemon",
+                ) as start_daemon,
+                mock.patch.object(
+                    process,
+                    "_activate_container_interface",
+                    return_value=True,
+                ) as activate,
+            ):
+                process._start_interface_daemon(inst)
+
+            self.assertFalse(daemon_pid.exists())
+            activate.assert_called_once_with(inst)
+            start_daemon.assert_called_once_with(str(root))
+
+            daemon_pid.write_text("456\n", encoding="utf-8")
+            reset_marker = (
+                root
+                / ".silicon"
+                / "interface-daemon-reset-required"
+            )
+            reset_marker.parent.mkdir()
+            reset_marker.touch()
+            with (
+                mock.patch.dict(
+                    process.os.environ,
+                    {"SILICON_CONTAINER_MODE": "1"},
+                    clear=True,
+                ),
+                mock.patch.object(
+                    process.interface_cli,
+                    "start_daemon",
+                ) as start_daemon,
+                mock.patch.object(
+                    process,
+                    "_activate_container_interface",
+                    return_value=True,
+                ) as activate,
+            ):
+                process._start_interface_daemon(inst)
+
+            self.assertFalse(daemon_pid.exists())
+            self.assertFalse(reset_marker.exists())
+            activate.assert_called_once_with(inst)
+            start_daemon.assert_called_once_with(str(root))
+
+            daemon_pid.write_text("789\n", encoding="utf-8")
+            reset_marker.touch()
+            with (
+                mock.patch.dict(
+                    process.os.environ,
+                    {"SILICON_CONTAINER_MODE": "1"},
+                    clear=True,
+                ),
+                mock.patch.object(
+                    process,
+                    "_activate_container_interface",
+                    return_value=False,
+                ),
+                mock.patch.object(
+                    process.interface_cli,
+                    "start_daemon",
+                ) as start_daemon,
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "could not activate",
+                ),
+            ):
+                process._start_interface_daemon(inst)
+
+            self.assertTrue(daemon_pid.exists())
+            self.assertTrue(reset_marker.exists())
+            start_daemon.assert_not_called()
+
+    def test_starting_an_already_running_instance_reconciles_interface_daemon(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            inst = registry.Install(
+                0,
+                "ada",
+                str(root),
+                str(root / ".silicon.pid"),
+            )
+            with (
+                mock.patch.object(
+                    process.registry,
+                    "resolve_one",
+                    return_value=inst,
+                ),
+                mock.patch.object(
+                    process,
+                    "_reconcile_glass_terminal_state",
+                ),
+                mock.patch.object(
+                    process,
+                    "legacy_offline_update_fenced",
+                    return_value=False,
+                ),
+                mock.patch.object(
+                    process,
+                    "_owned_watchdog_pid",
+                    return_value=(123, True),
+                ),
+                mock.patch.object(
+                    process.interface_cli,
+                    "start_daemon",
+                ) as start_daemon,
+                mock.patch.object(
+                    process,
+                    "_reconcile_backup_schedule",
+                ),
+            ):
+                process._start_one_unlocked(
+                    "ada",
+                    start_agent=False,
+                    reconcile_updates=False,
+                )
+
+            start_daemon.assert_called_once_with(str(root))
+
+    def test_container_interface_reactivation_uses_image_owned_helper(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            activator = root / "activate-interface"
+            package_executable = root / "package-silicon-interface"
+            executable = root / "silicon-interface"
+            activator.touch()
+            activator.chmod(0o755)
+            package_executable.touch()
+            package_executable.chmod(0o755)
+            executable.symlink_to(package_executable)
+            inst = registry.Install(
+                0,
+                "ada",
+                str(root),
+                str(root / ".silicon.pid"),
+            )
+            with (
+                mock.patch.object(
+                    process,
+                    "CONTAINER_INTERFACE_ACTIVATOR",
+                    activator,
+                ),
+                mock.patch.object(
+                    process,
+                    "CONTAINER_INTERFACE_EXECUTABLE",
+                    executable,
+                ),
+                mock.patch.object(
+                    process.subprocess,
+                    "run",
+                    return_value=mock.Mock(returncode=0),
+                ) as run,
+            ):
+                self.assertTrue(
+                    process._activate_container_interface(inst)
+                )
+
+            run.assert_called_once_with(
+                [
+                    str(activator),
+                    "--root",
+                    str(root.resolve()),
+                    "--executable",
+                    str(executable),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+
     def test_watchdog_waits_for_its_own_durable_pid_publication(self):
         with tempfile.TemporaryDirectory() as raw:
             pid_file = Path(raw) / ".silicon.pid"
@@ -291,11 +505,57 @@ class RuntimeChildHealthTests(unittest.TestCase):
                 mock.patch.object(process, "kill_floaters"),
                 mock.patch.object(process.os, "kill") as kill,
                 mock.patch.object(process.glassagent, "stop"),
+                mock.patch.object(
+                    process.interface_cli,
+                    "stop_daemon",
+                ) as stop_interface,
             ):
                 process._stop_one_unlocked("ada", full=True)
             kill.assert_called_once_with(123, process.signal.SIGTERM)
+            stop_interface.assert_called_once_with(
+                str(root),
+                required=True,
+            )
             self.assertFalse(pid_file.exists())
             self.assertFalse(process.runtime_meta_file(root).exists())
+
+    def test_full_stop_without_watchdog_still_quiesces_interface(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            install = registry.Install(
+                0,
+                "ada",
+                str(root),
+                str(root / ".silicon.pid"),
+            )
+            with (
+                mock.patch.object(
+                    process.registry,
+                    "resolve_one",
+                    return_value=install,
+                ),
+                mock.patch.object(
+                    process,
+                    "_owned_watchdog_pid",
+                    return_value=None,
+                ),
+                mock.patch.object(process, "kill_floaters"),
+                mock.patch.object(
+                    process.interface_cli,
+                    "stop_daemon",
+                ) as stop_interface,
+                mock.patch.object(
+                    process.glassagent,
+                    "stop",
+                ) as stop_agent,
+            ):
+                process._stop_one_unlocked("ada", full=True)
+
+            stop_interface.assert_called_once_with(
+                str(root),
+                required=True,
+            )
+            stop_agent.assert_called_once_with(str(root))
 
     def test_corrupt_metadata_keeps_command_owned_watchdog_conservatively_active(self):
         with tempfile.TemporaryDirectory() as raw:

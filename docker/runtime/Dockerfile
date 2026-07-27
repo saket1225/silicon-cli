@@ -60,8 +60,11 @@ RUN curl --fail --location --silent --show-error \
     "${CLAUDE_CODE_SPEC}" \
     "${CODEX_SPEC}"
 
+COPY docker/runtime/activate-interface-cli.py /usr/local/libexec/silicon-activate-interface-cli.py
 COPY docker/runtime/runtime-entrypoint.sh /usr/local/bin/silicon-runtime-entrypoint
-RUN chmod +x /usr/local/bin/silicon-runtime-entrypoint
+RUN chmod 0555 \
+        /usr/local/libexec/silicon-activate-interface-cli.py \
+        /usr/local/bin/silicon-runtime-entrypoint
 
 WORKDIR /silicon
 ENTRYPOINT ["tini", "--", "/usr/local/bin/silicon-runtime-entrypoint"]

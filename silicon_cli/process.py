@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from . import docker_runtime, glassagent, registry, ui
+from . import docker_runtime, glassagent, interface_cli, registry, ui
 from .config import (
     active_release_root,
     legacy_offline_update_fenced,
@@ -34,6 +34,12 @@ MAX_RAPID = 5
 RAPID_WINDOW = 60
 WATCHDOG_PUBLICATION_TIMEOUT = 15.0
 LIFECYCLE_LOCK_TIMEOUT = 30.0
+CONTAINER_INTERFACE_ACTIVATOR = Path(
+    "/usr/local/libexec/silicon-activate-interface-cli.py"
+)
+CONTAINER_INTERFACE_EXECUTABLE = Path(
+    "/usr/local/bin/silicon-interface"
+)
 
 
 class _RuntimeLifecycleLock(InstanceLock):
@@ -93,7 +99,7 @@ def _fsync_directory(path: Path) -> None:
             path,
             os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
         )
-    except OSError:
+    except (OSError, RuntimeError):
         return
     try:
         os.fsync(descriptor)
@@ -665,6 +671,120 @@ def _reconcile_glass_terminal_state(inst: registry.Install) -> None:
         )
 
 
+def _start_interface_daemon(
+    inst: registry.Install,
+) -> None:
+    """Start Interface only after the instance's durable state is ready.
+
+    A container PID cannot survive an image boot, so a fresh container start
+    drops the persisted daemon PID before asking the active image's local
+    wrapper to start its bundled Interface CLI. Host-local starts preserve the
+    PID so the command remains idempotent.
+    """
+
+    truthy = {"1", "true", "yes", "on"}
+    container_mode = (
+        os.environ.get("SILICON_CONTAINER_MODE", "").strip().lower()
+        in truthy
+    )
+    reset_container_pid = (
+        os.environ.pop(
+            "SILICON_INTERFACE_RESET_DAEMON_PID",
+            "",
+        ).strip().lower()
+        in truthy
+    )
+    reset_marker = (
+        Path(inst.path)
+        / ".silicon"
+        / "interface-daemon-reset-required"
+    )
+    if container_mode:
+        try:
+            marker_metadata = reset_marker.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise RuntimeError(
+                "Could not inspect the Silicon Interface fresh-boot marker: "
+                f"{exc}"
+            ) from exc
+        else:
+            if (
+                stat.S_ISLNK(marker_metadata.st_mode)
+                or not stat.S_ISREG(marker_metadata.st_mode)
+                or marker_metadata.st_nlink != 1
+            ):
+                raise RuntimeError(
+                    "Silicon Interface fresh-boot marker is unsafe; "
+                    "the daemon was not started."
+                )
+            reset_container_pid = True
+    if container_mode and reset_container_pid:
+        if not _activate_container_interface(inst):
+            raise RuntimeError(
+                "the selected runtime image could not activate "
+                "Silicon Interface"
+            )
+        daemon_pid = (
+            Path(inst.path) / ".silicon-interface" / "daemon.pid"
+        )
+        try:
+            daemon_pid.unlink(missing_ok=True)
+        except IsADirectoryError as exc:
+            raise RuntimeError(
+                "Silicon Interface daemon PID path is unsafe; "
+                "the daemon was not started."
+            ) from exc
+        reset_marker.unlink(missing_ok=True)
+    interface_cli.start_daemon(inst.path)
+
+
+def _activate_container_interface(inst: registry.Install) -> bool:
+    """Re-activate image-owned launchers after any suspended state restore."""
+
+    activator = CONTAINER_INTERFACE_ACTIVATOR
+    runtime_interface = CONTAINER_INTERFACE_EXECUTABLE
+    try:
+        resolved_interface = runtime_interface.resolve(strict=True)
+    except (OSError, RuntimeError):
+        resolved_interface = runtime_interface
+    if (
+        activator.is_symlink()
+        or not activator.is_file()
+        or not os.access(activator, os.X_OK)
+        or not resolved_interface.is_file()
+        or not os.access(resolved_interface, os.X_OK)
+    ):
+        ui.warn(
+            "The selected runtime image cannot activate Silicon Interface."
+        )
+        return False
+    try:
+        result = subprocess.run(
+            [
+                str(activator),
+                "--root",
+                str(Path(inst.path).resolve()),
+                "--executable",
+                str(runtime_interface),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        ui.warn(f"Silicon Interface activation failed: {exc}")
+        return False
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        suffix = f": {detail[-1]}" if detail else ""
+        ui.warn(f"Silicon Interface activation failed{suffix}")
+        return False
+    return True
+
+
 def _start_one_unlocked(
     target: str | None,
     *,
@@ -700,12 +820,14 @@ def _start_one_unlocked(
             )
             return
         ui.warn(f"'{inst.name}' is already running (PID {pid})")
+        _start_interface_daemon(inst)
         if start_agent:
             glassagent.start(inst.path)
         _reconcile_backup_schedule(inst)
         return
 
     kill_floaters(inst.path)
+    _start_interface_daemon(inst)
     pid_path = _validated_pid_path(inst.path, inst.pid_file)
     pid_path.unlink(missing_ok=True)
     (Path(inst.path) / ".silicon.stop").unlink(missing_ok=True)
@@ -801,6 +923,7 @@ def _stop_one_unlocked(target: str | None, full: bool = False) -> None:
         (Path(inst.path) / ".silicon.stop").unlink(missing_ok=True)
         runtime_meta_file(inst.path).unlink(missing_ok=True)
         if full:
+            interface_cli.stop_daemon(inst.path, required=True)
             glassagent.stop(inst.path)
         return
 
@@ -842,6 +965,7 @@ def _stop_one_unlocked(target: str | None, full: bool = False) -> None:
     ui.success(f"'{inst.name}' stopped")
 
     if full:
+        interface_cli.stop_daemon(inst.path, required=True)
         glassagent.stop(inst.path)
     else:
         ui.info("Glass agent still running (use --full to stop it too).")

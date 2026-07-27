@@ -42,6 +42,10 @@ SILICON_INTERFACE_CLI_RELEASE_URL = (
     "interface-cli-v2.0.2/"
     "teamofsilicons-silicon-interface-cli-2.0.2.tgz"
 )
+SILICON_INTERFACE_CLI_RELEASE_SHA256 = (
+    "5f594958e8165dfaf87e19a71781a628"
+    "012b5debe0482dcdc24f28b308e710b2"
+)
 SILICON_INTERFACE_CLI_PACKAGE = os.environ.get(
     "SILICON_INTERFACE_CLI_PACKAGE",
     SILICON_INTERFACE_CLI_RELEASE_URL,

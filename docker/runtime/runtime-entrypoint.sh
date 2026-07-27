@@ -259,23 +259,21 @@ if (
     )
 PY
 
-  global_interface="$(command -v silicon-interface || true)"
+  global_interface="/usr/local/bin/silicon-interface"
   local_interface="$SILICON_ROOT/.silicon-interface/bin/si"
-  [ -n "$global_interface" ] \
+  [ -x "$global_interface" ] \
     || die "Silicon Interface CLI is missing from the runtime image"
   global_interface_version="$("$global_interface" --version 2>/dev/null || true)"
   [ -n "$global_interface_version" ] \
     || die "Silicon Interface CLI in the runtime image is not executable"
-  local_interface_version=""
-  if [ -x "$local_interface" ]; then
-    local_interface_version="$("$local_interface" --version 2>/dev/null || true)"
-  fi
-  if [ "$local_interface_version" != "$global_interface_version" ]; then
-    log "refreshing Silicon Interface shim from the runtime image"
-    "$global_interface" install "$SILICON_ROOT" >/dev/null \
-      || die "Silicon Interface shim refresh failed"
-    local_interface_version="$("$local_interface" --version 2>/dev/null || true)"
-  fi
+  log "atomically activating Silicon Interface CLI from the runtime image"
+  "$runtime_python" \
+    /usr/local/libexec/silicon-activate-interface-cli.py \
+    --root "$SILICON_ROOT" \
+    --executable "$global_interface" \
+    >/dev/null \
+    || die "Silicon Interface CLI activation failed"
+  local_interface_version="$("$local_interface" --version 2>/dev/null || true)"
   [ "$local_interface_version" = "$global_interface_version" ] \
     || die "Silicon Interface shim does not match the runtime image"
 
@@ -399,6 +397,44 @@ PY
 
 prepare_runtime
 
+# The Interface daemon PID belongs to the prior container namespace. Keep this
+# one-shot marker outside the protected Interface snapshot so an updater-owned
+# suspended boot can restore state first; process.start consumes it immediately
+# before starting Interface.
+python3 - "$SILICON_ROOT" <<'PY' \
+  || die "could not publish the Interface daemon fresh-boot marker"
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+state = root / ".silicon"
+state.mkdir(mode=0o700, exist_ok=True)
+if state.is_symlink() or not state.is_dir():
+    raise SystemExit("Silicon runtime state directory is unsafe")
+marker = state / "interface-daemon-reset-required"
+flags = os.O_CREAT | os.O_WRONLY
+flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(marker, flags, 0o600)
+try:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise SystemExit("Interface daemon fresh-boot marker is unsafe")
+    os.ftruncate(descriptor, 0)
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+directory = os.open(
+    state,
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+)
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+PY
+
 # PIDs are namespaced to each container boot. Stale files from a previous
 # container can point at an unrelated new process, so remove them before start.
 rm -f \
@@ -414,7 +450,8 @@ if [ -f "$SILICON_ROOT/.silicon/docker-start-suspended" ]; then
   rm -f "$SILICON_ROOT/.silicon/docker-start-suspended"
   log "service start suspended for transactional state restoration"
 else
-  silicon start "$INSTANCE_NAME" || log "initial start returned non-zero; container stays alive for inspection"
+  SILICON_INTERFACE_RESET_DAEMON_PID=1 silicon start "$INSTANCE_NAME" \
+    || log "initial start returned non-zero; container stays alive for inspection"
 fi
 
 while true; do
