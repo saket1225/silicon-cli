@@ -4,7 +4,8 @@ FROM node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca440
 ARG SILICON_CLI_SPEC=silicon-cli==1.0.22
 ARG SILICON_BROWSER_SPEC=silicon-browser==1.0.8
 ARG SILICON_EXTEND_SPEC=silicon-extend==0.1.1
-ARG SILICON_INTERFACE_CLI_SPEC=@teamofsilicons/silicon-interface-cli@2.0.1
+ARG SILICON_INTERFACE_CLI_URL=https://github.com/teamofsilicons/silicon-interface-web/releases/download/interface-cli-v2.0.2/teamofsilicons-silicon-interface-cli-2.0.2.tgz
+ARG SILICON_INTERFACE_CLI_SHA256=5f594958e8165dfaf87e19a71781a628012b5debe0482dcdc24f28b308e710b2
 ARG CLAUDE_CODE_SPEC=@anthropic-ai/claude-code@2.1.220
 ARG CODEX_SPEC=@openai/codex@0.145.0
 ARG PIP_SPEC=pip==26.1.2
@@ -47,8 +48,15 @@ RUN python3 -m venv /opt/silicon-runtime \
         "${SILICON_EXTEND_SPEC}" \
     && /opt/silicon-runtime/bin/pip check
 
-RUN npm install -g --no-audit --no-fund \
-    "${SILICON_INTERFACE_CLI_SPEC}" \
+RUN curl --fail --location --silent --show-error \
+        --output /tmp/silicon-interface-cli.tgz \
+        "${SILICON_INTERFACE_CLI_URL}" \
+    && echo "${SILICON_INTERFACE_CLI_SHA256}  /tmp/silicon-interface-cli.tgz" \
+        | sha256sum --check --strict \
+    && npm install -g --no-audit --no-fund \
+        /tmp/silicon-interface-cli.tgz \
+    && rm -f /tmp/silicon-interface-cli.tgz \
+    && npm install -g --no-audit --no-fund \
     "${CLAUDE_CODE_SPEC}" \
     "${CODEX_SPEC}"
 

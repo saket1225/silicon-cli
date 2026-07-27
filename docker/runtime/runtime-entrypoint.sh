@@ -259,12 +259,25 @@ if (
     )
 PY
 
-  if command -v silicon-interface >/dev/null 2>&1; then
-    if [ ! -x "$SILICON_ROOT/.silicon-interface/bin/si" ]; then
-      log "installing Silicon Interface shim"
-      silicon-interface install "$SILICON_ROOT" >/dev/null
-    fi
+  global_interface="$(command -v silicon-interface || true)"
+  local_interface="$SILICON_ROOT/.silicon-interface/bin/si"
+  [ -n "$global_interface" ] \
+    || die "Silicon Interface CLI is missing from the runtime image"
+  global_interface_version="$("$global_interface" --version 2>/dev/null || true)"
+  [ -n "$global_interface_version" ] \
+    || die "Silicon Interface CLI in the runtime image is not executable"
+  local_interface_version=""
+  if [ -x "$local_interface" ]; then
+    local_interface_version="$("$local_interface" --version 2>/dev/null || true)"
   fi
+  if [ "$local_interface_version" != "$global_interface_version" ]; then
+    log "refreshing Silicon Interface shim from the runtime image"
+    "$global_interface" install "$SILICON_ROOT" >/dev/null \
+      || die "Silicon Interface shim refresh failed"
+    local_interface_version="$("$local_interface" --version 2>/dev/null || true)"
+  fi
+  [ "$local_interface_version" = "$global_interface_version" ] \
+    || die "Silicon Interface shim does not match the runtime image"
 
   "$runtime_python" - "$INSTANCE_NAME" "$SILICON_ROOT" <<'PY'
 import sys

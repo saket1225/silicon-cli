@@ -79,8 +79,8 @@ and durable update jobs.
 | `GLASS_SERVER_URL` | `https://glass.teamofsilicons.com` | Glass sync server (pull/push) |
 | `SILICON_STEMCELL_REPO` | `teamofsilicons/silicon-stemcell` | GitHub repository used by `new`, `pull`, and `update` |
 | `SILICON_PYTHON` | `python3` | interpreter used to run a silicon's `main.py` |
-| `SILICON_INTERFACE_CLI_PACKAGE` | `@teamofsilicons/silicon-interface-cli` | npm package used to install the Silicon Interface CLI |
-| `SILICON_INTERFACE_CLI_TARBALL` | versioned npm tarball | fallback package URL if registry metadata is briefly unavailable |
+| `SILICON_INTERFACE_CLI_PACKAGE` | immutable Interface CLI release asset | package spec used to install the Silicon Interface CLI |
+| `SILICON_INTERFACE_CLI_TARBALL` | same immutable release asset | fallback package spec for an explicitly overridden primary source |
 | `SILICON_INTERFACE_CLI_SOURCE` | *(empty)* | local package dir or `silicon-interface.mjs` path for dev installs |
 | `SILICON_INTERFACE_CLI_SKIP` | *(empty)* | set to `1` to skip interface CLI setup |
 | `SILICON_INTERFACE_DAEMON_SKIP` | *(empty)* | set to `1` to install the CLI without starting its listener daemon |
@@ -283,6 +283,8 @@ The local wrappers are written to:
 
 For Glass-pulled silicons, those wrappers automatically use the folder's
 `.glass.json` (`server_url` + `api_key`) for conversation API auth.
+Docker startup compares these persisted wrappers with the CLI pinned in the
+runtime image and refreshes them before Silicon starts whenever they differ.
 
 During local development, point `SILICON_INTERFACE_CLI_SOURCE` at the package:
 

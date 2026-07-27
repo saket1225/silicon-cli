@@ -27,6 +27,8 @@ from . import (
 )
 from .config import (
     REGISTRY_DIR,
+    SILICON_INTERFACE_CLI_RELEASE_URL,
+    SILICON_INTERFACE_CLI_VERSION,
     STEMCELL_GIT_URL,
     active_release_root,
     active_environment_python,
@@ -88,8 +90,8 @@ PACKAGE_SPECS = (
         "Silicon Interface CLI",
         "npm",
         "@teamofsilicons/silicon-interface-cli",
-        "npm install -g @teamofsilicons/silicon-interface-cli@latest",
-        "npm",
+        f"npm install -g {SILICON_INTERFACE_CLI_RELEASE_URL}",
+        "embedded",
     ),
     PackageSpec(
         "claude",
@@ -157,6 +159,8 @@ def _latest_version(spec: PackageSpec) -> tuple[str, str]:
                 ).version,
                 "",
             )
+        if spec.latest_source == "embedded":
+            return SILICON_INTERFACE_CLI_VERSION, ""
         raise RuntimeError(f"unknown latest-version source: {spec.latest_source}")
     except Exception as exc:
         return "", str(exc)[:300]

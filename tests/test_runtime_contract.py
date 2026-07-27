@@ -38,6 +38,10 @@ class RuntimeContractTests(unittest.TestCase):
             contract["exact_python_packages"],
             {"silicon-extend": "0.1.1"},
         )
+        self.assertEqual(
+            contract["minimum_command_versions"]["silicon-interface"],
+            "2.0.2",
+        )
 
     def test_docker_runtime_probe_uses_the_exact_signed_image(self):
         image = (
