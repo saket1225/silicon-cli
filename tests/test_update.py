@@ -284,7 +284,7 @@ class CliUpdateTests(unittest.TestCase):
             inst.path,
             inst.pid_file,
             min_uptime=5.0,
-            max_heartbeat_age=5.0,
+            max_heartbeat_age=update.HEARTBEAT_MAX_AGE_SECONDS,
         )
 
     def test_local_bootstrap_checkpoint_has_an_in_place_restorer(self):

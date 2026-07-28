@@ -38,6 +38,14 @@ from .updater.release import FetchedRelease
 # a short budget here does not report an unhealthy Silicon -- it reports a slow
 # one, fails the recovery, and leaves an interrupted transaction that blocks
 # every later update until someone resumes it by hand.
+# The runtime writes its readiness heartbeat on the main loop tick (LOOP_TICK,
+# 10s). Demanding the heartbeat be under five seconds old therefore asks for
+# something true only half the tick, and the gate wants three consecutive
+# observations -- so it passed on timing luck and failed outright on a busy
+# Silicon whose tick runs long. Allow several ticks, which still catches a
+# runtime that has genuinely stopped heartbeating.
+HEARTBEAT_MAX_AGE_SECONDS = 30.0
+
 HEALTH_BUDGET_SECONDS = 90.0
 HEALTH_BUDGET_DOCKER_SECONDS = 120.0
 def _cache() -> ReleaseCache:
@@ -199,7 +207,7 @@ def _local_hooks(inst: registry.Install) -> EngineHooks:
                     inst.path,
                     inst.pid_file,
                     min_uptime=5.0,
-                    max_heartbeat_age=5.0,
+                    max_heartbeat_age=HEARTBEAT_MAX_AGE_SECONDS,
                 )
                 if previous.get("main")
                 else not process.is_running(inst.pid_file)
@@ -531,7 +539,7 @@ def _docker_hooks(inst: registry.Install) -> EngineHooks:
                 docker_runtime.silicon_ready(
                     inst,
                     min_uptime=5.0,
-                    max_heartbeat_age=5.0,
+                    max_heartbeat_age=HEARTBEAT_MAX_AGE_SECONDS,
                 )
                 if container and previous.get("main")
                 else (

@@ -286,7 +286,7 @@ class DockerUpdateHookTests(unittest.TestCase):
         ready.assert_called_with(
             self.install,
             min_uptime=5.0,
-            max_heartbeat_age=5.0,
+            max_heartbeat_age=update.HEARTBEAT_MAX_AGE_SECONDS,
         )
 
     def test_maintenance_and_checkpoint_use_active_runtime_and_portable_paths(self):
@@ -640,3 +640,28 @@ class HealthBudgetTests(unittest.TestCase):
             update.HEALTH_BUDGET_DOCKER_SECONDS,
             update.HEALTH_BUDGET_SECONDS,
         )
+
+
+class HeartbeatFreshnessTests(unittest.TestCase):
+    """The readiness window must outlast the runtime's heartbeat cadence.
+
+    The runtime writes its heartbeat on the main loop tick (10s). Requiring the
+    heartbeat to be under five seconds old was therefore true only about half of
+    each tick, and the gate wants three consecutive passes -- so updates
+    succeeded on timing luck and failed outright on a busy Silicon whose tick
+    ran long. One instance measured 21 of 24 samples over the old limit, peaking
+    at 9.8s, and could never be updated.
+    """
+
+    RUNTIME_LOOP_TICK_SECONDS = 10.0
+
+    def test_window_covers_several_runtime_ticks(self):
+        self.assertGreater(
+            update.HEARTBEAT_MAX_AGE_SECONDS,
+            self.RUNTIME_LOOP_TICK_SECONDS * 2,
+            "a heartbeat window inside one tick makes the gate a coin flip",
+        )
+
+    def test_window_still_catches_a_stalled_runtime(self):
+        # Generous, not unbounded: a runtime silent for this long is stuck.
+        self.assertLessEqual(update.HEARTBEAT_MAX_AGE_SECONDS, 120.0)
