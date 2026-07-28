@@ -1,18 +1,20 @@
 """Install the Silicon Interface CLI into a silicon folder."""
 from __future__ import annotations
 
+import os
 import re
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
 from . import runtime_contract, ui
 from .config import (
-    SILICON_INTERFACE_DAEMON_SKIP,
     SILICON_INTERFACE_CLI_PACKAGE,
     SILICON_INTERFACE_CLI_SKIP,
     SILICON_INTERFACE_CLI_SOURCE,
     SILICON_INTERFACE_CLI_TARBALL,
+    SILICON_INTERFACE_DAEMON_SKIP,
 )
 
 
@@ -145,10 +147,80 @@ def _start_daemon(target: Path) -> bool:
     return ok
 
 
-def start_daemon(target: str | Path) -> bool:
-    """Best-effort start of this instance's Interface daemon."""
+def daemon_required(target: str | Path) -> bool:
+    """Return whether this Glass-managed instance requires live delivery."""
 
-    return _start_daemon(Path(target).resolve())
+    return bool(
+        not SILICON_INTERFACE_DAEMON_SKIP
+        and (Path(target).resolve() / ".glass.json").exists()
+    )
+
+
+def _daemon_pid(target: Path) -> int | None:
+    path = target / ".silicon-interface" / "daemon.pid"
+    descriptor = -1
+    try:
+        before = path.lstat()
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_size <= 0
+            or before.st_size > 32
+        ):
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or not os.path.samestat(
+            before, opened
+        ):
+            return None
+        payload = os.read(descriptor, 33)
+        if len(payload) > 32:
+            return None
+        value = payload.decode("ascii").strip()
+        pid = int(value)
+        return pid if value.isdigit() and pid > 0 else None
+    except (OSError, UnicodeError, ValueError):
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def daemon_running(target: str | Path) -> bool:
+    """Return whether the instance's recorded Interface daemon is alive."""
+
+    pid = _daemon_pid(Path(target).resolve())
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _start_daemon_checked(target: Path, *, required: bool) -> bool:
+    ok = _start_daemon(target)
+    if required and not ok:
+        raise RuntimeError(
+            "Silicon Interface daemon is required but could not be started"
+        )
+    return ok
+
+
+def start_daemon(
+    target: str | Path,
+    *,
+    required: bool = False,
+) -> bool:
+    """Start this instance's Interface daemon, optionally failing closed."""
+
+    return _start_daemon_checked(Path(target).resolve(), required=required)
 
 
 def _stop_daemon(target: Path) -> bool:
@@ -231,11 +303,14 @@ def setup(
             f"{target_path}/.silicon-interface/bin/si"
         )
         if start_daemon:
-            _start_daemon(target_path)
+            _start_daemon_checked(
+                target_path,
+                required=required and daemon_required(target_path),
+            )
         return True
 
     if force:
-        _stop_daemon(target_path)
+        stop_daemon(target_path, required=True)
 
     ui.info("Setting up Silicon Interface CLI...")
     if source_script is not None:
@@ -292,7 +367,10 @@ def setup(
             f"{target_path}/.silicon-interface/bin/si"
         )
         if start_daemon:
-            _start_daemon(target_path)
+            _start_daemon_checked(
+                target_path,
+                required=required and daemon_required(target_path),
+            )
         return True
     if required:
         raise RuntimeError(

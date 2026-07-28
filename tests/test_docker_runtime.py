@@ -1468,6 +1468,152 @@ class DockerRuntimeTests(unittest.TestCase):
         )
         self.assertFalse(suspend_marker.exists())
 
+    def test_cold_rollback_starts_interface_from_pre_activation_image(self):
+        instance = self.root / "silicons" / "ada"
+        instance.mkdir(parents=True)
+        cfg = self.write_docker_config()
+        inst = registry.Install(
+            0,
+            "ada",
+            str(instance),
+            str(instance / ".silicon.pid"),
+            "docker",
+            "silicon-ada",
+            cfg["compose_file"],
+            cfg["image"],
+            "silicon-ada",
+        )
+        suspend_marker = instance / ".silicon" / "docker-start-suspended"
+
+        def acknowledge_start(_install):
+            suspend_marker.unlink()
+            return True
+
+        with (
+            mock.patch.object(docker_runtime, "ensure_ready"),
+            mock.patch.object(
+                docker_runtime,
+                "_legacy_offline_fence_owner",
+                return_value=None,
+            ),
+            mock.patch.object(
+                docker_runtime,
+                "active_generation_runtime_image",
+                return_value="",
+            ),
+            mock.patch.object(
+                docker_runtime,
+                "config_for_install",
+                return_value=cfg,
+            ),
+            mock.patch.object(docker_runtime, "_ensure_image"),
+            mock.patch.object(docker_runtime, "render_compose"),
+            mock.patch.object(
+                docker_runtime,
+                "container_running",
+                side_effect=[False, True],
+            ),
+            mock.patch.object(
+                docker_runtime,
+                "_run",
+                return_value=SimpleNamespace(returncode=0),
+            ),
+            mock.patch.object(
+                docker_runtime,
+                "_wait_for_container",
+                side_effect=acknowledge_start,
+            ),
+            mock.patch.object(
+                docker_runtime,
+                "silicon_running",
+                return_value=False,
+            ),
+            mock.patch.object(
+                docker_runtime,
+                "_container_supports_interface_activation",
+                return_value=False,
+            ),
+            mock.patch.object(
+                docker_runtime,
+                "interface_daemon_running",
+                side_effect=[False, True],
+            ),
+            mock.patch.object(
+                docker_runtime,
+                "_start_legacy_container_interface",
+            ) as start_interface,
+            mock.patch.object(
+                docker_runtime,
+                "glass_agent_running",
+                return_value=False,
+            ),
+            mock.patch.object(ui, "info"),
+            mock.patch.object(ui, "success"),
+        ):
+            docker_runtime.start_one(
+                inst,
+                start_agent=False,
+                start_interface=True,
+                reconcile=False,
+            )
+
+        start_interface.assert_called_once_with(
+            inst,
+            reset_pid=True,
+        )
+
+    def test_pre_activation_image_starts_its_absolute_interface_command(self):
+        instance = self.root / "silicons" / "ada"
+        instance.mkdir(parents=True)
+        inst = registry.Install(
+            0,
+            "ada",
+            str(instance),
+            str(instance / ".silicon.pid"),
+            "docker",
+            "silicon-ada",
+            str(self.root / "silicons" / "compose.yml"),
+            "example/silicon:latest",
+            "silicon-ada",
+        )
+        with (
+            mock.patch.object(
+                docker_runtime,
+                "_reset_container_interface_pid",
+            ) as reset,
+            mock.patch.object(
+                docker_runtime,
+                "_exec_args",
+                return_value=["docker", "exec", "interface"],
+            ) as exec_args,
+            mock.patch.object(
+                docker_runtime,
+                "_run",
+                return_value=SimpleNamespace(
+                    returncode=0,
+                    stdout="",
+                    stderr="",
+                ),
+            ),
+        ):
+            docker_runtime._start_legacy_container_interface(
+                inst,
+                reset_pid=True,
+            )
+
+        reset.assert_called_once_with(inst)
+        exec_args.assert_called_once_with(
+            inst,
+            [
+                "/usr/local/bin/silicon-interface",
+                "daemon",
+                "start",
+            ],
+            extra_environment=(
+                "SILICON_INTERFACE_ROOT=/silicon",
+            ),
+        )
+
     def test_active_container_python_uses_generation_environment(self):
         instance = self.root / "silicons" / "ada"
         environment = instance / ".silicon" / "environments" / "env-1"

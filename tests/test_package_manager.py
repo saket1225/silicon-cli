@@ -439,6 +439,34 @@ class PackageManagerTests(unittest.TestCase):
         stop.assert_called_once()
         run.assert_called_once()
 
+    def test_force_interface_setup_fails_before_mutation_if_daemon_wont_stop(
+        self,
+    ):
+        installer = Path("/verified/bin/silicon-interface.mjs")
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                mock.patch.object(interface_cli, "_node_major", return_value=22),
+                mock.patch.object(
+                    interface_cli,
+                    "_stop_daemon",
+                    return_value=False,
+                ) as stop,
+                mock.patch.object(interface_cli, "_run") as run,
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "could not be stopped safely",
+                ),
+            ):
+                interface_cli.setup(
+                    temporary,
+                    required=True,
+                    force=True,
+                    source_script=installer,
+                )
+
+        stop.assert_called_once()
+        run.assert_not_called()
+
     def test_interface_setup_can_reuse_a_verified_installer(self):
         installer = Path("/verified/bin/silicon-interface.mjs")
         with tempfile.TemporaryDirectory() as temporary:

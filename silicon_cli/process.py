@@ -736,8 +736,20 @@ def _start_interface_daemon(
                 "Silicon Interface daemon PID path is unsafe; "
                 "the daemon was not started."
             ) from exc
+    required = interface_cli.daemon_required(inst.path)
+    started = interface_cli.start_daemon(
+        inst.path,
+        required=required,
+    )
+    if required and not started:
+        # Keep this guard even though the concrete implementation raises for a
+        # required failure. It also makes injected/test implementations obey the
+        # same fail-closed lifecycle contract.
+        raise RuntimeError(
+            "Silicon Interface daemon is required but could not be started"
+        )
+    if container_mode and reset_container_pid:
         reset_marker.unlink(missing_ok=True)
-    interface_cli.start_daemon(inst.path)
 
 
 def _activate_container_interface(inst: registry.Install) -> bool:

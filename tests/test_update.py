@@ -78,12 +78,86 @@ class CliUpdateTests(unittest.TestCase):
         ):
             hooks = update._hooks(inst)
             self.assertEqual(
-                hooks.service_state(), {"main": True, "glass_agent": False}
+                hooks.service_state(),
+                {
+                    "main": True,
+                    "glass_agent": False,
+                    "interface": False,
+                },
             )
-            hooks.start_services({"main": True, "glass_agent": False})
+            hooks.start_services(
+                {
+                    "main": True,
+                    "glass_agent": False,
+                    "interface": False,
+                }
+            )
 
         start.assert_called_once_with(
             "ada", start_agent=False, reconcile_updates=False
+        )
+
+    def test_hooks_restore_listener_only_service_state(self):
+        inst = registry.Install(
+            index=0,
+            name="ada",
+            path="/tmp/ada",
+            pid_file="/tmp/ada/.silicon.pid",
+        )
+        with (
+            mock.patch.object(update.process, "is_running", return_value=False),
+            mock.patch.object(update.glassagent, "status", return_value=False),
+            mock.patch.object(
+                update.interface_cli,
+                "daemon_running",
+                return_value=True,
+            ),
+            mock.patch.object(
+                update.interface_cli,
+                "start_daemon",
+                return_value=True,
+            ) as start_interface,
+        ):
+            hooks = update._hooks(inst)
+            state = hooks.service_state()
+            hooks.start_services(state)
+
+        self.assertEqual(
+            state,
+            {
+                "main": False,
+                "glass_agent": False,
+                "interface": True,
+            },
+        )
+        start_interface.assert_called_once_with(
+            inst.path,
+            required=True,
+        )
+
+    def test_hooks_quiesce_interface_before_protected_checkpoint(self):
+        inst = registry.Install(
+            index=0,
+            name="ada",
+            path="/tmp/ada",
+            pid_file="/tmp/ada/.silicon.pid",
+        )
+        with (
+            mock.patch.object(
+                update.interface_cli,
+                "daemon_running",
+                return_value=True,
+            ),
+            mock.patch.object(
+                update.interface_cli,
+                "stop_daemon",
+            ) as stop_interface,
+        ):
+            update._hooks(inst).quiesce_delivery()
+
+        stop_interface.assert_called_once_with(
+            inst.path,
+            required=True,
         )
 
     def test_same_instance_task_cannot_deadlock_updating_itself(self):

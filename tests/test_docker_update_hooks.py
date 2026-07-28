@@ -66,6 +66,11 @@ class DockerUpdateHookTests(unittest.TestCase):
                 "glass_agent_running",
                 return_value=True,
             ),
+            mock.patch.object(
+                update.docker_runtime,
+                "interface_daemon_running",
+                return_value=False,
+            ),
             mock.patch.object(update.docker_runtime, "restore_one") as restore,
         ):
             hooks = update._hooks(self.install)
@@ -74,15 +79,100 @@ class DockerUpdateHookTests(unittest.TestCase):
 
         self.assertEqual(
             state,
-            {"container": True, "main": False, "glass_agent": True},
+            {
+                "container": True,
+                "main": False,
+                "glass_agent": True,
+                "interface": False,
+            },
         )
         restore.assert_called_once_with(
             self.install,
             container=True,
             main=False,
             glass_agent=True,
+            interface=False,
             reconcile=False,
             allow_legacy_fence=False,
+        )
+
+    def test_hooks_restore_listener_only_docker_service_state(self):
+        with (
+            mock.patch.object(
+                update.docker_runtime,
+                "container_running",
+                return_value=True,
+            ),
+            mock.patch.object(
+                update.docker_runtime,
+                "silicon_running",
+                return_value=False,
+            ),
+            mock.patch.object(
+                update.docker_runtime,
+                "glass_agent_running",
+                return_value=False,
+            ),
+            mock.patch.object(
+                update.docker_runtime,
+                "interface_daemon_running",
+                return_value=True,
+            ),
+            mock.patch.object(
+                update.docker_runtime,
+                "restore_one",
+            ) as restore,
+        ):
+            hooks = update._hooks(self.install)
+            state = hooks.service_state()
+            hooks.start_services(state)
+
+        self.assertEqual(
+            state,
+            {
+                "container": True,
+                "main": False,
+                "glass_agent": False,
+                "interface": True,
+            },
+        )
+        restore.assert_called_once_with(
+            self.install,
+            container=True,
+            main=False,
+            glass_agent=False,
+            interface=True,
+            reconcile=False,
+            allow_legacy_fence=False,
+        )
+
+    def test_hooks_quiesce_docker_interface_before_checkpoint(self):
+        with (
+            mock.patch.object(
+                update.docker_runtime,
+                "maintenance_coordinator_available",
+                return_value=True,
+            ),
+            mock.patch.object(
+                update.docker_runtime,
+                "container_running",
+                return_value=True,
+            ),
+            mock.patch.object(
+                update.docker_runtime,
+                "interface_daemon_running",
+                return_value=True,
+            ),
+            mock.patch.object(
+                update.docker_runtime,
+                "stop_interface_daemon",
+            ) as stop_interface,
+        ):
+            update._hooks(self.install).quiesce_delivery()
+
+        stop_interface.assert_called_once_with(
+            self.install,
+            required=True,
         )
 
     def test_stop_hook_fails_closed_if_container_survives(self):

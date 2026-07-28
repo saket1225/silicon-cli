@@ -135,6 +135,9 @@ class Fixture:
             await_quiescent=lambda _tx, _deadline, _cancel, _running: self.events.append(
                 "quiescent"
             ),
+            quiesce_delivery=lambda: self.events.append(
+                "quiesce-delivery"
+            ),
             stop_services=stop,
             start_services=start,
             health_check=health,
@@ -542,6 +545,10 @@ class PlannerAndRecoveryTests(unittest.TestCase):
             )
             updater.run(fixture.release)
             self.assertLess(
+                fixture.events.index("quiesce-delivery"),
+                fixture.events.index("checkpoint"),
+            )
+            self.assertLess(
                 fixture.events.index("checkpoint"), fixture.events.index("stop")
             )
             self.assertLess(
@@ -614,7 +621,18 @@ class TransactionTests(unittest.TestCase):
             )
             result = updater.run(fixture.release)
             self.assertEqual(result["state"], "COMMITTED")
-            self.assertLess(fixture.events.index("quiescent"), fixture.events.index("stop"))
+            self.assertLess(
+                fixture.events.index("quiescent"),
+                fixture.events.index("quiesce-delivery"),
+            )
+            self.assertLess(
+                fixture.events.index("quiesce-delivery"),
+                fixture.events.index("checkpoint"),
+            )
+            self.assertLess(
+                fixture.events.index("checkpoint"),
+                fixture.events.index("stop"),
+            )
             self.assertLess(fixture.events.index("stop"), fixture.events.index("start"))
             active = active_release_root(fixture.instance)
             self.assertEqual((active / "main.py").read_text(), "print('new')\n")
@@ -627,6 +645,38 @@ class TransactionTests(unittest.TestCase):
             self.assertEqual(
                 (fixture.instance / "prompts/MEMORY.md").read_text(),
                 "important memory\n",
+            )
+
+    def test_checkpoint_failure_restores_precheckpoint_delivery_state(self):
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = Fixture(Path(raw))
+            hooks = fixture.hooks()
+
+            def fail_checkpoint(_transaction_id, _release_id):
+                fixture.events.append("checkpoint-failed")
+                raise RuntimeError("snapshot unavailable")
+
+            hooks.create_checkpoint = fail_checkpoint
+            updater = TransactionalUpdater(
+                fixture.instance,
+                fixture.cache,
+                hooks=hooks,
+            )
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "snapshot unavailable",
+            ):
+                updater.run(fixture.release)
+
+            self.assertLess(
+                fixture.events.index("quiesce-delivery"),
+                fixture.events.index("checkpoint-failed"),
+            )
+            self.assertIn("start", fixture.events)
+            self.assertNotIn("stop", fixture.events)
+            self.assertEqual(
+                fixture.services,
+                {"main": True, "glass_agent": True},
             )
 
     def test_legacy_seal_excludes_seed_data_from_recovery_source(self):
@@ -1178,8 +1228,17 @@ class TransactionTests(unittest.TestCase):
                 fixture.instance, fixture.cache, hooks=fixture.hooks()
             )
             updater.run(fixture.release)
+            fixture.events.clear()
             result = updater.rollback()
             self.assertEqual(result["state"], "COMMITTED")
+            self.assertLess(
+                fixture.events.index("quiesce-delivery"),
+                fixture.events.index("checkpoint"),
+            )
+            self.assertLess(
+                fixture.events.index("checkpoint"),
+                fixture.events.index("stop"),
+            )
             self.assertEqual(
                 active_release_root(fixture.instance), fixture.instance.resolve()
             )

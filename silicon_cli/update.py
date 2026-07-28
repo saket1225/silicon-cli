@@ -11,7 +11,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import docker_runtime, glassagent, process, registry, ui
+from . import docker_runtime, glassagent, interface_cli, process, registry, ui
 from .config import (
     REGISTRY_DIR,
     active_release_root,
@@ -141,12 +141,17 @@ def _local_hooks(inst: registry.Install) -> EngineHooks:
         return {
             "main": process.is_running(inst.pid_file),
             "glass_agent": glassagent.status(inst.path),
+            "interface": interface_cli.daemon_running(inst.path),
         }
 
     maintenance = MaintenanceProtocol(
         Path(inst.path),
         legacy_offline_safe=lambda: not any(state().values()),
     )
+
+    def quiesce_delivery() -> None:
+        if interface_cli.daemon_running(inst.path):
+            interface_cli.stop_daemon(inst.path, required=True)
 
     def stop_services() -> None:
         if maintenance.legacy_offline and any(state().values()):
@@ -157,14 +162,23 @@ def _local_hooks(inst: registry.Install) -> EngineHooks:
         process.stop_one(inst.name, full=True)
 
     def start_services(previous: dict[str, bool]) -> None:
+        interface = bool(previous.get("interface")) or bool(
+            previous.get("main")
+            and interface_cli.daemon_required(inst.path)
+        )
         if previous.get("main"):
             process.start_one(
                 inst.name,
                 start_agent=bool(previous.get("glass_agent")),
                 reconcile_updates=False,
             )
-        elif previous.get("glass_agent"):
-            glassagent.start(inst.path)
+        else:
+            if interface:
+                interface_cli.start_daemon(inst.path, required=True)
+            if previous.get("glass_agent"):
+                glassagent.start(inst.path)
+        if interface and not interface_cli.daemon_running(inst.path):
+            interface_cli.start_daemon(inst.path, required=True)
 
     def healthy(previous: dict[str, bool]) -> bool:
         # Require three consecutive healthy observations. A process that merely
@@ -185,7 +199,17 @@ def _local_hooks(inst: registry.Install) -> EngineHooks:
             agent_ok = glassagent.status(inst.path) == bool(
                 previous.get("glass_agent")
             )
-            if main_ok and agent_ok:
+            interface_ok = (
+                not (
+                    previous.get("interface")
+                    or (
+                        previous.get("main")
+                        and interface_cli.daemon_required(inst.path)
+                    )
+                )
+                or interface_cli.daemon_running(inst.path)
+            )
+            if main_ok and agent_ok and interface_ok:
                 consecutive += 1
                 if consecutive >= 3:
                     return True
@@ -350,6 +374,7 @@ def _local_hooks(inst: registry.Install) -> EngineHooks:
             )
         ),
         cancel_drain=maintenance.cancel,
+        quiesce_delivery=quiesce_delivery,
         stop_services=stop_services,
         start_services=start_services,
         health_check=healthy,
@@ -411,6 +436,11 @@ def _docker_hooks(inst: registry.Install) -> EngineHooks:
             "glass_agent": (
                 docker_runtime.glass_agent_running(inst) if container else False
             ),
+            "interface": (
+                docker_runtime.interface_daemon_running(inst)
+                if container
+                else False
+            ),
         }
 
     coordinator_available = docker_runtime.maintenance_coordinator_available(inst)
@@ -434,6 +464,13 @@ def _docker_hooks(inst: registry.Install) -> EngineHooks:
             )
         maintenance.begin(transaction_id, target_version)
 
+    def quiesce_delivery() -> None:
+        if (
+            docker_runtime.container_running(inst)
+            and docker_runtime.interface_daemon_running(inst)
+        ):
+            docker_runtime.stop_interface_daemon(inst, required=True)
+
     def stop_services() -> None:
         if docker_runtime.container_running(inst):
             docker_runtime.stop_one(inst, full=True)
@@ -443,10 +480,16 @@ def _docker_hooks(inst: registry.Install) -> EngineHooks:
             )
 
     def start_services(previous: dict[str, bool]) -> None:
+        interface = bool(previous.get("interface")) or bool(
+            previous.get("main")
+            and interface_cli.daemon_required(inst.path)
+        )
         container = bool(
             previous.get(
                 "container",
-                previous.get("main") or previous.get("glass_agent"),
+                previous.get("main")
+                or previous.get("glass_agent")
+                or interface,
             )
         )
         docker_runtime.restore_one(
@@ -454,15 +497,22 @@ def _docker_hooks(inst: registry.Install) -> EngineHooks:
             container=container,
             main=bool(previous.get("main")),
             glass_agent=bool(previous.get("glass_agent")),
+            interface=interface,
             reconcile=False,
             allow_legacy_fence=maintenance.legacy_offline,
         )
 
     def healthy(previous: dict[str, bool]) -> bool:
+        expected_interface = bool(previous.get("interface")) or bool(
+            previous.get("main")
+            and interface_cli.daemon_required(inst.path)
+        )
         expected_container = bool(
             previous.get(
                 "container",
-                previous.get("main") or previous.get("glass_agent"),
+                previous.get("main")
+                or previous.get("glass_agent")
+                or expected_interface,
             )
         )
         consecutive = 0
@@ -485,10 +535,16 @@ def _docker_hooks(inst: registry.Install) -> EngineHooks:
             agent = (
                 docker_runtime.glass_agent_running(inst) if container else False
             )
+            interface = (
+                docker_runtime.interface_daemon_running(inst)
+                if container and expected_interface
+                else False
+            )
             if (
                 container == expected_container
                 and main == bool(previous.get("main"))
                 and agent == bool(previous.get("glass_agent"))
+                and (not expected_interface or interface)
             ):
                 consecutive += 1
                 if consecutive >= 3:
@@ -677,6 +733,7 @@ def _docker_hooks(inst: registry.Install) -> EngineHooks:
             )
         ),
         cancel_drain=maintenance.cancel,
+        quiesce_delivery=quiesce_delivery,
         stop_services=stop_services,
         start_services=start_services,
         health_check=healthy,

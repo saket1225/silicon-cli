@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Iterable
 
-from . import registry, runtime_contract, ui
+from . import interface_cli, registry, runtime_contract, ui
 from .config import REGISTRY_DIR
 from .host_lock import HostFileLock, ensure_private_directory
 from .updater.io import atomic_write_bytes, atomic_write_json
@@ -25,6 +25,10 @@ DEFAULT_IMAGE_REPOSITORY = "ghcr.io/teamofsilicons/silicon-runtime"
 CONTAINER_PATH = "/silicon"
 CONTAINER_HOME = f"{CONTAINER_PATH}/.home"
 CONTAINER_SHARED_HOME = "/silicon-shared-home"
+CONTAINER_INTERFACE_ACTIVATOR = (
+    "/usr/local/libexec/silicon-activate-interface-cli.py"
+)
+CONTAINER_INTERFACE_EXECUTABLE = "/usr/local/bin/silicon-interface"
 AUTH_FILE = ".silicon-auth.json"
 AUTH_PROVIDERS = {"claude", "codex"}
 UNPINNED_IMAGE_OPT_IN = "SILICON_DOCKER_ALLOW_UNPINNED_IMAGE"
@@ -1741,14 +1745,202 @@ except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
     return result.returncode == 0
 
 
+def interface_daemon_running(inst: registry.Install) -> bool:
+    """Verify the recorded Interface PID is an Interface listener process."""
+
+    script = r"""
+import os
+import stat
+from pathlib import Path
+
+pid_path = Path("/silicon/.silicon-interface/daemon.pid")
+descriptor = -1
+try:
+    before = pid_path.lstat()
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_size <= 0
+        or before.st_size > 32
+    ):
+        raise ValueError("invalid Interface daemon PID file")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(pid_path, flags)
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or not os.path.samestat(before, opened)
+    ):
+        raise ValueError("Interface daemon PID file changed")
+    payload = os.read(descriptor, 33)
+    if len(payload) > 32:
+        raise ValueError("oversized Interface daemon PID")
+    process_id = int(payload.decode("ascii").strip())
+    if process_id <= 0:
+        raise ValueError("invalid Interface daemon PID")
+    os.kill(process_id, 0)
+    command = Path(f"/proc/{process_id}/cmdline").read_bytes().split(b"\0")
+    arguments = [item.decode("utf-8", "replace") for item in command if item]
+    if (
+        not any(Path(item).name == "silicon-interface.mjs" for item in arguments)
+        or "daemon" not in arguments
+        or "run" not in arguments
+    ):
+        raise ValueError("recorded PID is not an Interface daemon")
+except (OSError, UnicodeError, ValueError):
+    raise SystemExit(1)
+finally:
+    if descriptor >= 0:
+        os.close(descriptor)
+"""
+    result = _run(
+        _exec_args(inst, ["python3", "-c", script]),
+        capture=True,
+    )
+    return result.returncode == 0
+
+
+def _container_supports_interface_activation(
+    inst: registry.Install,
+) -> bool:
+    result = _run(
+        _exec_args(
+            inst,
+            ["test", "-x", CONTAINER_INTERFACE_ACTIVATOR],
+        ),
+        capture=True,
+    )
+    return result.returncode == 0
+
+
+def _reset_container_interface_pid(inst: registry.Install) -> None:
+    script = (
+        "from pathlib import Path;"
+        "path=Path('/silicon/.silicon-interface/daemon.pid');"
+        "path.unlink(missing_ok=True)"
+    )
+    result = _run(
+        _exec_args(inst, ["python3", "-c", script]),
+        capture=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(
+            "could not reset the stale container Interface daemon PID"
+            + (f": {detail}" if detail else "")
+        )
+
+
+def _start_current_container_interface(
+    inst: registry.Install,
+    *,
+    reset_pid: bool,
+) -> None:
+    command = (
+        "import sys;"
+        "from silicon_cli import process,registry;"
+        "process._start_interface_daemon(registry.resolve_one(sys.argv[1]))"
+    )
+    result = _run(
+        _exec_args(
+            inst,
+            ["python3", "-c", command, inst.name],
+            extra_environment=(
+                ("SILICON_INTERFACE_RESET_DAEMON_PID=1",)
+                if reset_pid
+                else ()
+            ),
+        ),
+        capture=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        suffix = f": {detail[-1]}" if detail else ""
+        raise RuntimeError(
+            "the selected runtime could not start Silicon Interface"
+            + suffix
+        )
+
+
+def _start_legacy_container_interface(
+    inst: registry.Install,
+    *,
+    reset_pid: bool,
+) -> None:
+    """Start Interface directly for the immediately preceding runtime contract."""
+
+    if reset_pid:
+        _reset_container_interface_pid(inst)
+    result = _run(
+        _exec_args(
+            inst,
+            [
+                CONTAINER_INTERFACE_EXECUTABLE,
+                "daemon",
+                "start",
+            ],
+            extra_environment=(
+                f"SILICON_INTERFACE_ROOT={CONTAINER_PATH}",
+            ),
+        ),
+        capture=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        suffix = f": {detail[-1]}" if detail else ""
+        raise RuntimeError(
+            "the rollback runtime could not start its Silicon Interface daemon"
+            + suffix
+        )
+
+
+def stop_interface_daemon(
+    inst: registry.Install,
+    *,
+    required: bool = False,
+) -> bool:
+    """Stop the selected image's Interface listener before protected snapshots."""
+
+    result = _run(
+        _exec_args(
+            inst,
+            [
+                CONTAINER_INTERFACE_EXECUTABLE,
+                "daemon",
+                "stop",
+            ],
+            extra_environment=(
+                f"SILICON_INTERFACE_ROOT={CONTAINER_PATH}",
+            ),
+        ),
+        capture=True,
+    )
+    ok = result.returncode == 0
+    if required and not ok:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        suffix = f": {detail[-1]}" if detail else ""
+        raise RuntimeError(
+            "Silicon Interface daemon could not be stopped safely"
+            + suffix
+        )
+    return ok
+
+
 def start_one(
     inst: registry.Install,
     *,
     start_main: bool = True,
     start_agent: bool = True,
+    start_interface: bool | None = None,
     reconcile: bool = True,
     allow_legacy_fence: bool = False,
 ) -> None:
+    restore_interface = (
+        interface_cli.daemon_required(inst.path)
+        if start_interface is None
+        else bool(start_interface)
+    )
     ensure_ready(
         auto_init=False,
         install=True,
@@ -1858,6 +2050,26 @@ def start_one(
         elif silicon_running(inst):
             _exec_silicon(inst, ["stop", inst.name])
 
+        if restore_interface:
+            current_activation = _container_supports_interface_activation(
+                inst
+            )
+            if not interface_daemon_running(inst):
+                if current_activation:
+                    _start_current_container_interface(
+                        inst,
+                        reset_pid=not was_running,
+                    )
+                else:
+                    _start_legacy_container_interface(
+                        inst,
+                        reset_pid=not was_running,
+                    )
+            if not interface_daemon_running(inst):
+                raise RuntimeError(
+                    f"Silicon Interface daemon for '{inst.name}' did not start"
+                )
+
         if start_agent:
             if not glass_agent_running(inst):
                 _exec_silicon(inst, ["agent", "start", inst.name])
@@ -1886,6 +2098,7 @@ def restore_one(
     container: bool,
     main: bool,
     glass_agent: bool,
+    interface: bool = False,
     reconcile: bool = False,
     allow_legacy_fence: bool = False,
 ) -> None:
@@ -1899,6 +2112,7 @@ def restore_one(
         inst,
         start_main=main,
         start_agent=glass_agent,
+        start_interface=interface,
         reconcile=reconcile,
         allow_legacy_fence=allow_legacy_fence,
     )

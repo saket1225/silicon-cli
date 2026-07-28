@@ -65,12 +65,14 @@ class EngineHooks:
     service_state: Callable[[], dict[str, bool]] = lambda: {
         "main": False,
         "glass_agent": False,
+        "interface": False,
     }
     request_drain: Callable[[str, float | None], None] = lambda _tx, _deadline: None
     await_quiescent: Callable[
         [str, float | None, Callable[[], bool], bool], None
     ] = lambda _tx, _deadline, _cancelled, _running: None
     cancel_drain: Callable[[str], None] = lambda _tx: None
+    quiesce_delivery: Callable[[], None] = lambda: None
     stop_services: Callable[[], None] = lambda: None
     start_services: Callable[[dict[str, bool]], None] = lambda _state: None
     health_check: Callable[[dict[str, bool]], bool] = lambda _state: True
@@ -489,6 +491,7 @@ class TransactionalUpdater:
         txid = TransactionJournal.new_id()
         activated = False
         stopped = False
+        delivery_quiesced = False
         lock_context = (
             nullcontext()
             if lock_held
@@ -570,6 +573,8 @@ class TransactionalUpdater:
                     "QUIESCENT", "all work leases released", failpoint=failpoint
                 )
                 self._verify_update_source_unchanged(journal)
+                delivery_quiesced = True
+                self.hooks.quiesce_delivery()
 
                 self.hooks.set_phase(
                     txid, "checkpointing", "Securing canonical protected data"
@@ -622,6 +627,7 @@ class TransactionalUpdater:
 
                 self.hooks.start_services(service_state)
                 stopped = False
+                delivery_quiesced = False
                 journal.transition(
                     "STARTED", "prior service state restored", failpoint=failpoint
                 )
@@ -654,7 +660,7 @@ class TransactionalUpdater:
                 if activated or crossed_stop_boundary:
                     self._recover_after_stop_boundary(journal, service_state, exc)
                 else:
-                    if stopped:
+                    if stopped or delivery_quiesced:
                         self.hooks.start_services(service_state)
                     self._finish_before_stop(journal, "cancelled")
                     journal.transition("CANCELLED", str(exc))
@@ -670,7 +676,7 @@ class TransactionalUpdater:
                 if activated or crossed_stop_boundary:
                     self._recover_after_stop_boundary(journal, service_state, exc)
                 else:
-                    if stopped:
+                    if stopped or delivery_quiesced:
                         self.hooks.start_services(service_state)
                     self._finish_before_stop(journal, "failed")
                     journal.transition("FAILED", str(exc))
@@ -952,6 +958,7 @@ class TransactionalUpdater:
             service_state = metadata.get("prior_service_state") or {
                 "main": False,
                 "glass_agent": False,
+                "interface": False,
             }
             version = str(
                 metadata.get("release", {}).get("version")
@@ -1062,6 +1069,7 @@ class TransactionalUpdater:
         services = metadata.get("prior_service_state") or {
             "main": False,
             "glass_agent": False,
+            "interface": False,
         }
         desired = metadata.get("new_generation")
         current_before = metadata.get("prior_generation")
@@ -1681,6 +1689,7 @@ class TransactionalUpdater:
         lock_held: bool = False,
     ) -> dict[str, Any]:
         txid = TransactionJournal.new_id()
+        delivery_quiesced = False
         lock_context = (
             nullcontext()
             if lock_held
@@ -1762,6 +1771,8 @@ class TransactionalUpdater:
                     raise UpdateCancelled("rollback cancellation requested")
                 journal.transition("QUIESCENT", "all work leases released")
                 self._verify_rollback_source_unchanged(journal)
+                delivery_quiesced = True
+                self.hooks.quiesce_delivery()
                 self.hooks.set_phase(
                     txid, "checkpointing", "Securing canonical protected data"
                 )
@@ -1824,6 +1835,7 @@ class TransactionalUpdater:
                     "rollback generation with preserved customizations activated",
                 )
                 self.hooks.start_services(services)
+                delivery_quiesced = False
                 journal.transition("STARTED", "prior service state restored")
                 self.hooks.set_phase(
                     txid, "validating", "Checking the rollback generation"
@@ -1848,6 +1860,8 @@ class TransactionalUpdater:
                 }:
                     self._recover_after_stop_boundary(journal, services, exc)
                 else:
+                    if delivery_quiesced:
+                        self.hooks.start_services(services)
                     self._finish_before_stop(journal, "cancelled")
                     journal.transition("CANCELLED", str(exc))
                 raise UpdateCancelled(str(exc)) from exc
@@ -1861,6 +1875,8 @@ class TransactionalUpdater:
                 }:
                     self._recover_after_stop_boundary(journal, services, exc)
                 else:
+                    if delivery_quiesced:
+                        self.hooks.start_services(services)
                     self._finish_before_stop(journal, "failed")
                     journal.transition("FAILED", str(exc))
                 raise

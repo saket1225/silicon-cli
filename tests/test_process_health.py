@@ -234,7 +234,10 @@ class RuntimeChildHealthTests(unittest.TestCase):
                 process._start_interface_daemon(inst)
 
             self.assertTrue(daemon_pid.exists())
-            start_daemon.assert_called_once_with(str(root))
+            start_daemon.assert_called_once_with(
+                str(root),
+                required=False,
+            )
 
             with (
                 mock.patch.dict(
@@ -259,7 +262,10 @@ class RuntimeChildHealthTests(unittest.TestCase):
 
             self.assertFalse(daemon_pid.exists())
             activate.assert_called_once_with(inst)
-            start_daemon.assert_called_once_with(str(root))
+            start_daemon.assert_called_once_with(
+                str(root),
+                required=False,
+            )
 
             daemon_pid.write_text("456\n", encoding="utf-8")
             reset_marker = (
@@ -290,7 +296,10 @@ class RuntimeChildHealthTests(unittest.TestCase):
             self.assertFalse(daemon_pid.exists())
             self.assertFalse(reset_marker.exists())
             activate.assert_called_once_with(inst)
-            start_daemon.assert_called_once_with(str(root))
+            start_daemon.assert_called_once_with(
+                str(root),
+                required=False,
+            )
 
             daemon_pid.write_text("789\n", encoding="utf-8")
             reset_marker.touch()
@@ -319,6 +328,36 @@ class RuntimeChildHealthTests(unittest.TestCase):
             self.assertTrue(daemon_pid.exists())
             self.assertTrue(reset_marker.exists())
             start_daemon.assert_not_called()
+
+    def test_glass_managed_start_fails_closed_when_interface_does_not_start(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / ".glass.json").write_text("{}", encoding="utf-8")
+            inst = registry.Install(
+                0,
+                "ada",
+                str(root),
+                str(root / ".silicon.pid"),
+            )
+            with (
+                mock.patch.object(
+                    process.interface_cli,
+                    "start_daemon",
+                    return_value=False,
+                ) as start_daemon,
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "required but could not be started",
+                ),
+            ):
+                process._start_interface_daemon(inst)
+
+            start_daemon.assert_called_once_with(
+                str(root),
+                required=True,
+            )
 
     def test_starting_an_already_running_instance_reconciles_interface_daemon(
         self,
@@ -366,7 +405,10 @@ class RuntimeChildHealthTests(unittest.TestCase):
                     reconcile_updates=False,
                 )
 
-            start_daemon.assert_called_once_with(str(root))
+            start_daemon.assert_called_once_with(
+                str(root),
+                required=False,
+            )
 
     def test_container_interface_reactivation_uses_image_owned_helper(self):
         with tempfile.TemporaryDirectory() as raw:
