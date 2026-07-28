@@ -32,6 +32,14 @@ from .updater.maintenance import MaintenanceError, MaintenanceProtocol
 from .updater.release import FetchedRelease
 
 
+# A restarted Silicon must satisfy min_uptime AND publish a fresh heartbeat
+# before it counts as healthy, and it contacts Glass for provider keys during
+# boot. Container start plus that round-trip routinely exceeds ten seconds, so
+# a short budget here does not report an unhealthy Silicon -- it reports a slow
+# one, fails the recovery, and leaves an interrupted transaction that blocks
+# every later update until someone resumes it by hand.
+HEALTH_BUDGET_SECONDS = 90.0
+HEALTH_BUDGET_DOCKER_SECONDS = 120.0
 def _cache() -> ReleaseCache:
     return ReleaseCache(REGISTRY_DIR / "cache")
 
@@ -184,7 +192,7 @@ def _local_hooks(inst: registry.Install) -> EngineHooks:
         # Require three consecutive healthy observations. A process that merely
         # exists for one instant is not a successful restart.
         consecutive = 0
-        deadline = time.monotonic() + 8.0
+        deadline = time.monotonic() + HEALTH_BUDGET_SECONDS
         while time.monotonic() < deadline:
             main_ok = (
                 process.runtime_ready(
@@ -516,7 +524,7 @@ def _docker_hooks(inst: registry.Install) -> EngineHooks:
             )
         )
         consecutive = 0
-        deadline = time.monotonic() + 12.0
+        deadline = time.monotonic() + HEALTH_BUDGET_DOCKER_SECONDS
         while time.monotonic() < deadline:
             container = docker_runtime.container_running(inst)
             main = (

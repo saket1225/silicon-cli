@@ -615,3 +615,28 @@ class DockerUpdateHookTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HealthBudgetTests(unittest.TestCase):
+    """A restarted Silicon must be given time to actually come up.
+
+    The health gate requires min_uptime=5s plus a fresh heartbeat plus three
+    consecutive observations, and a booting Silicon calls Glass for provider
+    keys first. When the budget was 12s a merely slow start read as an
+    unhealthy one: recovery was declared failed and the interrupted transaction
+    it left behind blocked every later update until resumed by hand.
+    """
+
+    def test_budgets_exceed_the_minimum_a_healthy_restart_needs(self):
+        # min_uptime (5s) + three observations 0.5s apart, with headroom for
+        # container start and the Glass round-trip during boot.
+        floor = 5.0 + 3 * 0.5
+        self.assertGreater(update.HEALTH_BUDGET_SECONDS, floor * 4)
+        self.assertGreater(update.HEALTH_BUDGET_DOCKER_SECONDS, floor * 4)
+
+    def test_docker_budget_is_not_tighter_than_local(self):
+        # Docker adds container start on top of everything the local path does.
+        self.assertGreaterEqual(
+            update.HEALTH_BUDGET_DOCKER_SECONDS,
+            update.HEALTH_BUDGET_SECONDS,
+        )
