@@ -32,7 +32,7 @@ CONTAINER_INTERFACE_EXECUTABLE = "/usr/local/bin/silicon-interface"
 AUTH_FILE = ".silicon-auth.json"
 AUTH_PROVIDERS = {"claude", "codex"}
 UNPINNED_IMAGE_OPT_IN = "SILICON_DOCKER_ALLOW_UNPINNED_IMAGE"
-SILICON_EXTEND_VERSION = "0.1.1"
+SILICON_EXTEND_VERSION = "0.1.3"
 
 _CONTAINER_PROCESS_IDENTITY_HELPER = r"""
 def _process_birth_identity(process_id):

@@ -56,7 +56,7 @@ class ExtendInstallationTest(unittest.TestCase):
             Path(__file__).resolve().parents[1] / "pyproject.toml"
         ).read_text(encoding="utf-8")
 
-        self.assertIn('"silicon-extend==0.1.1"', pyproject)
+        self.assertIn('"silicon-extend==0.1.3"', pyproject)
 
     def test_container_entrypoint_prefers_generation_environment_bin(self):
         entrypoint = (
@@ -92,7 +92,7 @@ class ExtendInstallationTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn(
-            'SILICON_EXTEND_REQUIRED_VERSION="0.1.1"',
+            'SILICON_EXTEND_REQUIRED_VERSION="0.1.3"',
             dockerfile,
         )
 

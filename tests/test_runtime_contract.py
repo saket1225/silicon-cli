@@ -36,7 +36,7 @@ class RuntimeContractTests(unittest.TestCase):
         )
         self.assertEqual(
             contract["exact_python_packages"],
-            {"silicon-extend": "0.1.1"},
+            {"silicon-extend": "0.1.3"},
         )
         self.assertEqual(
             contract["minimum_command_versions"]["silicon-interface"],
@@ -53,7 +53,7 @@ class RuntimeContractTests(unittest.TestCase):
         )
         payload = {
             "failures": [],
-            "versions": {"silicon-cli": "1.0.22", "node": "v22.0.0"},
+            "versions": {"silicon-cli": "1.0.24", "node": "v22.0.0"},
         }
         with mock.patch.object(
             docker_runtime,
@@ -77,14 +77,14 @@ class RuntimeContractTests(unittest.TestCase):
         )
         self.assertIn(image, command)
         self.assertIn(runtime_contract.DOCKER_PROBE_SCRIPT, command)
-        self.assertEqual(versions["silicon-cli"], "1.0.22")
+        self.assertEqual(versions["silicon-cli"], "1.0.24")
 
     def test_docker_runtime_probe_fails_closed_on_outdated_dependency(self):
         image = (
             "ghcr.io/teamofsilicons/silicon-runtime@sha256:" + "b" * 64
         )
         payload = {
-            "failures": ["codex: found 0.1.0, require 0.145.0 or newer"],
+            "failures": ["codex: found 0.1.0, require 0.146.0 or newer"],
             "versions": {"codex": "0.1.0"},
         }
         with (

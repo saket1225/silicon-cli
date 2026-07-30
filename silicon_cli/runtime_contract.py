@@ -11,19 +11,19 @@ from .config import SILICON_INTERFACE_CLI_VERSION
 
 
 MINIMUM_PYTHON_PACKAGES = {
-    "silicon-cli": "1.0.22",
+    "silicon-cli": "1.0.24",
     "silicon-browser": "1.1.1",
-    "silicon-extend": "0.1.1",
+    "silicon-extend": "0.1.3",
 }
 EXACT_PYTHON_PACKAGES = {
-    "silicon-extend": "0.1.1",
+    "silicon-extend": "0.1.3",
 }
 MINIMUM_COMMAND_VERSIONS = {
     "silicon-browser": "1.1.1",
-    "silicon-extend": "0.1.1",
+    "silicon-extend": "0.1.3",
     "silicon-interface": SILICON_INTERFACE_CLI_VERSION,
     "claude": "2.1.219",
-    "codex": "0.145.0",
+    "codex": "0.146.0",
     "node": "22.0.0",
 }
 REQUIRED_COMMANDS = (
