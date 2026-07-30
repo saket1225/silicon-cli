@@ -509,7 +509,7 @@ class DockerRuntimeTests(unittest.TestCase):
             "FROM node:22-bookworm-slim@sha256:"
             "6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3",
             "ARG SILICON_CLI_SPEC=silicon-cli==1.0.22",
-            "ARG SILICON_BROWSER_SPEC=silicon-browser==1.0.8",
+            "ARG SILICON_BROWSER_SPEC=silicon-browser==1.1.1",
             "ARG SILICON_EXTEND_SPEC=silicon-extend==0.1.1",
             "ARG SILICON_INTERFACE_CLI_URL="
             "https://github.com/teamofsilicons/silicon-interface-web/releases/"

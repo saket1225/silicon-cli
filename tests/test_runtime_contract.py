@@ -42,6 +42,10 @@ class RuntimeContractTests(unittest.TestCase):
             contract["minimum_command_versions"]["silicon-interface"],
             "2.0.2",
         )
+        self.assertEqual(
+            contract["minimum_command_versions"]["silicon-browser"],
+            "1.1.1",
+        )
 
     def test_docker_runtime_probe_uses_the_exact_signed_image(self):
         image = (
