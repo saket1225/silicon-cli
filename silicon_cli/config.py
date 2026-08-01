@@ -36,15 +36,15 @@ STEMCELL_GIT_URL = f"https://github.com/{STEMCELL_REPO}.git"
 # Silicon Interface CLI. During local development, silicon-cli will auto-detect
 # a sibling silicon-interface checkout. Production uses the immutable GitHub
 # release asset because npm publishing is not part of the runtime release path.
-SILICON_INTERFACE_CLI_VERSION = "2.0.2"
+SILICON_INTERFACE_CLI_VERSION = "2.0.3"
 SILICON_INTERFACE_CLI_RELEASE_URL = (
     "https://github.com/teamofsilicons/silicon-interface-web/releases/download/"
-    "interface-cli-v2.0.2/"
-    "teamofsilicons-silicon-interface-cli-2.0.2.tgz"
+    "interface-cli-v2.0.3/"
+    "teamofsilicons-silicon-interface-cli-2.0.3.tgz"
 )
 SILICON_INTERFACE_CLI_RELEASE_SHA256 = (
-    "5f594958e8165dfaf87e19a71781a628"
-    "012b5debe0482dcdc24f28b308e710b2"
+    "99ce21f080cc7a54e8e96a9ff7d35895"
+    "5a41a96e4e1d0f833a201fbcc900bf22"
 )
 SILICON_INTERFACE_CLI_PACKAGE = os.environ.get(
     "SILICON_INTERFACE_CLI_PACKAGE",

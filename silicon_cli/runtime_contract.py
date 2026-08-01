@@ -11,7 +11,7 @@ from .config import SILICON_INTERFACE_CLI_VERSION
 
 
 MINIMUM_PYTHON_PACKAGES = {
-    "silicon-cli": "1.0.25",
+    "silicon-cli": "1.0.26",
     "silicon-browser": "1.1.1",
     "silicon-extend": "0.1.3",
 }
