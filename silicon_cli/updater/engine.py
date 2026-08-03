@@ -486,6 +486,7 @@ class TransactionalUpdater:
         failpoint: str | None = None,
         prepared: dict[str, Any] | None = None,
         lock_held: bool = False,
+        defer_retention: bool = False,
     ) -> dict[str, Any]:
         cached = self.cache.store(release)
         txid = TransactionJournal.new_id()
@@ -643,10 +644,13 @@ class TransactionalUpdater:
                 journal.transition(
                     "COMMITTED", "update committed", failpoint=failpoint
                 )
-                try:
-                    journal.merge_metadata(retention=self.retention.prune())
-                except Exception as cleanup_error:
-                    journal.merge_metadata(retention_warning=str(cleanup_error))
+                if defer_retention:
+                    journal.merge_metadata(retention_deferred=True)
+                else:
+                    try:
+                        journal.merge_metadata(retention=self.retention.prune())
+                    except Exception as cleanup_error:
+                        journal.merge_metadata(retention_warning=str(cleanup_error))
                 journal.clear_cancel()
                 return journal.value
             except (UpdateCancelled, InterruptedError, KeyboardInterrupt) as exc:
@@ -683,6 +687,29 @@ class TransactionalUpdater:
                 raise
             finally:
                 shutil.rmtree(work, ignore_errors=True)
+
+    def finalize_retention(self, transaction_id: str) -> dict[str, Any]:
+        """Run non-critical cleanup after a fleet activation has committed."""
+
+        journal = self._select_journal(
+            transaction_id,
+            committed_only=True,
+        )
+        if journal is None:
+            raise UpdateError(
+                f"committed transaction not found: {transaction_id}"
+            )
+        try:
+            journal.merge_metadata(
+                retention=self.retention.prune(),
+                retention_deferred=False,
+            )
+        except Exception as cleanup_error:
+            journal.merge_metadata(
+                retention_deferred=False,
+                retention_warning=str(cleanup_error),
+            )
+        return journal.value
 
     def _adopt_preflight(
         self,

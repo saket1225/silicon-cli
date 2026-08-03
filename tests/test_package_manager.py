@@ -100,7 +100,7 @@ class PackageManagerTests(unittest.TestCase):
         self.assertEqual(result["installations"], 1)
         self.assertEqual(result["summary"]["total"], 2)
 
-    def test_docker_package_update_rolls_published_runtime_and_host_copy(self):
+    def test_host_package_update_does_not_roll_docker_runtime(self):
         alpha = _install("alpha", "docker")
         with (
             mock.patch.object(
@@ -127,10 +127,65 @@ class PackageManagerTests(unittest.TestCase):
         ):
             result = package_manager.update_package("codex")
 
-        update_instance.assert_called_once_with("alpha")
+        update_instance.assert_not_called()
         update_host.assert_called_once()
         self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(
+            result["steps"],
+            [{"step": "host:codex", "status": "done"}],
+        )
+
+    def test_explicit_silicon_update_still_rolls_docker_runtime(self):
+        alpha = _install("alpha", "docker")
+        with (
+            mock.patch.object(
+                package_manager,
+                "_selected_installs",
+                return_value=[alpha],
+            ),
+            mock.patch.object(
+                package_manager.update,
+                "update_instance",
+            ) as update_instance,
+            mock.patch.object(
+                package_manager.registry,
+                "installs",
+                return_value=[alpha],
+            ),
+            mock.patch.object(
+                package_manager,
+                "HostFileLock",
+                return_value=nullcontext(),
+            ),
+        ):
+            result = package_manager.update_package("silicon")
+
+        update_instance.assert_called_once_with("alpha")
+        self.assertEqual(result["status"], "succeeded")
         self.assertEqual(result["steps"][0]["step"], "git-release")
+
+    def test_docker_package_row_routes_runtime_update_through_silicon(self):
+        alpha = _install("alpha", "docker")
+        with mock.patch.object(
+            package_manager,
+            "_glass_identity",
+            return_value={"silicon_id": "sid-alpha", "team_slug": "team"},
+        ):
+            row = package_manager._row(
+                package_manager.PACKAGE_BY_KEY["silicon-cli"],
+                "1.0.0",
+                "2.0.0",
+                location="docker-image",
+                strategy="published-runtime",
+                install=alpha,
+            )
+
+        self.assertFalse(row["direct_update"])
+        self.assertEqual(row["update_package"], "silicon")
+        self.assertEqual(
+            row["update_command"],
+            "silicon package update silicon",
+        )
 
     def test_running_local_silicon_blocks_shared_host_mutation(self):
         alpha = _install("alpha")
@@ -162,6 +217,86 @@ class PackageManagerTests(unittest.TestCase):
         update_host.assert_not_called()
         self.assertEqual(result["status"], "partial")
         self.assertEqual(result["steps"][0]["status"], "blocked")
+
+    def test_running_local_silicon_does_not_block_host_cli_self_upgrade(self):
+        alpha = _install("alpha")
+        with (
+            mock.patch.object(
+                package_manager,
+                "_selected_installs",
+                return_value=[alpha],
+            ),
+            mock.patch.object(
+                package_manager.registry,
+                "installs",
+                return_value=[alpha],
+            ),
+            mock.patch.object(
+                package_manager.process,
+                "install_is_running",
+                return_value=True,
+            ),
+            mock.patch.object(
+                package_manager,
+                "_update_host_package",
+                return_value={
+                    "step": "host:silicon-cli",
+                    "status": "done",
+                    "installed_version": "2.0.0",
+                },
+            ) as update_host,
+            mock.patch.object(
+                package_manager,
+                "HostFileLock",
+                return_value=nullcontext(),
+            ),
+        ):
+            result = package_manager.update_package("silicon-cli")
+
+        update_host.assert_called_once_with(
+            package_manager.PACKAGE_BY_KEY["silicon-cli"]
+        )
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(
+            result["steps"][0]["installed_version"],
+            "2.0.0",
+        )
+
+    def test_host_cli_upgrade_uses_noninteractive_pip_and_verifies_install(self):
+        spec = package_manager.PACKAGE_BY_KEY["silicon-cli"]
+        with (
+            mock.patch.object(
+                package_manager,
+                "_run_step",
+                return_value={
+                    "step": "host:silicon-cli",
+                    "status": "done",
+                    "returncode": 0,
+                    "detail": "",
+                },
+            ) as run_step,
+            mock.patch.object(
+                package_manager.metadata,
+                "version",
+                return_value="2.0.0",
+            ),
+        ):
+            result = package_manager._update_host_package(spec)
+
+        run_step.assert_called_once_with(
+            [
+                package_manager.sys.executable,
+                "-m",
+                "pip",
+                "--disable-pip-version-check",
+                "--no-input",
+                "install",
+                "--upgrade",
+                "silicon-cli",
+            ],
+            "host:silicon-cli",
+        )
+        self.assertEqual(result["installed_version"], "2.0.0")
 
     def test_interface_package_update_installs_verified_release_asset(self):
         alpha = _install("alpha", "docker")

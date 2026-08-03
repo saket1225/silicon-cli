@@ -12,7 +12,7 @@ from typing import Callable, Iterable, Mapping
 
 from .io import fsync_dir
 from .journal import TERMINAL_STATES, TransactionJournal
-from .lock import InstanceLock
+from .lock import AdvisoryFileLock
 from .overlay import OverlayError, OverlayStore
 
 _TREE_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -695,7 +695,13 @@ class RetentionManager:
                 _remove_directory(path, generation_root)
                 removed["generations"].append(path.name)
 
-        with InstanceLock(self.cache_root, f"retention-{os.getpid()}"):
+        # Fleet cleanup runs per-instance work concurrently. The shared cache
+        # portion must wait its turn instead of treating another cleanup worker
+        # as a conflicting update and silently skipping retention.
+        with AdvisoryFileLock(
+            self.cache_root / ".silicon" / "update.lock",
+            label="release cache retention lock",
+        ):
             release_cache = self.cache_root / "releases"
             if release_cache.is_dir() and not release_cache.is_symlink():
                 candidates = sorted(

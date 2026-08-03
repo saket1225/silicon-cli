@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -479,15 +480,11 @@ class DockerUpdateHookTests(unittest.TestCase):
         ):
             update.update_instance("group")
 
-        self.assertEqual(
-            events,
-            [
-                "preflight:local",
-                "preflight:ada",
-                "run:local",
-                "run:ada",
-            ],
+        self.assertCountEqual(
+            events[:2],
+            ["preflight:local", "preflight:ada"],
         )
+        self.assertEqual(events[2:], ["run:local", "run:ada"])
         verify_runtime.assert_called_once_with(
             {"image": release.manifest.runtime_image},
             release.manifest.runtime_image,
@@ -555,14 +552,14 @@ class DockerUpdateHookTests(unittest.TestCase):
             update.update_instance("group")
 
         self.assertEqual(raised.exception.code, 2)
-        self.assertEqual(events, ["preflight:local", "preflight:ada"])
+        self.assertCountEqual(events, ["preflight:local", "preflight:ada"])
         local_updater.run.assert_not_called()
         docker_updater.run.assert_not_called()
 
-    def test_rolling_activation_stops_after_first_runtime_failure(self):
+    def test_parallel_activation_finishes_failed_wave_and_stops_later_waves(self):
         installs = []
         updaters = []
-        for index, name in enumerate(("one", "two", "three")):
+        for index, name in enumerate(("one", "two", "three", "four")):
             path = self.root.parent / name
             path.mkdir()
             installs.append(
@@ -600,17 +597,77 @@ class DockerUpdateHookTests(unittest.TestCase):
             mock.patch.object(update.ui, "error"),
             self.assertRaises(SystemExit) as raised,
         ):
-            update.update_instance("group")
+            update.update_instance("group", concurrency=2)
 
         self.assertEqual(raised.exception.code, 2)
         updaters[0].run.assert_called_once()
         updaters[1].run.assert_called_once()
-        updaters[2].run.assert_not_called()
+        updaters[2].run.assert_called_once()
+        updaters[3].run.assert_not_called()
         updaters[0].rollback.assert_called_once_with(
             deadline=None,
             transaction_id="tx-one",
             lock_held=True,
         )
+        updaters[2].rollback.assert_called_once_with(
+            deadline=None,
+            transaction_id="tx-three",
+            lock_held=True,
+        )
+
+    def test_post_canary_activation_wave_runs_concurrently(self):
+        installs = []
+        updaters = []
+        activation_barrier = threading.Barrier(2, timeout=2)
+        started: list[str] = []
+        started_lock = threading.Lock()
+        for index, name in enumerate(("canary", "two", "three")):
+            path = self.root.parent / name
+            path.mkdir()
+            installs.append(
+                registry.Install(
+                    index=index,
+                    name=name,
+                    path=str(path),
+                    pid_file=str(path / ".silicon.pid"),
+                )
+            )
+            updater = mock.Mock()
+            updater.preflight.return_value = {
+                "safe_to_apply": True,
+                "plan": {"conflicts": []},
+            }
+            if name == "canary":
+                updater.run.return_value = {"transaction_id": "tx-canary"}
+            else:
+                def activate(_release, *, _name=name, **_kwargs):
+                    with started_lock:
+                        started.append(_name)
+                    activation_barrier.wait()
+                    return {"transaction_id": f"tx-{_name}"}
+
+                updater.run.side_effect = activate
+            updaters.append(updater)
+        release = self.signed_release()
+
+        with (
+            mock.patch.object(
+                update, "REGISTRY_DIR", self.root.parent / ".cli-state"
+            ),
+            mock.patch.object(update, "_targets", return_value=installs),
+            mock.patch.object(update, "_cache", return_value=object()),
+            mock.patch.object(update, "_fetch_latest", return_value=release),
+            mock.patch.object(update.registry, "installs", return_value=installs),
+            mock.patch.object(update, "_hooks", return_value=EngineHooks()),
+            mock.patch.object(
+                update, "TransactionalUpdater", side_effect=updaters
+            ),
+            mock.patch.object(update.ui, "info"),
+            mock.patch.object(update.ui, "success"),
+        ):
+            update.update_instance("group", concurrency=2)
+
+        self.assertCountEqual(started, ["two", "three"])
 
 
 if __name__ == "__main__":

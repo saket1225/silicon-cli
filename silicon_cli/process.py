@@ -16,10 +16,10 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
+from importlib import import_module
 from pathlib import Path
 from typing import Iterator
 
-from . import docker_runtime, glassagent, interface_cli, registry, ui
 from .config import (
     active_release_root,
     legacy_offline_update_fenced,
@@ -40,6 +40,33 @@ CONTAINER_INTERFACE_ACTIVATOR = Path(
 CONTAINER_INTERFACE_EXECUTABLE = Path(
     "/usr/local/bin/silicon-interface"
 )
+
+
+class _LazyModule:
+    """Import CLI-only integrations only when a foreground command needs one."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self._module = None
+
+    def _load(self):
+        if self._module is None:
+            self._module = import_module(self.name, __package__)
+        return self._module
+
+    def __getattr__(self, name: str):
+        return getattr(self._load(), name)
+
+
+# The detached watchdog spends almost all of its life in this module, but it
+# never needs Docker, Glass, Interface, registry, or terminal rendering code.
+# Proxies preserve the existing module surface for foreground commands/tests
+# without retaining those dependency graphs in every idle supervisor.
+docker_runtime = _LazyModule(".docker_runtime")
+glassagent = _LazyModule(".glassagent")
+interface_cli = _LazyModule(".interface_cli")
+registry = _LazyModule(".registry")
+ui = _LazyModule(".ui")
 
 
 class _RuntimeLifecycleLock(InstanceLock):
@@ -633,7 +660,7 @@ def watchdog_loop(name: str, path: str, pid_file: str) -> None:
 def _spawn_watchdog(name: str, path: str, pid_file: str) -> int:
     """Launch the detached watchdog; return its PID."""
     proc = subprocess.Popen(
-        [sys.executable, "-m", "silicon_cli.cli", "_watchdog", path, name, pid_file],
+        [sys.executable, "-m", "silicon_cli._watchdog", path, name, pid_file],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,  # detach so it survives this CLI exiting
     )

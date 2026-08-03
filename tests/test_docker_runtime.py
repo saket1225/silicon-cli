@@ -498,7 +498,7 @@ class DockerRuntimeTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn(
-            "ARG SILICON_EXTEND_SPEC=silicon-extend==0.1.3",
+            "ARG SILICON_EXTEND_SPEC=silicon-extend==0.1.4",
             dockerfile,
         )
         self.assertIn('"${SILICON_EXTEND_SPEC}"', dockerfile)
@@ -514,9 +514,9 @@ class DockerRuntimeTests(unittest.TestCase):
             "87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89",
             "FROM node:22-bookworm-slim@sha256:"
             "6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3",
-            "ARG SILICON_CLI_SPEC=silicon-cli==1.0.27",
+            "ARG SILICON_CLI_SPEC=silicon-cli==1.0.28",
             "ARG SILICON_BROWSER_SPEC=silicon-browser==1.1.1",
-            "ARG SILICON_EXTEND_SPEC=silicon-extend==0.1.3",
+            "ARG SILICON_EXTEND_SPEC=silicon-extend==0.1.4",
             "ARG SILICON_INTERFACE_CLI_URL="
             "https://github.com/teamofsilicons/silicon-interface-web/releases/"
             "download/interface-cli-v2.0.4/"
@@ -1051,7 +1051,7 @@ class DockerRuntimeTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 RuntimeError,
-                r"required Silicon Extend 0\.1\.3 runtime",
+                r"required Silicon Extend 0\.1\.4 runtime",
             ),
         ):
             docker_runtime.verify_silicon_extend(inst)

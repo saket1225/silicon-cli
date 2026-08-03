@@ -480,6 +480,32 @@ class RuntimeChildHealthTests(unittest.TestCase):
                     )
                 )
 
+    def test_watchdog_uses_the_minimal_process_entrypoint(self):
+        spawned = mock.Mock(pid=321)
+        with mock.patch.object(
+            process.subprocess,
+            "Popen",
+            return_value=spawned,
+        ) as popen:
+            self.assertEqual(
+                process._spawn_watchdog("ada", "/srv/ada", "/srv/ada/.silicon.pid"),
+                321,
+            )
+
+        popen.assert_called_once_with(
+            [
+                process.sys.executable,
+                "-m",
+                "silicon_cli._watchdog",
+                "/srv/ada",
+                "ada",
+                "/srv/ada/.silicon.pid",
+            ],
+            stdout=process.subprocess.DEVNULL,
+            stderr=process.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
     def test_stale_watchdog_exits_when_a_new_parent_publishes_another_pid(self):
         with tempfile.TemporaryDirectory() as raw:
             pid_file = Path(raw) / ".silicon.pid"

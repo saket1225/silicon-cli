@@ -279,6 +279,8 @@ def _row(
     detail: str = "",
 ) -> dict:
     identity = _glass_identity(install) if install is not None else {}
+    direct_update = strategy != "published-runtime"
+    update_package = spec.key if direct_update else "silicon"
     return {
         "key": spec.key,
         "label": spec.label,
@@ -290,10 +292,12 @@ def _row(
         "location": location,
         "update_strategy": strategy,
         "update_command": (
-            f"silicon package update {spec.key}"
+            f"silicon package update {update_package}"
             if strategy != "system"
             else ""
         ),
+        "direct_update": direct_update,
+        "update_package": update_package,
         "instance_name": install.name if install is not None else "",
         "silicon_id": identity.get("silicon_id", ""),
         "team_slug": identity.get("team_slug", ""),
@@ -625,17 +629,31 @@ def _update_host_interface(npm: str, spec: PackageSpec) -> dict:
 
 def _update_host_package(spec: PackageSpec) -> dict:
     if spec.manager == "pip":
-        return _run_step(
+        step = _run_step(
             [
                 sys.executable,
                 "-m",
                 "pip",
+                "--disable-pip-version-check",
+                "--no-input",
                 "install",
                 "--upgrade",
                 spec.package,
             ],
             f"host:{spec.key}",
         )
+        if step["status"] == "done" and spec.key == "silicon-cli":
+            try:
+                step["installed_version"] = metadata.version(spec.package)
+            except metadata.PackageNotFoundError:
+                return {
+                    "step": f"host:{spec.key}",
+                    "status": "failed",
+                    "detail": (
+                        "pip reported success but silicon-cli is not installed"
+                    ),
+                }
+        return step
     npm = shutil.which("npm")
     if not npm:
         return {
@@ -666,11 +684,17 @@ def _update_package_unlocked(
     if not installs:
         raise RuntimeError("no matching registered Silicon installations")
     steps: list[dict] = []
-    docker_installs = [install for install in installs if install.is_docker]
     local_installs = [install for install in installs if not install.is_docker]
 
-    release_targets = list(docker_installs)
-    if package_key in {"silicon", "silicon-extend"}:
+    # Docker-image package copies are immutable runtime contents. Updating a
+    # host tool must never turn into a full drain/checkpoint/restart of every
+    # selected Docker Silicon. Runtime copies move only with an explicit
+    # Silicon release; silicon-extend remains generation-owned for local
+    # installs.
+    release_targets: list[registry.Install] = []
+    if package_key == "silicon":
+        release_targets.extend(installs)
+    elif package_key == "silicon-extend":
         release_targets.extend(local_installs)
     if release_targets:
         names = ",".join(
@@ -706,7 +730,7 @@ def _update_package_unlocked(
             for install in registry.installs()
             if not install.is_docker and process.install_is_running(install)
         ]
-        if running_local:
+        if running_local and package_key != "silicon-cli":
             host_step = {
                 "step": f"host:{package_key}",
                 "status": "blocked",

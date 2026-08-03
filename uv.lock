@@ -1118,7 +1118,7 @@ wheels = [
 
 [[package]]
 name = "silicon-cli"
-version = "1.0.27"
+version = "1.0.28"
 source = { editable = "." }
 dependencies = [
     { name = "certifi" },
@@ -1128,12 +1128,12 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "certifi", specifier = ">=2024.2.2" },
-    { name = "silicon-extend", specifier = "==0.1.3" },
+    { name = "silicon-extend", specifier = "==0.1.4" },
 ]
 
 [[package]]
 name = "silicon-extend"
-version = "0.1.3"
+version = "0.1.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cryptography", version = "47.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version <= '3.9'" },
@@ -1144,9 +1144,9 @@ dependencies = [
     { name = "requests", version = "2.32.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "requests", version = "2.34.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/61/e9/bec91823074dacc7e63aba5e95cd6b81e02288bf97a01253c008563d35db/silicon_extend-0.1.3.tar.gz", hash = "sha256:1146b751e352601528731947a32e64f5862df01abbcf570aca18b51d0ab67cde", size = 38408, upload-time = "2026-07-30T13:12:37.5Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/3f/58/65d3a9714a7756492dc5a7b69d87a3ec3bafc1a8c5b99e3afb9fcde961ac/silicon_extend-0.1.4.tar.gz", hash = "sha256:16e8aa9acea14bbf5b1e1c69f78954692acd374dfc14363452a518f89f0f03e1", size = 38352, upload-time = "2026-08-03T15:47:52.555Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/6b/5b/c3207e4c13d7a2530094aa5382c5b3c8409101aa50d1e828ffae2ea7733e/silicon_extend-0.1.3-py3-none-any.whl", hash = "sha256:32f1281a55ed546fdf8e762a2878a33c434e78f8088543baeae542eb80d8c659", size = 44398, upload-time = "2026-07-30T13:12:36.387Z" },
+    { url = "https://files.pythonhosted.org/packages/fb/c8/0169b01880cda5dbc34e7393ed3a3bd9da9af9c2d7d22a2cb735c8b2c44b/silicon_extend-0.1.4-py3-none-any.whl", hash = "sha256:303e17e32d8105e20f30298b418ff197924d7845dd5705a1360bed2c49841b22", size = 44461, upload-time = "2026-08-03T15:47:51.37Z" },
 ]
 
 [[package]]

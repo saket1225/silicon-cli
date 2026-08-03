@@ -647,6 +647,35 @@ class TransactionTests(unittest.TestCase):
                 "important memory\n",
             )
 
+    def test_fleet_can_defer_retention_until_after_activation_commit(self):
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = Fixture(Path(raw))
+            updater = TransactionalUpdater(
+                fixture.instance, fixture.cache, hooks=fixture.hooks()
+            )
+            removed = {"generations": ["old-generation"]}
+            with mock.patch.object(
+                updater.retention,
+                "prune",
+                return_value=removed,
+            ) as prune:
+                result = updater.run(
+                    fixture.release,
+                    defer_retention=True,
+                )
+                prune.assert_not_called()
+                self.assertTrue(result["metadata"]["retention_deferred"])
+
+                finalized = updater.finalize_retention(
+                    str(result["transaction_id"])
+                )
+
+            prune.assert_called_once_with()
+            self.assertFalse(
+                finalized["metadata"]["retention_deferred"]
+            )
+            self.assertEqual(finalized["metadata"]["retention"], removed)
+
     def test_checkpoint_failure_restores_precheckpoint_delivery_state(self):
         with tempfile.TemporaryDirectory() as raw:
             fixture = Fixture(Path(raw))

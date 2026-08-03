@@ -19,6 +19,11 @@ class CliUpdateTests(unittest.TestCase):
                 "run",
                 return_value=SimpleNamespace(returncode=0),
             ) as run,
+            mock.patch.object(
+                update.metadata,
+                "version",
+                return_value="2.0.0",
+            ),
             mock.patch.object(update.ui, "info"),
             mock.patch.object(update.ui, "success"),
         ):
@@ -29,6 +34,8 @@ class CliUpdateTests(unittest.TestCase):
                 sys.executable,
                 "-m",
                 "pip",
+                "--disable-pip-version-check",
+                "--no-input",
                 "install",
                 "--upgrade",
                 "silicon-cli",
@@ -45,6 +52,55 @@ class CliUpdateTests(unittest.TestCase):
             "ada",
             dry_run=True,
             deadline_seconds=None,
+            concurrency=None,
+            canary_count=None,
+            all_at_once=False,
+        )
+
+    def test_update_command_routes_parallel_rollout_controls(self):
+        with mock.patch.object(update, "update_instance") as update_instance:
+            update.update_command(
+                [
+                    "all",
+                    "--concurrency=12",
+                    "--canary-count",
+                    "2",
+                ]
+            )
+
+        update_instance.assert_called_once_with(
+            "all",
+            dry_run=False,
+            deadline_seconds=None,
+            concurrency=12,
+            canary_count=2,
+            all_at_once=False,
+        )
+
+    def test_update_command_routes_all_at_once(self):
+        with mock.patch.object(update, "update_instance") as update_instance:
+            update.update_command(["--all-at-once", "all"])
+
+        update_instance.assert_called_once_with(
+            "all",
+            dry_run=False,
+            deadline_seconds=None,
+            concurrency=None,
+            canary_count=None,
+            all_at_once=True,
+        )
+
+    def test_default_waves_are_one_canary_then_batches_of_eight(self):
+        waves = update._activation_waves(
+            46,
+            concurrency=update.DEFAULT_FLEET_CONCURRENCY,
+            canary_count=update.DEFAULT_FLEET_CANARY_COUNT,
+        )
+
+        self.assertEqual([len(wave) for wave in waves], [1, 8, 8, 8, 8, 8, 5])
+        self.assertEqual(
+            [member for wave in waves for member in wave],
+            list(range(46)),
         )
 
     def test_removed_unsigned_git_flag_fails_closed(self):
