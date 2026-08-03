@@ -161,7 +161,7 @@ class Fixture:
 
 
 class ReleaseTests(unittest.TestCase):
-    def test_parallel_release_cache_operations_wait_for_the_shared_lock(self):
+    def test_parallel_cache_stores_wait_while_materialization_overlaps(self):
         with tempfile.TemporaryDirectory() as raw:
             fixture = Fixture(Path(raw))
             store_entered = threading.Event()
@@ -198,14 +198,11 @@ class ReleaseTests(unittest.TestCase):
                     cached.manifest,
                 )
 
-            extract_entered = threading.Event()
-            allow_extract = threading.Event()
+            extract_barrier = threading.Barrier(2)
             original_extract = cache_module.safe_extract
 
             def slow_extract(*args, **kwargs):
-                if not extract_entered.is_set():
-                    extract_entered.set()
-                    self.assertTrue(allow_extract.wait(2))
+                extract_barrier.wait(2)
                 return original_extract(*args, **kwargs)
 
             with (
@@ -221,15 +218,11 @@ class ReleaseTests(unittest.TestCase):
                     cached,
                     fixture.root / "extract-one",
                 )
-                self.assertTrue(extract_entered.wait(2))
                 second_extract = executor.submit(
                     fixture.cache.materialize,
                     cached,
                     fixture.root / "extract-two",
                 )
-                time.sleep(0.05)
-                self.assertFalse(second_extract.done())
-                allow_extract.set()
                 first_extract.result(timeout=2)
                 second_extract.result(timeout=2)
 

@@ -170,11 +170,11 @@ class ReleaseCache:
     def materialize(self, release: FetchedRelease, destination: Path) -> None:
         self._real_directory(self.root, create=True)
         self._regular_file(Path(release.artifact))
-        with self._operation_lock(
-            "release cache extract "
-            f"{release.manifest.identity.tree_sha256[:16]}",
-        ):
-            safe_extract(release.artifact, destination, release.manifest)
+        # The cached artifact is immutable and safe_extract verifies it before
+        # writing to the caller-owned, unique destination.  Serializing these
+        # read-only extractions made every fleet worker wait behind one global
+        # cache lock and defeated the rollout's configured concurrency.
+        safe_extract(release.artifact, destination, release.manifest)
 
     def prepare_environment(
         self,
