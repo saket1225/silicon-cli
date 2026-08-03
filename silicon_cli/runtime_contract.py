@@ -1,6 +1,7 @@
 """Runtime dependency contracts enforced before a Silicon pull commits."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -9,9 +10,8 @@ from pathlib import Path
 
 from .config import SILICON_INTERFACE_CLI_VERSION
 
-
 MINIMUM_PYTHON_PACKAGES = {
-    "silicon-cli": "1.0.28",
+    "silicon-cli": "1.0.29",
     "silicon-browser": "1.1.1",
     "silicon-extend": "0.1.4",
 }
@@ -220,6 +220,40 @@ def docker_contract() -> dict[str, object]:
 
 def docker_contract_json() -> str:
     return json.dumps(docker_contract(), sort_keys=True, separators=(",", ":"))
+
+
+def docker_contract_sha256() -> str:
+    """Return the stable identity of the complete runtime contract."""
+
+    return hashlib.sha256(docker_contract_json().encode("utf-8")).hexdigest()
+
+
+def release_contract_metadata() -> dict[str, object]:
+    """Build the small contract record committed with a Stemcell release."""
+
+    return {
+        "schema": 1,
+        "sha256": docker_contract_sha256(),
+        "silicon_cli": MINIMUM_PYTHON_PACKAGES["silicon-cli"],
+        "silicon_extend": EXACT_PYTHON_PACKAGES["silicon-extend"],
+    }
+
+
+def verify_release_contract_metadata(value: object) -> dict[str, object]:
+    """Reject incompatible release metadata before downloading its image."""
+
+    expected = release_contract_metadata()
+    if not isinstance(value, dict) or value != expected:
+        found = value if isinstance(value, dict) else {}
+        raise RuntimeError(
+            "the published Stemcell runtime_contract does not match this "
+            "Silicon CLI before image download: "
+            f"found sha256={found.get('sha256', 'missing')!s}, "
+            f"require sha256={expected['sha256']}; publish the packages first, "
+            "build and verify the runtime image second, and create a new "
+            "immutable Stemcell tag last"
+        )
+    return expected
 
 
 DOCKER_PROBE_SCRIPT = r"""

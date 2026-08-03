@@ -296,6 +296,7 @@ def cmd_help() -> None:
   silicon update all --concurrency 8 --canary-count 1
                               Canary-first bounded-parallel fleet rollout
   silicon update all --all-at-once  Maximum speed with no canary barrier
+  silicon update prewarm            Fetch and verify the next runtime without activation
   silicon update status [name]       Show generation and transaction state
   silicon update cancel [name]       Cancel an update before its stop boundary
   silicon update resume [name]       Resume an interrupted transaction

@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from silicon_cli import registry, update
+from silicon_cli import registry, runtime_contract, update
 from silicon_cli.updater import EngineHooks, UpdateError
 from silicon_cli.updater.maintenance import MaintenanceError
 
@@ -46,11 +46,15 @@ class DockerUpdateHookTests(unittest.TestCase):
         }
         return SimpleNamespace(
             manifest=SimpleNamespace(
-                identity=SimpleNamespace(to_dict=lambda: dict(identity)),
+                identity=SimpleNamespace(
+                    version=identity["version"],
+                    to_dict=lambda: dict(identity),
+                ),
                 runtime_image=(
                     "ghcr.io/teamofsilicons/silicon-runtime@sha256:"
                     + "d" * 64
                 ),
+                runtime_contract=runtime_contract.release_contract_metadata(),
             )
         )
 

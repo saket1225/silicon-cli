@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
+from .. import runtime_contract
 from .io import (
     UnsafePathError,
     atomic_write_json,
@@ -152,6 +153,7 @@ class ReleaseManifest:
     identity: ReleaseIdentity
     files: dict[str, dict[str, object]]
     runtime_image: str = ""
+    runtime_contract: dict[str, object] | None = None
     schema: int = 1
 
     def to_dict(self) -> dict:
@@ -160,16 +162,23 @@ class ReleaseManifest:
             "identity": self.identity.to_dict(),
             "files": self.files,
             "runtime_image": self.runtime_image,
+            "runtime_contract": self.runtime_contract or {},
         }
 
     @classmethod
     def from_dict(cls, value: dict) -> "ReleaseManifest":
-        if not isinstance(value, dict) or set(value) != {
+        required_fields = {
             "schema",
             "identity",
             "files",
             "runtime_image",
-        }:
+        }
+        allowed_fields = required_fields | {"runtime_contract"}
+        if (
+            not isinstance(value, dict)
+            or not required_fields.issubset(value)
+            or set(value) - allowed_fields
+        ):
             raise ReleaseVerificationError(
                 "release manifest has unknown or missing fields"
             )
@@ -238,10 +247,25 @@ class ReleaseManifest:
                 raise ReleaseVerificationError(
                     "release runtime image is not an immutable digest reference"
                 )
+        declared_contract = value.get("runtime_contract", {})
+        if not isinstance(declared_contract, dict):
+            raise ReleaseVerificationError(
+                "release runtime_contract must be an object"
+            )
+        serialized_contract = json.dumps(
+            declared_contract,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(serialized_contract.encode("utf-8")) > 4096:
+            raise ReleaseVerificationError(
+                "release runtime_contract metadata is too large"
+            )
         return cls(
             identity=identity,
             files=files,
             runtime_image=str(runtime_image or ""),
+            runtime_contract=declared_contract,
         )
 
     @classmethod
@@ -484,6 +508,7 @@ def create_artifact(
     version: str | None = None,
     sequence: int | None = None,
     runtime_image: str = "",
+    runtime_contract_metadata: dict[str, object] | None = None,
     canonical_modes: dict[str, int] | None = None,
 ) -> FetchedRelease:
     """Create a deterministic archive and verify declared release metadata."""
@@ -576,7 +601,12 @@ def create_artifact(
         }
     )
     return FetchedRelease(
-        ReleaseManifest(identity, files, runtime_image=runtime_image),
+        ReleaseManifest(
+            identity,
+            files,
+            runtime_image=runtime_image,
+            runtime_contract=runtime_contract_metadata or {},
+        ),
         destination,
     )
 
@@ -891,7 +921,7 @@ def resolve_latest_published_git_release(git_url: str) -> PublishedGitRelease:
 def _published_stemcell_metadata(
     checkout: Path,
     release: PublishedGitRelease,
-) -> str:
+) -> tuple[str, dict[str, object]]:
     path = checkout / "silicon.info"
     try:
         metadata = path.lstat()
@@ -923,7 +953,14 @@ def _published_stemcell_metadata(
         raise ReleaseVerificationError(
             "published Stemcell has no immutable runtime_image digest"
         )
-    return str(runtime_image)
+    declared_contract = value.get("runtime_contract")
+    try:
+        verified_contract = runtime_contract.verify_release_contract_metadata(
+            declared_contract
+        )
+    except RuntimeError as exc:
+        raise ReleaseVerificationError(str(exc)) from exc
+    return str(runtime_image), verified_contract
 
 
 def _verify_checkout_matches_git_tree(
@@ -1134,7 +1171,10 @@ def fetch_git_release(
             raise ReleaseVerificationError(
                 "checked-out Stemcell does not match the published commit"
             )
-        runtime_image = _published_stemcell_metadata(checkout, published)
+        runtime_image, runtime_contract_metadata = _published_stemcell_metadata(
+            checkout,
+            published,
+        )
         canonical_modes = _verify_checkout_matches_git_tree(checkout)
         shutil.rmtree(checkout / ".git", ignore_errors=True)
         cache_staging.mkdir(parents=True, exist_ok=True)
@@ -1151,6 +1191,7 @@ def fetch_git_release(
             version=published.version,
             sequence=published.sequence,
             runtime_image=runtime_image,
+            runtime_contract_metadata=runtime_contract_metadata,
             canonical_modes=canonical_modes,
         )
     finally:

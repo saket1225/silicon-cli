@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from silicon_cli import runtime_contract
 from silicon_cli.updater.release import (
     PUBLISHED_GIT_TRUST,
     PublishedGitRelease,
@@ -20,7 +21,6 @@ from silicon_cli.updater.release import (
     resolve_latest_published_git_release,
     safe_extract,
 )
-
 
 RUNTIME_IMAGE = (
     "ghcr.io/teamofsilicons/silicon-runtime@sha256:" + "a" * 64
@@ -235,6 +235,9 @@ class GitReleaseSourceTests(unittest.TestCase):
                 {
                     "version": version,
                     "runtime_image": runtime_image,
+                    "runtime_contract": (
+                        runtime_contract.release_contract_metadata()
+                    ),
                 }
             )
             + "\n",
@@ -272,6 +275,10 @@ class GitReleaseSourceTests(unittest.TestCase):
                 PUBLISHED_GIT_TRUST,
             )
             self.assertEqual(fetched.manifest.runtime_image, RUNTIME_IMAGE)
+            self.assertEqual(
+                fetched.manifest.runtime_contract,
+                runtime_contract.release_contract_metadata(),
+            )
             extracted = root / "extracted"
             safe_extract(fetched.artifact, extracted, fetched.manifest)
             self.assertEqual(
@@ -375,6 +382,9 @@ class GitReleaseSourceTests(unittest.TestCase):
                     {
                         "version": "2.0.1",
                         "runtime_image": RUNTIME_IMAGE,
+                        "runtime_contract": (
+                            runtime_contract.release_contract_metadata()
+                        ),
                     }
                 ),
                 encoding="utf-8",
@@ -390,6 +400,9 @@ class GitReleaseSourceTests(unittest.TestCase):
                     {
                         "version": "2.0.0",
                         "runtime_image": "ghcr.io/example/runtime:latest",
+                        "runtime_contract": (
+                            runtime_contract.release_contract_metadata()
+                        ),
                     }
                 ),
                 encoding="utf-8",
@@ -397,6 +410,21 @@ class GitReleaseSourceTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 ReleaseVerificationError,
                 "immutable runtime_image",
+            ):
+                _published_stemcell_metadata(root, release)
+
+            info.write_text(
+                json.dumps(
+                    {
+                        "version": "2.0.0",
+                        "runtime_image": RUNTIME_IMAGE,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ReleaseVerificationError,
+                "before image download",
             ):
                 _published_stemcell_metadata(root, release)
 

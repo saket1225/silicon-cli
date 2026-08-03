@@ -13,7 +13,15 @@ from contextlib import contextmanager
 from importlib import metadata
 from pathlib import Path
 
-from . import docker_runtime, glassagent, interface_cli, process, registry, ui
+from . import (
+    docker_runtime,
+    glassagent,
+    interface_cli,
+    process,
+    registry,
+    runtime_contract,
+    ui,
+)
 from .config import (
     REGISTRY_DIR,
     active_release_root,
@@ -32,7 +40,6 @@ from .updater.fleet import FleetJournal, FleetJournalError
 from .updater.lock import InstanceLock
 from .updater.maintenance import MaintenanceError, MaintenanceProtocol
 from .updater.release import FetchedRelease
-
 
 # A restarted Silicon must satisfy min_uptime AND publish a fresh heartbeat
 # before it counts as healthy, and it contacts Glass for provider keys during
@@ -53,6 +60,7 @@ HEALTH_BUDGET_DOCKER_SECONDS = 120.0
 DEFAULT_FLEET_CONCURRENCY = 8
 DEFAULT_FLEET_CANARY_COUNT = 1
 MAX_FLEET_CONCURRENCY = 64
+PREWARM_MARKER = "SILICON_UPDATE_PREWARM="
 
 
 def _cache() -> ReleaseCache:
@@ -1120,8 +1128,19 @@ def update_instance(
     concurrency: int | None = None,
     canary_count: int | None = None,
     all_at_once: bool = False,
-) -> None:
+) -> dict[str, object]:
     rollout_started = time.monotonic()
+    timings: dict[str, object] = {
+        "resolve_release": 0.0,
+        "metadata_contract": 0.0,
+        "image_pull": 0.0,
+        "runtime_probe": 0.0,
+        "prestage": 0.0,
+        "activation": 0.0,
+        "retention": 0.0,
+        "waves": [],
+        "total": 0.0,
+    }
     installs = _targets(target)
     resolved_concurrency = _fleet_option(
         concurrency,
@@ -1170,9 +1189,15 @@ def update_instance(
             + ", ".join(install.name for install in installs)
             + "?"
         ):
-            return
+            timings["total"] = round(time.monotonic() - rollout_started, 3)
+            return {"schema": 1, "status": "cancelled", "timings_seconds": timings}
     cache = _cache()
+    release_started = time.monotonic()
     release = _fetch_latest(cache)
+    timings["resolve_release"] = round(
+        time.monotonic() - release_started,
+        3,
+    )
     docker_installs = [install for install in installs if install.is_docker]
     if docker_installs and not dry_run:
         runtime_image = release.manifest.runtime_image
@@ -1181,10 +1206,25 @@ def update_instance(
                 "Docker updates require the published Stemcell Git tag to "
                 "declare an immutable runtime_image digest"
             )
+        metadata_started = time.monotonic()
+        runtime_contract.verify_release_contract_metadata(
+            release.manifest.runtime_contract
+        )
+        timings["metadata_contract"] = round(
+            time.monotonic() - metadata_started,
+            3,
+        )
+        image_started = time.monotonic()
         runtime_config = docker_runtime.prepare_release_image(runtime_image)
+        timings["image_pull"] = round(time.monotonic() - image_started, 3)
+        probe_started = time.monotonic()
         docker_runtime.verify_runtime_contract(
             runtime_config,
             runtime_image,
+        )
+        timings["runtime_probe"] = round(
+            time.monotonic() - probe_started,
+            3,
         )
     instance_roots = [Path(item.path) for item in registry.installs()]
     updaters = [
@@ -1212,7 +1252,8 @@ def update_instance(
                 ui.error(f"Dry-run failed safely for '{install.name}': {exc}")
         if failures:
             raise SystemExit(2)
-        return
+        timings["total"] = round(time.monotonic() - rollout_started, 3)
+        return {"schema": 1, "status": "dry-run", "timings_seconds": timings}
 
     fleet_id = f"fleet-{int(time.time())}-{os.getpid()}"
     reservations = [
@@ -1294,6 +1335,10 @@ def update_instance(
             for index, (install, updater) in enumerate(updaters)
             if index in preflight_results
         ]
+        timings["prestage"] = round(
+            time.monotonic() - preflight_started,
+            3,
+        )
         if failures:
             raise SystemExit(2)
         if len(prepared) > 1:
@@ -1334,6 +1379,7 @@ def update_instance(
                 f"Starting {wave_kind} activation wave {wave_number}/"
                 f"{len(waves)} for {len(member_indexes)} Silicon(s)."
             )
+            wave_started = time.monotonic()
             activation_futures: dict[
                 Future[dict], tuple[
                     int, registry.Install, TransactionalUpdater
@@ -1420,6 +1466,18 @@ def update_instance(
                         ui.error(
                             f"Update failed safely for '{install.name}': {exc}"
                         )
+            timings["waves"].append(
+                {
+                    "wave": wave_number,
+                    "kind": wave_kind,
+                    "members": len(member_indexes),
+                    "seconds": round(time.monotonic() - wave_started, 3),
+                }
+            )
+        timings["activation"] = round(
+            time.monotonic() - activation_started,
+            3,
+        )
         if failures and fleet_journal is not None:
             for index, member in enumerate(fleet_journal.value["members"]):
                 if member["state"] == "pending":
@@ -1436,6 +1494,7 @@ def update_instance(
                 "Fleet activation committed; pruning superseded update "
                 "assets in the background phase."
             )
+            retention_started = time.monotonic()
             with ThreadPoolExecutor(
                 max_workers=min(resolved_concurrency, len(committed)),
                 thread_name_prefix="silicon-retention",
@@ -1461,6 +1520,10 @@ def update_instance(
                             f"Deferred cleanup for '{install.name}' will be "
                             f"retried by retention later: {exc}"
                         )
+            timings["retention"] = round(
+                time.monotonic() - retention_started,
+                3,
+            )
             ui.success(
                 f"Fleet update finished in "
                 f"{time.monotonic() - rollout_started:.1f}s."
@@ -1532,6 +1595,16 @@ def update_instance(
             reservation.release()
     if failures:
         raise SystemExit(2)
+    timings["total"] = round(time.monotonic() - rollout_started, 3)
+    return {
+        "schema": 1,
+        "status": "succeeded",
+        "release": release.manifest.identity.version,
+        "installations": len(installs),
+        "concurrency": resolved_concurrency,
+        "canary_count": resolved_canary_count,
+        "timings_seconds": timings,
+    }
 
 
 def _parse_duration(value: str) -> float:
@@ -1598,6 +1671,48 @@ def _print_status(value) -> None:
     print(json.dumps(value, indent=2, sort_keys=True))
 
 
+def prewarm_release() -> dict[str, object]:
+    """Fetch and verify the next Docker release without activating a Silicon."""
+
+    started = time.monotonic()
+    timings: dict[str, float] = {}
+    release_started = time.monotonic()
+    release = _fetch_latest(_cache())
+    timings["resolve_release"] = round(time.monotonic() - release_started, 3)
+    image = release.manifest.runtime_image
+    if not image:
+        raise UpdateError(
+            "the published Stemcell Git tag has no immutable runtime_image"
+        )
+    metadata_started = time.monotonic()
+    runtime_contract.verify_release_contract_metadata(
+        release.manifest.runtime_contract
+    )
+    timings["metadata_contract"] = round(
+        time.monotonic() - metadata_started,
+        3,
+    )
+    pull_started = time.monotonic()
+    config = docker_runtime.prepare_release_image(image)
+    timings["image_pull"] = round(time.monotonic() - pull_started, 3)
+    probe_started = time.monotonic()
+    versions = docker_runtime.verify_runtime_contract(config, image)
+    timings["runtime_probe"] = round(time.monotonic() - probe_started, 3)
+    timings["total"] = round(time.monotonic() - started, 3)
+    return {
+        "schema": 1,
+        "status": "succeeded",
+        "release": release.manifest.identity.version,
+        "runtime_image": image,
+        "runtime_contract_sha256": release.manifest.runtime_contract.get(
+            "sha256",
+            "",
+        ),
+        "versions": versions,
+        "timings_seconds": timings,
+    }
+
+
 def update_command(arguments: list[str]) -> None:
     try:
         _update_command(arguments)
@@ -1610,6 +1725,25 @@ def _update_command(arguments: list[str]) -> None:
     args = list(arguments)
     if args and args[0] in {"check", "trigger"}:
         trigger_update_check(args[1] if len(args) > 1 else None)
+        return
+    if args and args[0] == "prewarm":
+        if len(args) != 1:
+            raise UpdateError("Usage: silicon update prewarm")
+        prewarm_started = time.monotonic()
+        try:
+            payload = prewarm_release()
+        except RuntimeError as exc:
+            payload = {
+                "schema": 1,
+                "status": "failed",
+                "detail": str(exc),
+                "timings_seconds": {
+                    "total": round(time.monotonic() - prewarm_started, 3),
+                },
+            }
+            print(PREWARM_MARKER + json.dumps(payload, sort_keys=True))
+            raise SystemExit(2) from exc
+        print(PREWARM_MARKER + json.dumps(payload, sort_keys=True))
         return
     operation = "run"
     if args and args[0] in {"status", "cancel", "resume", "history", "rollback"}:

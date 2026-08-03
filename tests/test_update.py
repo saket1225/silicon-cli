@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -7,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from silicon_cli import registry, update
+from silicon_cli import registry, runtime_contract, update
 from silicon_cli.updater import snapshot_adapter
 
 
@@ -89,6 +90,109 @@ class CliUpdateTests(unittest.TestCase):
             canary_count=None,
             all_at_once=True,
         )
+
+    def test_update_command_routes_runtime_prewarm(self):
+        payload = {"schema": 1, "status": "succeeded"}
+        with (
+            mock.patch.object(update, "prewarm_release", return_value=payload),
+            mock.patch("builtins.print") as output,
+        ):
+            update.update_command(["prewarm"])
+
+        output.assert_called_once_with(
+            update.PREWARM_MARKER
+            + '{"schema": 1, "status": "succeeded"}'
+        )
+
+    def test_prewarm_checks_metadata_before_pulling_the_image(self):
+        image = (
+            "ghcr.io/teamofsilicons/silicon-runtime@sha256:" + "a" * 64
+        )
+        declared = runtime_contract.release_contract_metadata()
+        release = SimpleNamespace(
+            manifest=SimpleNamespace(
+                runtime_image=image,
+                runtime_contract=declared,
+                identity=SimpleNamespace(version="2.4.1"),
+            )
+        )
+        with (
+            mock.patch.object(update, "_fetch_latest", return_value=release),
+            mock.patch.object(update, "_cache"),
+            mock.patch.object(
+                update.runtime_contract,
+                "verify_release_contract_metadata",
+                return_value=declared,
+            ) as metadata_check,
+            mock.patch.object(
+                update.docker_runtime,
+                "prepare_release_image",
+                return_value={"image": image},
+            ) as prepare,
+            mock.patch.object(
+                update.docker_runtime,
+                "verify_runtime_contract",
+                return_value={"silicon-cli": "1.0.29"},
+            ) as verify,
+        ):
+            result = update.prewarm_release()
+
+        metadata_check.assert_called_once_with(declared)
+        prepare.assert_called_once_with(image)
+        verify.assert_called_once_with({"image": image}, image)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["release"], "2.4.1")
+        self.assertEqual(result["runtime_contract_sha256"], declared["sha256"])
+        self.assertIn("total", result["timings_seconds"])
+
+    def test_prewarm_contract_mismatch_fails_before_image_pull(self):
+        image = (
+            "ghcr.io/teamofsilicons/silicon-runtime@sha256:" + "b" * 64
+        )
+        release = SimpleNamespace(
+            manifest=SimpleNamespace(
+                runtime_image=image,
+                runtime_contract={"schema": 1, "sha256": "bad"},
+                identity=SimpleNamespace(version="2.4.1"),
+            )
+        )
+        with (
+            mock.patch.object(update, "_fetch_latest", return_value=release),
+            mock.patch.object(update, "_cache"),
+            mock.patch.object(
+                update.runtime_contract,
+                "verify_release_contract_metadata",
+                side_effect=RuntimeError("contract mismatch"),
+            ),
+            mock.patch.object(
+                update.docker_runtime,
+                "prepare_release_image",
+            ) as prepare,
+            self.assertRaisesRegex(RuntimeError, "contract mismatch"),
+        ):
+            update.prewarm_release()
+
+        prepare.assert_not_called()
+
+    def test_prewarm_command_emits_structured_failure_with_timing(self):
+        with (
+            mock.patch.object(
+                update,
+                "prewarm_release",
+                side_effect=RuntimeError("contract mismatch"),
+            ),
+            mock.patch("builtins.print") as output,
+            self.assertRaises(SystemExit) as stopped,
+        ):
+            update.update_command(["prewarm"])
+
+        self.assertEqual(stopped.exception.code, 2)
+        marker = output.call_args.args[0]
+        self.assertTrue(marker.startswith(update.PREWARM_MARKER))
+        payload = json.loads(marker.removeprefix(update.PREWARM_MARKER))
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["detail"], "contract mismatch")
+        self.assertIn("total", payload["timings_seconds"])
 
     def test_default_waves_are_one_canary_then_batches_of_eight(self):
         waves = update._activation_waves(

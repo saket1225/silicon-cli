@@ -196,15 +196,23 @@ it with:
 silicon docker compose
 ```
 
-Build and publish the runtime image from this repo, then record the registry's
-immutable digest as `runtime_image` in the Stemcell's `silicon.info` before
-creating and pushing the matching stable Git tag:
+Publish the Python packages first. The runtime workflow then builds the exact
+CLI commit, stamps the runtime-contract digest into the OCI image, runs the
+complete dependency probe against the pushed immutable digest, and only then
+allows promotion. Record that verified digest and the contract metadata in the
+Stemcell's `silicon.info` before creating the matching stable Git tag:
 
 ```bash
-docker build -f docker/runtime/Dockerfile -t ghcr.io/teamofsilicons/silicon-runtime:<version> .
-docker push ghcr.io/teamofsilicons/silicon-runtime:<version>
-docker image inspect --format '{{json .RepoDigests}}' ghcr.io/teamofsilicons/silicon-runtime:<version>
+gh workflow run publish-runtime.yml --ref main -f promote_latest=false
+gh run watch
+# Copy the build's verified ghcr.io/...@sha256:<digest> into silicon.info.
+# In silicon-stemcell, validate that exact image before tagging:
+python scripts/verify_release_runtime.py
 ```
+
+Never publish the Stemcell tag before the package and runtime-image checks have
+completed. The CLI compares the small contract record before downloading image
+layers, so a release-order mismatch now fails quickly without fleet downtime.
 
 For local CLI, Silicon Browser, and Silicon Extend development, build their
 wheels into separate directories and layer them over the published runtime

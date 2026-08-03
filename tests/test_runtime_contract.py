@@ -53,7 +53,7 @@ class RuntimeContractTests(unittest.TestCase):
         )
         payload = {
             "failures": [],
-            "versions": {"silicon-cli": "1.0.28", "node": "v22.0.0"},
+            "versions": {"silicon-cli": "1.0.29", "node": "v22.0.0"},
         }
         with mock.patch.object(
             docker_runtime,
@@ -77,7 +77,23 @@ class RuntimeContractTests(unittest.TestCase):
         )
         self.assertIn(image, command)
         self.assertIn(runtime_contract.DOCKER_PROBE_SCRIPT, command)
-        self.assertEqual(versions["silicon-cli"], "1.0.28")
+        self.assertEqual(versions["silicon-cli"], "1.0.29")
+
+    def test_release_contract_metadata_is_stable_and_fail_closed(self):
+        metadata = runtime_contract.release_contract_metadata()
+
+        self.assertEqual(metadata["schema"], 1)
+        self.assertEqual(metadata["silicon_cli"], "1.0.29")
+        self.assertEqual(metadata["silicon_extend"], "0.1.4")
+        self.assertEqual(len(metadata["sha256"]), 64)
+        self.assertEqual(
+            runtime_contract.verify_release_contract_metadata(metadata),
+            metadata,
+        )
+        with self.assertRaisesRegex(RuntimeError, "before image download"):
+            runtime_contract.verify_release_contract_metadata(
+                {**metadata, "silicon_extend": "0.1.3"}
+            )
 
     def test_docker_runtime_probe_fails_closed_on_outdated_dependency(self):
         image = (

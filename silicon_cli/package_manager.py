@@ -10,6 +10,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -33,8 +34,8 @@ from .config import (
     SILICON_INTERFACE_CLI_RELEASE_URL,
     SILICON_INTERFACE_CLI_VERSION,
     STEMCELL_GIT_URL,
-    active_release_root,
     active_environment_python,
+    active_release_root,
 )
 from .host_lock import HostFileLock
 from .updater.release import resolve_latest_published_git_release
@@ -674,6 +675,7 @@ def _update_package_unlocked(
     *,
     silicon_ids: set[str] | None = None,
 ) -> dict:
+    package_started = time.monotonic()
     spec = PACKAGE_BY_KEY.get(package_key)
     if spec is None:
         raise RuntimeError(
@@ -700,8 +702,9 @@ def _update_package_unlocked(
         names = ",".join(
             dict.fromkeys(install.name for install in release_targets)
         )
+        update_started = time.monotonic()
         try:
-            update.update_instance(names)
+            update_result = update.update_instance(names)
         except SystemExit as exc:
             code = int(exc.code or 1)
             steps.append(
@@ -710,6 +713,9 @@ def _update_package_unlocked(
                     "status": "done" if code == 0 else "failed",
                     "returncode": code,
                     "detail": "",
+                    "timings_seconds": {
+                        "total": round(time.monotonic() - update_started, 3)
+                    },
                 }
             )
         except Exception as exc:
@@ -718,10 +724,28 @@ def _update_package_unlocked(
                     "step": "git-release",
                     "status": "failed",
                     "detail": str(exc),
+                    "timings_seconds": {
+                        "total": round(time.monotonic() - update_started, 3)
+                    },
                 }
             )
         else:
-            steps.append({"step": "git-release", "status": "done"})
+            steps.append(
+                {
+                    "step": "git-release",
+                    "status": "done",
+                    "timings_seconds": (
+                        update_result.get("timings_seconds", {})
+                        if isinstance(update_result, dict)
+                        else {
+                            "total": round(
+                                time.monotonic() - update_started,
+                                3,
+                            )
+                        }
+                    ),
+                }
+            )
 
     interface_source_script = ""
     if package_key != "silicon":
@@ -800,6 +824,9 @@ def _update_package_unlocked(
         "status": "succeeded" if not failed else "partial",
         "steps": steps,
         "installations": [install.name for install in installs],
+        "timings_seconds": {
+            "total": round(time.monotonic() - package_started, 3),
+        },
     }
 
 
