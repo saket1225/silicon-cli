@@ -1896,6 +1896,7 @@ def update_cli() -> None:
             "pip",
             "--disable-pip-version-check",
             "--no-input",
+            "--no-cache-dir",
             "install",
             "--upgrade",
             "silicon-cli",

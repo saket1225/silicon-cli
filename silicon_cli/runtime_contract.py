@@ -325,7 +325,7 @@ for command in contract["commands"]:
             capture_output=True,
             text=True,
             check=False,
-            timeout=20,
+            timeout=60,
         )
     except Exception as exc:
         failures.append("%s: %s" % (command, exc))

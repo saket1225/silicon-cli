@@ -290,6 +290,7 @@ class PackageManagerTests(unittest.TestCase):
                 "pip",
                 "--disable-pip-version-check",
                 "--no-input",
+                "--no-cache-dir",
                 "install",
                 "--upgrade",
                 "silicon-cli",

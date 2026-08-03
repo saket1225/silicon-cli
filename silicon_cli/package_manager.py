@@ -637,6 +637,7 @@ def _update_host_package(spec: PackageSpec) -> dict:
                 "pip",
                 "--disable-pip-version-check",
                 "--no-input",
+                "--no-cache-dir",
                 "install",
                 "--upgrade",
                 spec.package,
