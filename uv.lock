@@ -1118,7 +1118,7 @@ wheels = [
 
 [[package]]
 name = "silicon-cli"
-version = "1.0.26"
+version = "1.0.27"
 source = { editable = "." }
 dependencies = [
     { name = "certifi" },

@@ -229,6 +229,55 @@ class RegistryDurabilityTests(unittest.TestCase):
 
 
 class PullOrchestrationTests(unittest.TestCase):
+    def test_docker_pull_prebuilds_and_binds_environment_before_start(self):
+        final = self.root / "instances" / "ada"
+        release = final / ".silicon" / "releases" / "generation-1"
+        environment = final / ".silicon" / "environments" / "environment-1"
+        release.mkdir(parents=True)
+        environment.mkdir(parents=True)
+        generation = {
+            "kind": "immutable-release",
+            "environment_path": "",
+        }
+        store = mock.Mock()
+        store.current.return_value = generation
+        store.resolve_release.return_value = release
+        journal = SimpleNamespace(
+            transaction_id="pull-1",
+            value={"runtime_image": "image@sha256:" + "a" * 64},
+        )
+        item = {"name": "ada", "final_path": str(final)}
+        install = registry.Install(
+            0,
+            "ada",
+            str(final),
+            str(final / ".silicon.pid"),
+            "docker",
+            image=journal.value["runtime_image"],
+        )
+
+        with (
+            mock.patch.object(sync, "GenerationStore", return_value=store),
+            mock.patch.object(
+                sync.docker_runtime,
+                "prepare_environment",
+                return_value=environment,
+            ) as prepare,
+            mock.patch.object(sync.ui, "info"),
+        ):
+            sync._prepare_pulled_docker_runtime(journal, item, install)
+
+        prepare.assert_called_once_with(
+            install,
+            release,
+            image=journal.value["runtime_image"],
+        )
+        restored = store.restore.call_args.args[0]
+        self.assertEqual(
+            restored["environment_path"],
+            ".silicon/environments/environment-1",
+        )
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
@@ -569,6 +618,7 @@ class PullOrchestrationTests(unittest.TestCase):
             mock.patch.object(
                 sync, "_refresh_team_pull_claim_credentials"
             ),
+            mock.patch.object(sync.interface_cli, "setup", return_value=True),
             self.assertRaisesRegex(RuntimeError, "rerun the same pull"),
         ):
             sync._execute_planned_pull(

@@ -1726,6 +1726,46 @@ def _register_pulled_item(
     return install
 
 
+def _prepare_pulled_docker_runtime(
+    journal: pull_transaction.PullJournal,
+    item: dict,
+    install: registry.Install,
+) -> None:
+    """Build and bind the Linux dependency environment before first boot."""
+
+    final = Path(item["final_path"]).resolve()
+    transaction_id = str(
+        getattr(journal, "transaction_id", "") or "pull-runtime"
+    )
+    with InstanceLock(final, f"{transaction_id}-runtime"):
+        store = GenerationStore(final)
+        generation = store.current()
+        release = store.resolve_release(generation)
+        ui.info(
+            f"Prebuilding Docker runtime dependencies for '{item['name']}'..."
+        )
+        environment = docker_runtime.prepare_environment(
+            install,
+            release,
+            image=str(journal.value.get("runtime_image") or install.image or ""),
+        )
+        if environment is None:
+            return
+        relative = environment.resolve().relative_to(final).as_posix()
+        expected_prefix = ".silicon/environments/"
+        if not relative.startswith(expected_prefix):
+            raise RuntimeError(
+                "prepared Docker dependency environment escaped its generation store"
+            )
+        if generation.get("environment_path") == relative:
+            return
+        updated = dict(generation)
+        updated["environment_path"] = relative
+        # Restore republishes the already-authenticated generation metadata
+        # without creating a false rollback edge in generation history.
+        store.restore(updated)
+
+
 def _finish_pull(journal: pull_transaction.PullJournal) -> None:
     if journal.state == "CLAIM_COMMITTED":
         journal.set_state("POSTCOMMIT")
@@ -1743,6 +1783,16 @@ def _finish_pull(journal: pull_transaction.PullJournal) -> None:
             # Docker registration atomically renders the compose interface.
             journal.update_item(index, interface_attempted=True)
         if not item["started"]:
+            install = registry.find(item["name"])
+            if install is None:
+                raise RuntimeError(
+                    f"could not resolve pulled Silicon '{item['name']}'"
+                )
+            if (
+                journal.value["runtime"] == "docker"
+                and journal.value.get("runtime_image")
+            ):
+                _prepare_pulled_docker_runtime(journal, item, install)
             process.start_one(item["name"])
             install = registry.find(item["name"])
             if install is None or not process.install_is_running(install):

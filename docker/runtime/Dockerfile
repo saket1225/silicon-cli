@@ -1,11 +1,11 @@
 # syntax=docker/dockerfile:1.24.0@sha256:87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89
 FROM node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3
 
-ARG SILICON_CLI_SPEC=silicon-cli==1.0.26
+ARG SILICON_CLI_SPEC=silicon-cli==1.0.27
 ARG SILICON_BROWSER_SPEC=silicon-browser==1.1.1
 ARG SILICON_EXTEND_SPEC=silicon-extend==0.1.3
-ARG SILICON_INTERFACE_CLI_URL=https://github.com/teamofsilicons/silicon-interface-web/releases/download/interface-cli-v2.0.3/teamofsilicons-silicon-interface-cli-2.0.3.tgz
-ARG SILICON_INTERFACE_CLI_SHA256=99ce21f080cc7a54e8e96a9ff7d358955a41a96e4e1d0f833a201fbcc900bf22
+ARG SILICON_INTERFACE_CLI_URL=https://github.com/teamofsilicons/silicon-interface-web/releases/download/interface-cli-v2.0.4/teamofsilicons-silicon-interface-cli-2.0.4.tgz
+ARG SILICON_INTERFACE_CLI_SHA256=75c6c5439ef7f5d62635408f00ad9314999d397b844175e3dfcecbf822391073
 ARG CLAUDE_CODE_SPEC=@anthropic-ai/claude-code@2.1.220
 ARG CODEX_SPEC=@openai/codex@0.146.0
 ARG PIP_SPEC=pip==26.2
@@ -61,10 +61,14 @@ RUN curl --fail --location --silent --show-error \
     "${CODEX_SPEC}"
 
 COPY docker/runtime/activate-interface-cli.py /usr/local/libexec/silicon-activate-interface-cli.py
+COPY docker/runtime/runtime-healthcheck.py /usr/local/libexec/silicon-runtime-healthcheck.py
 COPY docker/runtime/runtime-entrypoint.sh /usr/local/bin/silicon-runtime-entrypoint
 RUN chmod 0555 \
         /usr/local/libexec/silicon-activate-interface-cli.py \
+        /usr/local/libexec/silicon-runtime-healthcheck.py \
         /usr/local/bin/silicon-runtime-entrypoint
 
 WORKDIR /silicon
+HEALTHCHECK --interval=15s --timeout=5s --start-period=120s --retries=4 \
+  CMD ["python3", "/usr/local/libexec/silicon-runtime-healthcheck.py"]
 ENTRYPOINT ["tini", "--", "/usr/local/bin/silicon-runtime-entrypoint"]

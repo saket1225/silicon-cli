@@ -28,17 +28,17 @@ class PackageManagerTests(unittest.TestCase):
     def test_interface_release_asset_metadata_is_pinned(self):
         spec = package_manager.PACKAGE_BY_KEY["silicon-interface"]
 
-        self.assertEqual(package_manager.SILICON_INTERFACE_CLI_VERSION, "2.0.3")
+        self.assertEqual(package_manager.SILICON_INTERFACE_CLI_VERSION, "2.0.4")
         self.assertEqual(
             package_manager.SILICON_INTERFACE_CLI_RELEASE_URL,
             "https://github.com/teamofsilicons/silicon-interface-web/"
-            "releases/download/interface-cli-v2.0.3/"
-            "teamofsilicons-silicon-interface-cli-2.0.3.tgz",
+            "releases/download/interface-cli-v2.0.4/"
+            "teamofsilicons-silicon-interface-cli-2.0.4.tgz",
         )
         self.assertEqual(
             package_manager.SILICON_INTERFACE_CLI_RELEASE_SHA256,
-            "99ce21f080cc7a54e8e96a9ff7d35895"
-            "5a41a96e4e1d0f833a201fbcc900bf22",
+            "75c6c5439ef7f5d62635408f00ad9314"
+            "999d397b844175e3dfcecbf822391073",
         )
         self.assertEqual(spec.latest_source, "embedded")
 
@@ -165,7 +165,7 @@ class PackageManagerTests(unittest.TestCase):
 
     def test_interface_package_update_installs_verified_release_asset(self):
         alpha = _install("alpha", "docker")
-        payload = b"immutable Interface CLI 2.0.3 release asset"
+        payload = b"immutable Interface CLI 2.0.4 release asset"
         observed: dict[str, object] = {}
 
         def urlopen(request, **kwargs):
@@ -198,7 +198,7 @@ class PackageManagerTests(unittest.TestCase):
                 ):
                     return SimpleNamespace(
                         returncode=0,
-                        stdout="2.0.3\n",
+                        stdout="2.0.4\n",
                         stderr="",
                     )
                 observed["command"] = command
@@ -271,7 +271,7 @@ class PackageManagerTests(unittest.TestCase):
                 "--no-fund",
             ],
         )
-        self.assertTrue(command[-1].endswith("silicon-interface-cli-2.0.3.tgz"))
+        self.assertTrue(command[-1].endswith("silicon-interface-cli-2.0.4.tgz"))
         self.assertNotIn("@latest", " ".join(command))
         self.assertNotIn(
             package_manager.PACKAGE_BY_KEY["silicon-interface"].package,

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -365,6 +368,9 @@ class DockerRuntimeTests(unittest.TestCase):
         self.assertIn(f'{Path(cfg["shared_home"]).resolve()}:/silicon-shared-home', compose)
         self.assertIn("SILICON_SHARED_HOME", compose)
         self.assertIn("example/silicon:latest", compose)
+        self.assertIn("healthcheck:", compose)
+        self.assertIn("silicon-runtime-healthcheck.py", compose)
+        self.assertIn("start_period: 120s", compose)
 
     def test_enabled_is_false_inside_container(self):
         self.write_docker_config()
@@ -508,15 +514,15 @@ class DockerRuntimeTests(unittest.TestCase):
             "87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89",
             "FROM node:22-bookworm-slim@sha256:"
             "6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3",
-            "ARG SILICON_CLI_SPEC=silicon-cli==1.0.26",
+            "ARG SILICON_CLI_SPEC=silicon-cli==1.0.27",
             "ARG SILICON_BROWSER_SPEC=silicon-browser==1.1.1",
             "ARG SILICON_EXTEND_SPEC=silicon-extend==0.1.3",
             "ARG SILICON_INTERFACE_CLI_URL="
             "https://github.com/teamofsilicons/silicon-interface-web/releases/"
-            "download/interface-cli-v2.0.3/"
-            "teamofsilicons-silicon-interface-cli-2.0.3.tgz",
+            "download/interface-cli-v2.0.4/"
+            "teamofsilicons-silicon-interface-cli-2.0.4.tgz",
             "ARG SILICON_INTERFACE_CLI_SHA256="
-            "99ce21f080cc7a54e8e96a9ff7d358955a41a96e4e1d0f833a201fbcc900bf22",
+            "75c6c5439ef7f5d62635408f00ad9314999d397b844175e3dfcecbf822391073",
             "ARG CLAUDE_CODE_SPEC=@anthropic-ai/claude-code@2.1.220",
             "ARG CODEX_SPEC=@openai/codex@0.146.0",
             "ARG PIP_SPEC=pip==26.2",
@@ -1165,6 +1171,119 @@ class DockerRuntimeTests(unittest.TestCase):
         handler = text.split("terminate_runtime()", 1)[1].split("}", 1)[0]
         self.assertIn("stop_runtime", handler)
         self.assertIn("exit 0", handler)
+
+    @unittest.skipIf(os.name == "nt", "Unix sockets are required by the runtime")
+    def test_image_healthcheck_requires_fresh_main_and_daemon_rpc(self):
+        root = self.root / "health-instance"
+        state = root / ".silicon"
+        release = state / "releases" / "generation-1"
+        interface_state = root / ".silicon-interface"
+        release.mkdir(parents=True)
+        interface_state.mkdir(parents=True)
+        (release / "main.py").write_text("", encoding="utf-8")
+        (state / "current.json").write_text(
+            json.dumps(
+                {
+                    "kind": "immutable-release",
+                    "release_path": ".silicon/releases/generation-1",
+                }
+            ),
+            encoding="utf-8",
+        )
+        process_id = os.getpid()
+        (root / ".silicon.pid").write_text(f"{process_id}\n", encoding="utf-8")
+        (root / ".silicon.pid.meta.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "supervisor_pid": process_id,
+                    "child_pid": process_id,
+                    "generation": str(release.resolve()),
+                }
+            ),
+            encoding="utf-8",
+        )
+        now = time.time()
+        health_file = state / "runtime-health.json"
+        health_file.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "pid": process_id,
+                    "code_root": str(release.resolve()),
+                    "ready": True,
+                    "ready_at": now - 1,
+                    "heartbeat_at": now,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (interface_state / "daemon.pid").write_text(
+            f"{process_id}\n",
+            encoding="utf-8",
+        )
+        rpc_path = Path("/tmp") / (
+            "silicon-health-"
+            + hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
+            + ".sock"
+        )
+        (interface_state / "daemon-rpc.json").write_text(
+            json.dumps({"version": 1, "socket": str(rpc_path)}),
+            encoding="utf-8",
+        )
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(rpc_path))
+        server.listen(2)
+
+        def serve():
+            for _ in range(2):
+                connection, _address = server.accept()
+                with connection:
+                    request = b""
+                    while b"\n" not in request:
+                        request += connection.recv(4096)
+                    value = json.loads(request.split(b"\n", 1)[0])
+                    connection.sendall(
+                        (
+                            json.dumps(
+                                {
+                                    "version": 1,
+                                    "id": value["id"],
+                                    "ok": True,
+                                    "result": {
+                                        "running": True,
+                                        "pid": process_id,
+                                    },
+                                }
+                            )
+                            + "\n"
+                        ).encode("utf-8")
+                    )
+            server.close()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        script = (
+            Path(__file__).resolve().parents[1]
+            / "docker"
+            / "runtime"
+            / "runtime-healthcheck.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "runtime_healthcheck_test",
+            script,
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.ROOT = root.resolve()
+
+        self.assertEqual(module.main(), 0)
+        stale = json.loads(health_file.read_text(encoding="utf-8"))
+        stale["heartbeat_at"] = time.time() - 120
+        health_file.write_text(json.dumps(stale), encoding="utf-8")
+        self.assertEqual(module.main(), 1)
+        thread.join(1)
+        rpc_path.unlink(missing_ok=True)
 
     def test_runtime_entrypoint_validates_the_resolved_generation(self):
         entrypoint = (
