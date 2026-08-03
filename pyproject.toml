@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "silicon-cli"
-version = "1.0.29"
+version = "1.0.30"
 description = "Silicon CLI — create, run, and manage your silicon instances."
 readme = "README.md"
 requires-python = ">=3.9"

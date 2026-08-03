@@ -7,12 +7,16 @@ import os
 import shutil
 import tarfile
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
 from silicon_cli.config import active_release_root
+from silicon_cli.updater import cache as cache_module
 from silicon_cli.updater import generation as generation_module
 from silicon_cli.updater import overlay as overlay_module
 from silicon_cli.updater.cache import ReleaseCache, runtime_platform_identity
@@ -24,8 +28,11 @@ from silicon_cli.updater.engine import (
 )
 from silicon_cli.updater.generation import GenerationError
 from silicon_cli.updater.io import hash_tree
-from silicon_cli.updater.journal import FailpointCrash, TransactionJournal
-from silicon_cli.updater.journal import JournalCorruption
+from silicon_cli.updater.journal import (
+    FailpointCrash,
+    JournalCorruption,
+    TransactionJournal,
+)
 from silicon_cli.updater.lock import InstanceLock, UpdateLocked
 from silicon_cli.updater.maintenance import MaintenanceProtocol
 from silicon_cli.updater.overlay import OverlayStore
@@ -154,6 +161,78 @@ class Fixture:
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_parallel_release_cache_operations_wait_for_the_shared_lock(self):
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = Fixture(Path(raw))
+            store_entered = threading.Event()
+            allow_store = threading.Event()
+            original_store = fixture.cache._store_locked
+
+            def slow_store(release):
+                if not store_entered.is_set():
+                    store_entered.set()
+                    self.assertTrue(allow_store.wait(2))
+                return original_store(release)
+
+            with (
+                mock.patch.object(
+                    fixture.cache,
+                    "_store_locked",
+                    side_effect=slow_store,
+                ),
+                ThreadPoolExecutor(max_workers=2) as executor,
+            ):
+                first_store = executor.submit(
+                    fixture.cache.store, fixture.release
+                )
+                self.assertTrue(store_entered.wait(2))
+                second_store = executor.submit(
+                    fixture.cache.store, fixture.release
+                )
+                time.sleep(0.05)
+                self.assertFalse(second_store.done())
+                allow_store.set()
+                cached = first_store.result(timeout=2)
+                self.assertEqual(
+                    second_store.result(timeout=2).manifest,
+                    cached.manifest,
+                )
+
+            extract_entered = threading.Event()
+            allow_extract = threading.Event()
+            original_extract = cache_module.safe_extract
+
+            def slow_extract(*args, **kwargs):
+                if not extract_entered.is_set():
+                    extract_entered.set()
+                    self.assertTrue(allow_extract.wait(2))
+                return original_extract(*args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    cache_module,
+                    "safe_extract",
+                    side_effect=slow_extract,
+                ),
+                ThreadPoolExecutor(max_workers=2) as executor,
+            ):
+                first_extract = executor.submit(
+                    fixture.cache.materialize,
+                    cached,
+                    fixture.root / "extract-one",
+                )
+                self.assertTrue(extract_entered.wait(2))
+                second_extract = executor.submit(
+                    fixture.cache.materialize,
+                    cached,
+                    fixture.root / "extract-two",
+                )
+                time.sleep(0.05)
+                self.assertFalse(second_extract.done())
+                allow_extract.set()
+                first_extract.result(timeout=2)
+                second_extract.result(timeout=2)
+
     def test_artifact_has_exact_identity_and_detects_tampering(self):
         with tempfile.TemporaryDirectory() as raw:
             fixture = Fixture(Path(raw))

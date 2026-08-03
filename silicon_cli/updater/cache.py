@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable
 
 from .io import atomic_write_json, fsync_dir, read_json, sha256_file
-from .lock import InstanceLock, UpdateLocked
+from .lock import AdvisoryFileLock, InstanceLock, UpdateLocked
 from .release import (
     FetchedRelease,
     ReleaseManifest,
@@ -29,6 +29,21 @@ class ReleaseCache:
         self.root = Path(root)
         self.releases = self.root / "releases"
         self.environments = self.root / "environments"
+
+    def _operation_lock(self, label: str) -> AdvisoryFileLock:
+        """Serialize shared-cache mutations without rejecting peer workers.
+
+        Fleet preflight intentionally runs in parallel.  A non-blocking
+        ``InstanceLock`` made those workers interpret ordinary cache
+        contention as a conflicting update, so every worker except the first
+        failed before activation.  The cache is shared infrastructure, not an
+        instance transaction: callers must wait briefly for it instead.
+        """
+
+        return AdvisoryFileLock(
+            self.root / ".silicon" / "update.lock",
+            label=label,
+        )
 
     @staticmethod
     def _real_directory(path: Path, *, create: bool = False) -> Path:
@@ -79,9 +94,9 @@ class ReleaseCache:
 
     def store(self, fetched: FetchedRelease) -> FetchedRelease:
         self._real_directory(self.root, create=True)
-        with InstanceLock(
-            self.root,
-            f"cache-store-{fetched.manifest.identity.tree_sha256[:16]}",
+        with self._operation_lock(
+            "release cache store "
+            f"{fetched.manifest.identity.tree_sha256[:16]}",
         ):
             return self._store_locked(fetched)
 
@@ -136,7 +151,9 @@ class ReleaseCache:
 
     def load(self, tree_sha256: str) -> FetchedRelease:
         self._real_directory(self.root, create=True)
-        with InstanceLock(self.root, f"cache-load-{tree_sha256[:16]}"):
+        with self._operation_lock(
+            f"release cache load {tree_sha256[:16]}"
+        ):
             release_dir = self._release_directory(tree_sha256, create=False)
             manifest_path = release_dir / "manifest.json"
             artifact = release_dir / "release.tar"
@@ -153,9 +170,9 @@ class ReleaseCache:
     def materialize(self, release: FetchedRelease, destination: Path) -> None:
         self._real_directory(self.root, create=True)
         self._regular_file(Path(release.artifact))
-        with InstanceLock(
-            self.root,
-            f"cache-extract-{release.manifest.identity.tree_sha256[:16]}",
+        with self._operation_lock(
+            "release cache extract "
+            f"{release.manifest.identity.tree_sha256[:16]}",
         ):
             safe_extract(release.artifact, destination, release.manifest)
 
