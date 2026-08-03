@@ -103,7 +103,7 @@ def _run_version(command: str) -> tuple[bool, str]:
             capture_output=True,
             text=True,
             check=False,
-            timeout=20,
+            timeout=60,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return False, str(exc)

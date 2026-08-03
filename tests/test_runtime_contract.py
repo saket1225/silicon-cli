@@ -77,6 +77,7 @@ class RuntimeContractTests(unittest.TestCase):
         )
         self.assertIn(image, command)
         self.assertIn(runtime_contract.DOCKER_PROBE_SCRIPT, command)
+        self.assertIn("timeout=60", runtime_contract.DOCKER_PROBE_SCRIPT)
         self.assertEqual(versions["silicon-cli"], "1.0.29")
 
     def test_release_contract_metadata_is_stable_and_fail_closed(self):
