@@ -113,6 +113,53 @@ class DockerRuntimeTests(unittest.TestCase):
 
         self.assertEqual(cfg["image"], "")
 
+    def test_full_stop_falls_back_when_restart_loop_blocks_exec(self):
+        cfg = self.write_docker_config()
+        instance = self.root / "silicons" / "ada"
+        instance.mkdir(parents=True)
+        inst = registry.Install(
+            0,
+            "ada",
+            str(instance),
+            str(instance / ".silicon.pid"),
+            "docker",
+        )
+        with (
+            mock.patch.object(
+                docker_runtime, "container_running", return_value=True
+            ),
+            mock.patch.object(
+                docker_runtime,
+                "_exec_silicon",
+                side_effect=subprocess.TimeoutExpired("docker exec", 30),
+            ) as exec_silicon,
+            mock.patch.object(
+                docker_runtime,
+                "_run",
+                return_value=SimpleNamespace(returncode=0),
+            ) as run,
+            mock.patch.object(ui, "warn") as warn,
+            mock.patch.object(ui, "success"),
+        ):
+            docker_runtime.stop_one(inst, full=True)
+
+        exec_silicon.assert_called_once_with(
+            inst,
+            ["stop", "--full", "ada"],
+            timeout=docker_runtime.FULL_STOP_EXEC_TIMEOUT_SECONDS,
+        )
+        run.assert_called_once_with(
+            [
+                "docker",
+                "compose",
+                "-f",
+                cfg["compose_file"],
+                "stop",
+                docker_runtime.service_name("ada"),
+            ]
+        )
+        warn.assert_called_once()
+
     def test_generation_pointer_symlinks_never_downgrade_to_flat_code(self):
         instance = self.root / "silicons" / "ada"
         state = instance / ".silicon"

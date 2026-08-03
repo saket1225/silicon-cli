@@ -33,6 +33,7 @@ AUTH_FILE = ".silicon-auth.json"
 AUTH_PROVIDERS = {"claude", "codex"}
 UNPINNED_IMAGE_OPT_IN = "SILICON_DOCKER_ALLOW_UNPINNED_IMAGE"
 SILICON_EXTEND_VERSION = "0.1.4"
+FULL_STOP_EXEC_TIMEOUT_SECONDS = 30.0
 
 _CONTAINER_PROCESS_IDENTITY_HELPER = r"""
 def _process_birth_identity(process_id):
@@ -994,14 +995,22 @@ def ensure_pull_runtime() -> bool:
     return True
 
 
-def _run(cmd: list[str], *, check: bool = False, capture: bool = False) -> subprocess.CompletedProcess:
+def _run(
+    cmd: list[str],
+    *,
+    check: bool = False,
+    capture: bool = False,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess:
     try:
-        return subprocess.run(
-            cmd,
-            check=check,
-            text=True,
-            capture_output=capture,
-        )
+        kwargs = {
+            "check": check,
+            "text": True,
+            "capture_output": capture,
+        }
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        return subprocess.run(cmd, **kwargs)
     except FileNotFoundError:
         ui.error(f"Command not found: {cmd[0]}")
         sys.exit(127)
@@ -1272,8 +1281,18 @@ def _wait_for_container(inst: registry.Install, seconds: float = 20.0) -> bool:
     return False
 
 
-def _exec_silicon(inst: registry.Install, args: list[str], *, check: bool = False) -> subprocess.CompletedProcess:
-    return _run(_exec_args(inst, ["silicon", *args]), check=check)
+def _exec_silicon(
+    inst: registry.Install,
+    args: list[str],
+    *,
+    check: bool = False,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess:
+    return _run(
+        _exec_args(inst, ["silicon", *args]),
+        check=check,
+        timeout=timeout,
+    )
 
 
 def maintenance_command(
@@ -2128,7 +2147,17 @@ def stop_one(inst: registry.Install, *, full: bool = False) -> None:
     svc = inst.service or service_name(inst.name)
     if full:
         if container_running(inst):
-            _exec_silicon(inst, ["stop", "--full", inst.name])
+            try:
+                _exec_silicon(
+                    inst,
+                    ["stop", "--full", inst.name],
+                    timeout=FULL_STOP_EXEC_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired:
+                ui.warn(
+                    f"In-container stop for '{inst.name}' timed out; "
+                    "forcing the Compose stop so rollback can continue."
+                )
         _run([*_compose_args(inst), "stop", svc])
         ui.success(f"'{inst.name}' container stopped.")
         return
