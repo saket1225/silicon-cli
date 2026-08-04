@@ -20,6 +20,7 @@ from .io import (
 from .policy import RUNTIME_EXACT, RUNTIME_PREFIXES, is_runtime_path
 
 MAX_OVERLAY_MANIFEST_BYTES = 256 * 1024 * 1024
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
 class OverlayError(RuntimeError):
@@ -123,6 +124,31 @@ def _inventory(root: Path, *, local: bool = False) -> dict[str, Path]:
             excluded_prefixes=RUNTIME_PREFIXES if local else {".git/"},
             excluded_names=RUNTIME_EXACT if local else set(),
         )
+    )
+
+
+def _is_authenticated_legacy_runtime_lock(
+    *,
+    relative: str,
+    digest: str,
+    size: object,
+    mode: object,
+) -> bool:
+    """Recognize the one runtime artifact admitted by old generations.
+
+    CLI releases before runtime-state filtering could seal empty lock files
+    into an otherwise authenticated generation.  Recovery must be able to
+    reconstruct that exact historical tree before recapturing it under the
+    current policy.  Keep this exception intentionally narrower than the
+    runtime-path policy: no state payloads, tombstones, or arbitrary files.
+    """
+
+    return (
+        relative.startswith("core/interface_state/")
+        and relative.endswith(".lock")
+        and digest == EMPTY_SHA256
+        and size == 0
+        and mode == 0o644
     )
 
 
@@ -278,7 +304,12 @@ class OverlayStore:
         _digest(value.get("base_tree_sha256"), "overlay base tree")
         return value
 
-    def verify(self, root_hash: str) -> dict:
+    def verify(
+        self,
+        root_hash: str,
+        *,
+        allow_authenticated_legacy_runtime_locks: bool = False,
+    ) -> dict:
         value = self.load(root_hash)
         _require_real_directory(
             self.root / "objects",
@@ -305,9 +336,18 @@ class OverlayStore:
             digest = str(entry["sha256"])
             size = entry["size"]
             mode = entry["mode"]
+            authenticated_legacy_lock = (
+                allow_authenticated_legacy_runtime_locks
+                and _is_authenticated_legacy_runtime_lock(
+                    relative=rel,
+                    digest=digest,
+                    size=size,
+                    mode=mode,
+                )
+            )
             if (
                 rel in paths
-                or is_runtime_path(rel)
+                or (is_runtime_path(rel) and not authenticated_legacy_lock)
                 or _unsafe_digest(digest)
                 or not isinstance(size, int)
                 or isinstance(size, bool)
@@ -362,8 +402,19 @@ class OverlayStore:
             raise OverlayError("invalid customization tombstones")
         return value
 
-    def apply(self, root_hash: str, destination: Path) -> None:
-        value = self.verify(root_hash)
+    def apply(
+        self,
+        root_hash: str,
+        destination: Path,
+        *,
+        allow_authenticated_legacy_runtime_locks: bool = False,
+    ) -> None:
+        value = self.verify(
+            root_hash,
+            allow_authenticated_legacy_runtime_locks=(
+                allow_authenticated_legacy_runtime_locks
+            ),
+        )
         root = destination.resolve(strict=True)
         for rel in value["tombstones"]:
             target = root / rel

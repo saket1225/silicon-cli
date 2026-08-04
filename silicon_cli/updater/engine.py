@@ -1341,7 +1341,11 @@ class TransactionalUpdater:
             )
         shutil.rmtree(destination, ignore_errors=True)
         self.cache.materialize(release, destination)
-        self.overlays.apply(overlay_hash, destination)
+        self.overlays.apply(
+            overlay_hash,
+            destination,
+            allow_authenticated_legacy_runtime_locks=True,
+        )
         actual, _files = hash_tree(destination)
         if actual != expected:
             shutil.rmtree(destination, ignore_errors=True)

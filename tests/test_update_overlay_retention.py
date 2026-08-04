@@ -23,6 +23,98 @@ def write(root: Path, relative: str, value: str) -> None:
 
 
 class OverlayTests(unittest.TestCase):
+    def _legacy_runtime_lock_overlay(
+        self,
+        instance: Path,
+        *,
+        relative: str = "core/interface_state/contacts.json.lock",
+        payload: bytes = b"",
+    ) -> tuple[OverlayStore, str]:
+        store = OverlayStore(instance)
+        digest = hashlib.sha256(payload).hexdigest()
+        source = store.objects / digest[:2] / digest[2:]
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(payload)
+        os.chmod(source, 0o400)
+        body = {
+            "schema": 1,
+            "base_tree_sha256": "a" * 64,
+            "files": [
+                {
+                    "path": relative,
+                    "sha256": digest,
+                    "size": len(payload),
+                    "mode": 0o644,
+                }
+            ],
+            "tombstones": [],
+        }
+        encoded = json.dumps(
+            body,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        root_hash = hashlib.sha256(encoded).hexdigest()
+        manifest = {**body, "root_hash": root_hash}
+        store.manifests.mkdir(parents=True, exist_ok=True)
+        (store.manifests / f"{root_hash}.json").write_text(
+            json.dumps(manifest),
+            encoding="utf-8",
+        )
+        return store, root_hash
+
+    def test_only_authenticated_empty_legacy_runtime_locks_can_be_rebuilt(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            destination = root / "destination"
+            destination.mkdir()
+            store, root_hash = self._legacy_runtime_lock_overlay(
+                root / "instance"
+            )
+
+            with self.assertRaisesRegex(
+                OverlayError, "duplicate or forbidden customization"
+            ):
+                store.verify(root_hash)
+
+            store.apply(
+                root_hash,
+                destination,
+                allow_authenticated_legacy_runtime_locks=True,
+            )
+            self.assertEqual(
+                (
+                    destination
+                    / "core/interface_state/contacts.json.lock"
+                ).read_bytes(),
+                b"",
+            )
+
+            nonempty, nonempty_hash = self._legacy_runtime_lock_overlay(
+                root / "nonempty",
+                payload=b"runtime state",
+            )
+            with self.assertRaisesRegex(
+                OverlayError, "duplicate or forbidden customization"
+            ):
+                nonempty.verify(
+                    nonempty_hash,
+                    allow_authenticated_legacy_runtime_locks=True,
+                )
+
+            state_file, state_hash = self._legacy_runtime_lock_overlay(
+                root / "state-file",
+                relative="core/interface_state/contacts.json",
+            )
+            with self.assertRaisesRegex(
+                OverlayError, "duplicate or forbidden customization"
+            ):
+                state_file.verify(
+                    state_hash,
+                    allow_authenticated_legacy_runtime_locks=True,
+                )
+
     def test_capture_from_manifest_matches_directory_capture(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
