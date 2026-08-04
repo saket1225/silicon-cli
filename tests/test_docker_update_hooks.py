@@ -743,4 +743,9 @@ class HeartbeatFreshnessTests(unittest.TestCase):
 
     def test_window_still_catches_a_stalled_runtime(self):
         # Generous, not unbounded: a runtime silent for this long is stuck.
-        self.assertLessEqual(update.HEARTBEAT_MAX_AGE_SECONDS, 120.0)
+        self.assertGreaterEqual(
+            update.HEARTBEAT_MAX_AGE_SECONDS,
+            180.0,
+            "fleet measurements reached 100 seconds under extreme CPU steal",
+        )
+        self.assertLessEqual(update.HEARTBEAT_MAX_AGE_SECONDS, 300.0)

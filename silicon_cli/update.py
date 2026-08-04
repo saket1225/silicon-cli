@@ -53,7 +53,12 @@ from .updater.release import FetchedRelease
 # observations -- so it passed on timing luck and failed outright on a busy
 # Silicon whose tick runs long. Allow several ticks, which still catches a
 # runtime that has genuinely stopped heartbeating.
-HEARTBEAT_MAX_AGE_SECONDS = 30.0
+# On a severely CPU-starved fleet host the live main loop has been observed to
+# go 79-100 seconds between heartbeats. Process birth identity, active
+# generation identity, readiness, and consecutive observations are checked
+# separately, so accepting up to three minutes of heartbeat delay avoids a
+# false rollback without treating a dead or replaced process as healthy.
+HEARTBEAT_MAX_AGE_SECONDS = 180.0
 
 HEALTH_BUDGET_SECONDS = 90.0
 # A saturated multi-container host can spend more than two minutes between
