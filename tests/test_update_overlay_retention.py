@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
+import stat
 import tempfile
 import time
 import unittest
 from pathlib import Path
 
+from silicon_cli import pull_transaction
 from silicon_cli.updater.journal import ORDERED_STATES, TransactionJournal
 from silicon_cli.updater.overlay import OverlayError, OverlayStore
 from silicon_cli.updater.retention import RetentionError, RetentionManager
-from silicon_cli import pull_transaction
 
 
 def write(root: Path, relative: str, value: str) -> None:
@@ -21,6 +23,47 @@ def write(root: Path, relative: str, value: str) -> None:
 
 
 class OverlayTests(unittest.TestCase):
+    def test_capture_from_manifest_matches_directory_capture(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            base = root / "base"
+            local = root / "local"
+            base.mkdir()
+            local.mkdir()
+            write(base, "main.py", "old\n")
+            write(base, "core/deleted.py", "delete me\n")
+            write(local, "main.py", "custom\n")
+            manifest = {}
+            for path in base.rglob("*"):
+                if not path.is_file():
+                    continue
+                relative = path.relative_to(base).as_posix()
+                manifest[relative] = {
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "size": path.stat().st_size,
+                    "mode": stat.S_IMODE(path.stat().st_mode),
+                }
+
+            from_directory = OverlayStore(root / "instance-a").capture(
+                base,
+                local,
+                base_tree_sha256="a" * 64,
+            )
+            from_manifest = OverlayStore(root / "instance-b").capture_from_manifest(
+                manifest,
+                local,
+                base_tree_sha256="a" * 64,
+            )
+
+            self.assertEqual(
+                OverlayStore(root / "instance-a").verify(
+                    from_directory["root_hash"]
+                ),
+                OverlayStore(root / "instance-b").verify(
+                    from_manifest["root_hash"]
+                ),
+            )
+
     def test_modified_file_and_tombstone_survive_release_gc(self):
         with tempfile.TemporaryDirectory() as raw:
             instance = Path(raw) / "instance"

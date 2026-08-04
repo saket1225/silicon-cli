@@ -309,10 +309,8 @@ class TransactionalUpdater:
                 "support; side-by-side activation would split mutable state"
             )
         self._validate_python_sources(candidate)
-        overlay_base = work / "overlay-base"
-        self.cache.materialize(cached, overlay_base)
-        overlay = self.overlays.capture(
-            overlay_base,
+        overlay = self.overlays.capture_from_manifest(
+            cached.manifest.files,
             candidate,
             base_tree_sha256=cached.manifest.identity.tree_sha256,
         )

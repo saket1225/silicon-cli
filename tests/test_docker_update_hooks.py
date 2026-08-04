@@ -398,7 +398,7 @@ class DockerUpdateHookTests(unittest.TestCase):
                 "glass_agent_running",
                 return_value=False,
             ),
-            mock.patch.object(update.time, "sleep"),
+            mock.patch.object(update.time, "sleep") as sleep,
         ):
             hooks = update._hooks(self.install)
             self.assertTrue(
@@ -412,6 +412,13 @@ class DockerUpdateHookTests(unittest.TestCase):
             self.install,
             min_uptime=5.0,
             max_heartbeat_age=update.HEARTBEAT_MAX_AGE_SECONDS,
+        )
+        self.assertTrue(sleep.call_args_list)
+        self.assertTrue(
+            all(
+                call.args == (update.DOCKER_HEALTH_POLL_SECONDS,)
+                for call in sleep.call_args_list
+            )
         )
 
     def test_maintenance_and_checkpoint_use_active_runtime_and_portable_paths(self):
@@ -490,6 +497,9 @@ class DockerUpdateHookTests(unittest.TestCase):
             maintenance_args[:5],
             ["-m", "core.maintenance", "--root", "/silicon", "request"],
         )
+        create_args = active_python.call_args_list[1].args[1]
+        self.assertIn("create_local_snapshot", create_args[1])
+        self.assertNotIn("verify_local_snapshot", create_args[1])
         verify_args = active_python.call_args_list[2].args[1]
         self.assertIn(
             "/silicon/.silicon/snapshots/manifests/" + "a" * 64 + ".json",
@@ -821,9 +831,9 @@ class HealthBudgetTests(unittest.TestCase):
     """
 
     def test_budgets_exceed_the_minimum_a_healthy_restart_needs(self):
-        # min_uptime (5s) + three observations 0.5s apart, with headroom for
-        # container start and the Glass round-trip during boot.
-        floor = 5.0 + 3 * 0.5
+        # min_uptime (5s) + three observations, with headroom for container
+        # start and the Glass round-trip during boot.
+        floor = 5.0 + 3 * update.DOCKER_HEALTH_POLL_SECONDS
         self.assertGreater(update.HEALTH_BUDGET_SECONDS, floor * 4)
         self.assertGreater(update.HEALTH_BUDGET_DOCKER_SECONDS, floor * 4)
 

@@ -8,6 +8,7 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -67,6 +68,15 @@ HEALTH_BUDGET_SECONDS = 90.0
 # five-minute ceiling still fails a genuinely broken boot promptly, while a
 # healthy fast boot returns as soon as the gate passes and pays no extra delay.
 HEALTH_BUDGET_DOCKER_SECONDS = 300.0
+DOCKER_HEALTH_POLL_SECONDS = 2.0
+# Fleet workers may drain and checkpoint in parallel, but Docker's control
+# plane becomes slower and less reliable when every worker recreates a
+# container at once on a shared-volume host. Keep the expensive stop/recreate
+# calls bounded independently from fleet concurrency.
+DOCKER_CONTROL_CONCURRENCY = 4
+_DOCKER_CONTROL_GATE = threading.BoundedSemaphore(
+    DOCKER_CONTROL_CONCURRENCY
+)
 DEFAULT_FLEET_CONCURRENCY = 8
 DEFAULT_FLEET_CANARY_COUNT = 1
 MAX_FLEET_CONCURRENCY = 64
@@ -266,11 +276,10 @@ def _local_hooks(inst: registry.Install) -> EngineHooks:
                 "import json,sys;"
                 "from pathlib import Path;"
                 "sys.path.insert(0,sys.argv[1]);"
-                "from core.backup import create_local_snapshot,verify_local_snapshot;"
+                "from core.backup import create_local_snapshot;"
                 "root=Path(sys.argv[2]);"
                 "store=root/'.silicon'/'snapshots';"
                 "result=create_local_snapshot(root,release_id=sys.argv[3],store=store);"
-                "verify_local_snapshot(result.manifest,store=store);"
                 "print(json.dumps({'root_hash':result.root_hash,"
                 "'manifest_path':str(result.manifest_path),'store':str(store),"
                 "'provider':'stemcell-canonical'}))"
@@ -540,12 +549,13 @@ def _docker_hooks(inst: registry.Install) -> EngineHooks:
                     socket_path.unlink()
 
     def stop_services() -> None:
-        if docker_runtime.container_running(inst):
-            docker_runtime.stop_one(inst, full=True)
-        if docker_runtime.container_running(inst):
-            raise UpdateError(
-                f"Docker container for '{inst.name}' did not stop cleanly"
-            )
+        with _DOCKER_CONTROL_GATE:
+            if docker_runtime.container_running(inst):
+                docker_runtime.stop_one(inst, full=True)
+            if docker_runtime.container_running(inst):
+                raise UpdateError(
+                    f"Docker container for '{inst.name}' did not stop cleanly"
+                )
 
     def start_services(previous: dict[str, bool]) -> None:
         interface = bool(previous.get("interface")) or bool(
@@ -560,15 +570,16 @@ def _docker_hooks(inst: registry.Install) -> EngineHooks:
                 or interface,
             )
         )
-        docker_runtime.restore_one(
-            inst,
-            container=container,
-            main=bool(previous.get("main")),
-            glass_agent=bool(previous.get("glass_agent")),
-            interface=interface,
-            reconcile=False,
-            allow_legacy_fence=maintenance.legacy_offline,
-        )
+        with _DOCKER_CONTROL_GATE:
+            docker_runtime.restore_one(
+                inst,
+                container=container,
+                main=bool(previous.get("main")),
+                glass_agent=bool(previous.get("glass_agent")),
+                interface=interface,
+                reconcile=False,
+                allow_legacy_fence=maintenance.legacy_offline,
+            )
 
     def healthy(previous: dict[str, bool]) -> bool:
         expected_interface = bool(previous.get("interface")) or bool(
@@ -619,7 +630,7 @@ def _docker_hooks(inst: registry.Install) -> EngineHooks:
                     return True
             else:
                 consecutive = 0
-            time.sleep(0.5)
+            time.sleep(DOCKER_HEALTH_POLL_SECONDS)
         return False
 
     def checkpoint_host_path(value: str) -> Path:
@@ -642,11 +653,10 @@ def _docker_hooks(inst: registry.Install) -> EngineHooks:
             script = (
                 "import json,sys;"
                 "from pathlib import Path;"
-                "from core.backup import create_local_snapshot,verify_local_snapshot;"
+                "from core.backup import create_local_snapshot;"
                 "root=Path(sys.argv[1]);"
                 "store=root/'.silicon'/'snapshots';"
                 "result=create_local_snapshot(root,release_id=sys.argv[2],store=store);"
-                "verify_local_snapshot(result.manifest,store=store);"
                 "print(json.dumps({'root_hash':result.root_hash,"
                 "'manifest_path':str(result.manifest_path),'store':str(store),"
                 "'provider':'stemcell-canonical'}))"

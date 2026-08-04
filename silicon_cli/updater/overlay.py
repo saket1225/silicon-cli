@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import stat
+from collections.abc import Mapping
 from pathlib import Path
 
 from .io import (
@@ -134,27 +135,79 @@ class OverlayStore:
 
     def capture(self, base: Path, local: Path, *, base_tree_sha256: str) -> dict:
         base_files = _inventory(base)
+        base_manifest = {
+            rel: {
+                "sha256": sha256_file(path),
+                "size": path.stat().st_size,
+                "mode": stat.S_IMODE(path.stat().st_mode),
+            }
+            for rel, path in base_files.items()
+        }
+        return self.capture_from_manifest(
+            base_manifest,
+            local,
+            base_tree_sha256=base_tree_sha256,
+        )
+
+    def capture_from_manifest(
+        self,
+        base_files: Mapping[str, Mapping[str, object]],
+        local: Path,
+        *,
+        base_tree_sha256: str,
+    ) -> dict:
+        """Capture customizations without rematerializing the published tree.
+
+        A verified release manifest already carries every upstream file digest
+        and mode needed for the comparison. Fleet preflight can therefore
+        avoid extracting and hashing a second pristine copy for every Silicon.
+        """
+
+        normalized_base: dict[str, tuple[str, int]] = {}
+        for raw_relative, metadata in base_files.items():
+            relative = validate_relative_path(str(raw_relative)).as_posix()
+            digest = _digest(metadata.get("sha256"), "base file digest")
+            mode = metadata.get("mode")
+            size = metadata.get("size")
+            if (
+                not isinstance(mode, int)
+                or isinstance(mode, bool)
+                or mode < 0
+                or mode > 0o777
+                or not isinstance(size, int)
+                or isinstance(size, bool)
+                or size < 0
+            ):
+                raise OverlayError(
+                    f"base file metadata is invalid: {relative}"
+                )
+            normalized_base[relative] = (digest, mode)
+
         local_files = _inventory(local, local=True)
         entries = []
         tombstones = []
         self.objects.mkdir(parents=True, exist_ok=True)
         self.manifests.mkdir(parents=True, exist_ok=True)
-        for rel in sorted(set(base_files) | set(local_files), key=os.fsencode):
+        for rel in sorted(
+            set(normalized_base) | set(local_files), key=os.fsencode
+        ):
             if is_runtime_path(rel):
                 continue
-            base_path = base_files.get(rel)
+            base_metadata = normalized_base.get(rel)
             local_path = local_files.get(rel)
-            if base_path is not None and local_path is not None:
+            local_digest = ""
+            if base_metadata is not None and local_path is not None:
+                local_digest = sha256_file(local_path)
                 if (
-                    sha256_file(base_path) == sha256_file(local_path)
-                    and stat.S_IMODE(base_path.stat().st_mode)
+                    base_metadata[0] == local_digest
+                    and base_metadata[1]
                     == stat.S_IMODE(local_path.stat().st_mode)
                 ):
                     continue
             if local_path is None:
                 tombstones.append(rel)
                 continue
-            digest = sha256_file(local_path)
+            digest = local_digest or sha256_file(local_path)
             destination = self.objects / digest[:2] / digest[2:]
             destination.parent.mkdir(parents=True, exist_ok=True)
             if not destination.exists():
