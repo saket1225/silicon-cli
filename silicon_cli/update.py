@@ -5,6 +5,7 @@ import json
 import math
 import os
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -520,6 +521,17 @@ def _docker_hooks(inst: registry.Install) -> EngineHooks:
             and docker_runtime.interface_daemon_running(inst)
         ):
             docker_runtime.stop_interface_daemon(inst, required=True)
+            socket_path = root / ".silicon-interface" / "daemon.sock"
+            try:
+                metadata = socket_path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                # The stopped daemon can leave its bound inode behind. Remove
+                # only the exact verified Unix socket; regular files, links,
+                # and other special files remain for policy validation.
+                if stat.S_ISSOCK(metadata.st_mode):
+                    socket_path.unlink()
 
     def stop_services() -> None:
         if docker_runtime.container_running(inst):

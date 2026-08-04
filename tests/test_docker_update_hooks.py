@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import tempfile
 import threading
 import unittest
@@ -152,6 +153,14 @@ class DockerUpdateHookTests(unittest.TestCase):
         )
 
     def test_hooks_quiesce_docker_interface_before_checkpoint(self):
+        state = self.root / ".silicon-interface"
+        state.mkdir()
+        daemon_socket = state / "daemon.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(str(daemon_socket))
+        finally:
+            listener.close()
         with (
             mock.patch.object(
                 update.docker_runtime,
@@ -179,6 +188,37 @@ class DockerUpdateHookTests(unittest.TestCase):
             self.install,
             required=True,
         )
+        self.assertFalse(daemon_socket.exists())
+
+    def test_hooks_do_not_remove_regular_interface_state(self):
+        state = self.root / ".silicon-interface"
+        state.mkdir()
+        daemon_file = state / "daemon.sock"
+        daemon_file.write_text("durable", encoding="utf-8")
+        with (
+            mock.patch.object(
+                update.docker_runtime,
+                "maintenance_coordinator_available",
+                return_value=True,
+            ),
+            mock.patch.object(
+                update.docker_runtime,
+                "container_running",
+                return_value=True,
+            ),
+            mock.patch.object(
+                update.docker_runtime,
+                "interface_daemon_running",
+                return_value=True,
+            ),
+            mock.patch.object(
+                update.docker_runtime,
+                "stop_interface_daemon",
+            ),
+        ):
+            update._hooks(self.install).quiesce_delivery()
+
+        self.assertEqual(daemon_file.read_text(encoding="utf-8"), "durable")
 
     def test_expired_docker_fence_preserves_structured_maintenance_error(self):
         expired = {
