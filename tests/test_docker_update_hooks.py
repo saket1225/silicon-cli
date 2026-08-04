@@ -180,6 +180,51 @@ class DockerUpdateHookTests(unittest.TestCase):
             required=True,
         )
 
+    def test_expired_docker_fence_preserves_structured_maintenance_error(self):
+        expired = {
+            "maintenance_id": "tx-expired",
+            "phase": "available",
+            "active_count": 0,
+            "last_outcome": "deadline_expired",
+        }
+        responses = [
+            SimpleNamespace(
+                returncode=1,
+                stdout=json.dumps(
+                    {
+                        "error": (
+                            "invalid maintenance transition: "
+                            "available -> rolling_back"
+                        ),
+                        "status": expired,
+                    }
+                )
+                + "\n",
+                stderr="",
+            ),
+            SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(expired) + "\n",
+                stderr="",
+            ),
+        ]
+        with (
+            mock.patch.object(
+                update.docker_runtime,
+                "maintenance_coordinator_available",
+                return_value=True,
+            ),
+            mock.patch.object(
+                update.docker_runtime,
+                "run_active_python",
+                side_effect=responses,
+            ) as active_python,
+        ):
+            hooks = update._hooks(self.install)
+            hooks.set_phase("tx-expired", "rolled_back", "")
+
+        self.assertEqual(active_python.call_count, 2)
+
     def test_stop_hook_fails_closed_if_container_survives(self):
         with (
             mock.patch.object(

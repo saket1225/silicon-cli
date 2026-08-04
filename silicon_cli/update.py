@@ -451,19 +451,29 @@ def _docker_hooks(inst: registry.Install) -> EngineHooks:
         return value
 
     def coordinator_command(arguments: list[str]) -> dict:
-        value = parse_result(
-            docker_runtime.run_active_python(
-                inst,
-                [
-                    "-m",
-                    "core.maintenance",
-                    "--root",
-                    docker_runtime.CONTAINER_PATH,
-                    *arguments,
-                ],
-            ),
-            "Docker task-safe maintenance coordinator",
+        result = docker_runtime.run_active_python(
+            inst,
+            [
+                "-m",
+                "core.maintenance",
+                "--root",
+                docker_runtime.CONTAINER_PATH,
+                *arguments,
+            ],
         )
+        # The coordinator intentionally exits nonzero with a structured JSON
+        # error for invalid transitions. Preserve its MaintenanceError type so
+        # idempotent recovery logic can inspect the durable status instead of
+        # losing it in the generic Docker command wrapper.
+        lines = str(getattr(result, "stdout", "") or "").strip().splitlines()
+        if lines:
+            try:
+                failure = json.loads(lines[-1])
+            except json.JSONDecodeError:
+                failure = None
+            if isinstance(failure, dict) and failure.get("error"):
+                raise MaintenanceError(str(failure["error"]))
+        value = parse_result(result, "Docker task-safe maintenance coordinator")
         if value.get("error"):
             raise MaintenanceError(str(value["error"]))
         return value
