@@ -34,6 +34,7 @@ AUTH_PROVIDERS = {"claude", "codex"}
 UNPINNED_IMAGE_OPT_IN = "SILICON_DOCKER_ALLOW_UNPINNED_IMAGE"
 SILICON_EXTEND_VERSION = "0.1.4"
 FULL_STOP_EXEC_TIMEOUT_SECONDS = 30.0
+TRANSACTIONAL_START_ACK_TIMEOUT_SECONDS = 120.0
 RUNTIME_HEALTHCHECK_PATH = "/usr/local/libexec/silicon-runtime-healthcheck.py"
 LEGACY_RUNTIME_HEALTHCHECK = (
     "import json,os,time;"
@@ -2047,7 +2048,9 @@ def start_one(
             )
             return
         if suspend_start:
-            acknowledgement_deadline = time.monotonic() + 20.0
+            acknowledgement_deadline = (
+                time.monotonic() + TRANSACTIONAL_START_ACK_TIMEOUT_SECONDS
+            )
             while (
                 suspend_marker.exists()
                 and container_running(inst)

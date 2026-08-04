@@ -20,6 +20,14 @@ from silicon_cli.updater.cache import runtime_platform_identity
 
 
 class DockerRuntimeTests(unittest.TestCase):
+    def test_transactional_start_ack_budget_matches_docker_health_budget(self):
+        from silicon_cli import update
+
+        self.assertEqual(
+            docker_runtime.TRANSACTIONAL_START_ACK_TIMEOUT_SECONDS,
+            update.HEALTH_BUDGET_DOCKER_SECONDS,
+        )
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
