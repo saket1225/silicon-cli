@@ -17,6 +17,12 @@ class SimulatedHostCrash(BaseException):
 
 
 class FleetUpdateJournalTests(unittest.TestCase):
+    def test_compensation_workers_cap_disk_heavy_parallelism(self):
+        self.assertEqual(update._compensation_worker_count(8, 32), 4)
+        self.assertEqual(update._compensation_worker_count(2, 32), 2)
+        self.assertEqual(update._compensation_worker_count(8, 3), 3)
+        self.assertEqual(update._compensation_worker_count(8, 0), 0)
+
     @staticmethod
     def _release():
         identity = ReleaseIdentity(

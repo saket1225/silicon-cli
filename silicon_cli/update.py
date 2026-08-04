@@ -77,10 +77,24 @@ DOCKER_CONTROL_CONCURRENCY = 4
 _DOCKER_CONTROL_GATE = threading.BoundedSemaphore(
     DOCKER_CONTROL_CONCURRENCY
 )
+# Rollback preparation also performs heavy tree hashing, snapshot work, and
+# fsyncs. Letting more workers than the Docker control plane run concurrently
+# saturates the same host volume before they even reach container recreation.
+FLEET_COMPENSATION_CONCURRENCY = DOCKER_CONTROL_CONCURRENCY
 DEFAULT_FLEET_CONCURRENCY = 8
 DEFAULT_FLEET_CANARY_COUNT = 1
 MAX_FLEET_CONCURRENCY = 64
 PREWARM_MARKER = "SILICON_UPDATE_PREWARM="
+
+
+def _compensation_worker_count(concurrency: int, members: int) -> int:
+    if members <= 0:
+        return 0
+    return min(
+        max(1, concurrency),
+        FLEET_COMPENSATION_CONCURRENCY,
+        members,
+    )
 
 
 def _cache() -> ReleaseCache:
@@ -1061,7 +1075,9 @@ def _reconcile_incomplete_fleet(
             compensation.append((index, updater, source_transaction))
         compensation_failures: list[str] = []
         if compensation:
-            workers = min(max(1, concurrency), len(compensation))
+            workers = _compensation_worker_count(
+                concurrency, len(compensation)
+            )
             ui.info(
                 f"Restoring {len(compensation)} fleet member(s) with up to "
                 f"{workers} parallel workers."
@@ -1655,7 +1671,10 @@ def update_instance(
                         error="",
                     )
             with ThreadPoolExecutor(
-                max_workers=min(resolved_concurrency, len(rollback_targets)),
+                max_workers=_compensation_worker_count(
+                    resolved_concurrency,
+                    len(rollback_targets),
+                ),
                 thread_name_prefix="silicon-compensate",
             ) as executor:
                 rollback_futures = {
