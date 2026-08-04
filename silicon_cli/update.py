@@ -911,6 +911,25 @@ def _fleet_installs(fleet: FleetJournal) -> list[registry.Install]:
     return result
 
 
+def _start_fleet_compensation(
+    updater: TransactionalUpdater,
+    source_transaction: str,
+    *,
+    deadline_seconds: float | None,
+) -> dict:
+    """Start one rollback with a budget measured from actual worker start."""
+
+    return updater.rollback(
+        deadline=(
+            time.time() + deadline_seconds
+            if deadline_seconds is not None
+            else None
+        ),
+        transaction_id=source_transaction,
+        lock_held=True,
+    )
+
+
 def _resume_or_start_fleet_compensation(
     updater: TransactionalUpdater,
     fleet: FleetJournal,
@@ -949,14 +968,10 @@ def _resume_or_start_fleet_compensation(
         ):
             result = prior_rollback
         else:
-            result = updater.rollback(
-                deadline=(
-                    time.time() + deadline_seconds
-                    if deadline_seconds is not None
-                    else None
-                ),
-                transaction_id=source_transaction,
-                lock_held=True,
+            result = _start_fleet_compensation(
+                updater,
+                source_transaction,
+                deadline_seconds=deadline_seconds,
             )
     if result.get("state") != "COMMITTED":
         raise UpdateError("fleet compensation did not commit")
@@ -1679,14 +1694,10 @@ def update_instance(
             ) as executor:
                 rollback_futures = {
                     executor.submit(
-                        updater.rollback,
-                        deadline=(
-                            time.time() + deadline_seconds
-                            if deadline_seconds is not None
-                            else None
-                        ),
-                        transaction_id=source_transaction,
-                        lock_held=True,
+                        _start_fleet_compensation,
+                        updater,
+                        source_transaction,
+                        deadline_seconds=deadline_seconds,
                     ): (member_index, install)
                     for (
                         member_index,

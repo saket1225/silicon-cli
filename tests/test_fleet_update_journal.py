@@ -23,6 +23,27 @@ class FleetUpdateJournalTests(unittest.TestCase):
         self.assertEqual(update._compensation_worker_count(8, 3), 3)
         self.assertEqual(update._compensation_worker_count(8, 0), 0)
 
+    def test_compensation_deadline_starts_when_worker_actually_runs(self):
+        updater = mock.Mock()
+        updater.rollback.return_value = {
+            "transaction_id": "rollback-one",
+            "state": "COMMITTED",
+        }
+
+        with mock.patch.object(update.time, "time", return_value=1000.0):
+            result = update._start_fleet_compensation(
+                updater,
+                "tx-one",
+                deadline_seconds=45.0,
+            )
+
+        self.assertEqual(result["state"], "COMMITTED")
+        updater.rollback.assert_called_once_with(
+            deadline=1045.0,
+            transaction_id="tx-one",
+            lock_held=True,
+        )
+
     @staticmethod
     def _release():
         identity = ReleaseIdentity(
