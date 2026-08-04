@@ -1667,6 +1667,7 @@ if not ready():
                 "pip",
                 "install",
                 "--disable-pip-version-check",
+                "--no-compile",
                 "--require-hashes",
                 "-r",
                 str(requirements),
@@ -1701,6 +1702,7 @@ print(json.dumps({"environment_path": str(environment)}))
         extra_environment=(
             f"SILICON_DATA_ROOT={CONTAINER_PATH}",
             f"SILICON_RELEASE_ROOT={container_release}",
+            f"PIP_CACHE_DIR={CONTAINER_SHARED_HOME}/.cache/pip",
         ),
         image=image,
         capture=True,

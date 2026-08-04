@@ -1154,6 +1154,11 @@ class DockerRuntimeTests(unittest.TestCase):
             '[sys.executable, "-m", "venv", "--copies", str(temporary)]',
             args[1][2],
         )
+        self.assertIn('"--no-compile"', args[1][2])
+        self.assertIn(
+            "PIP_CACHE_DIR=/silicon-shared-home/.cache/pip",
+            command.call_args.kwargs["extra_environment"],
+        )
         self.assertTrue(command.call_args.kwargs["capture"])
 
     def test_prepare_environment_requires_hash_pinned_lockfile(self):
