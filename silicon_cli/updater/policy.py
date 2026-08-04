@@ -54,7 +54,7 @@ RUNTIME_PREFIXES = {
     ".tools/",
     ".venv/",
     "__pycache__/",
-    "core/interface_state/media/",
+    "core/interface_state/",
     "core/activity_logs/",
     "prompts/memory/",
     "sessions/",

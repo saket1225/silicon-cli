@@ -1235,6 +1235,29 @@ class TransactionTests(unittest.TestCase):
             )
             self.assertEqual(updater.history()[0]["state"], "FAILED")
 
+    def test_runtime_state_created_during_drain_does_not_trip_source_fence(self):
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = Fixture(Path(raw))
+            hooks = fixture.hooks()
+
+            def quiesce(_tx, _deadline, _cancel, _running):
+                fixture.events.append("quiescent")
+                Fixture._write(
+                    fixture.instance,
+                    "core/interface_state/maintenance.json.lock",
+                    "",
+                )
+
+            hooks.await_quiescent = quiesce
+            updater = TransactionalUpdater(
+                fixture.instance, fixture.cache, hooks=hooks
+            )
+
+            result = updater.run(fixture.release)
+
+            self.assertEqual(result["state"], "COMMITTED")
+            self.assertIn("stop", fixture.events)
+
     def test_missing_data_root_capability_aborts_before_drain(self):
         with tempfile.TemporaryDirectory() as raw:
             fixture = Fixture(Path(raw))
