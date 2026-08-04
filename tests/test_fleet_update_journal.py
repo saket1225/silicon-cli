@@ -102,7 +102,18 @@ class FleetUpdateJournalTests(unittest.TestCase):
                 "state": "COMMITTED",
             }
             recovered_second.status.return_value = {
-                "active_transaction": None
+                "active_transaction": {
+                    "transaction_id": "tx-two",
+                    "metadata": {
+                        "release": {
+                            "tree_sha256": release.manifest.identity.tree_sha256,
+                        }
+                    },
+                }
+            }
+            recovered_second.resume.return_value = {
+                "transaction_id": "tx-two",
+                "state": "ROLLED_BACK",
             }
             recovered_second.history.return_value = []
             with (
@@ -129,6 +140,9 @@ class FleetUpdateJournalTests(unittest.TestCase):
                 deadline=None,
                 transaction_id="tx-one",
                 lock_held=True,
+            )
+            recovered_second.resume.assert_called_once_with(
+                "tx-two", lock_held=True
             )
 
 

@@ -909,7 +909,9 @@ def _reconcile_incomplete_fleet(
                         f"'{member['name']}' has an unrelated active "
                         "transaction during fleet recovery"
                     )
-                result = updater.resume(str(active["transaction_id"]))
+                result = updater.resume(
+                    str(active["transaction_id"]), lock_held=True
+                )
             else:
                 result = _matching_fleet_transaction(
                     updater, fleet, operation="update"
@@ -963,7 +965,7 @@ def _reconcile_incomplete_fleet(
                         "transaction during fleet compensation"
                     )
                 rollback_result = updater.resume(
-                    str(active["transaction_id"])
+                    str(active["transaction_id"]), lock_held=True
                 )
             else:
                 prior_rollback = _matching_fleet_transaction(

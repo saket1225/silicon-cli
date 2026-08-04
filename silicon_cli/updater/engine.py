@@ -968,19 +968,29 @@ class TransactionalUpdater:
             }
         )
 
-    def resume(self, transaction_id: str | None = None) -> dict[str, Any]:
+    def resume(
+        self,
+        transaction_id: str | None = None,
+        *,
+        lock_held: bool = False,
+    ) -> dict[str, Any]:
         journal = self._select_journal(transaction_id, active_only=True)
         if journal is None:
             raise UpdateError("no incomplete update transaction to resume")
         if journal.metadata.get("operation") == "rollback":
-            return self._resume_rollback(journal)
+            return self._resume_rollback(journal, lock_held=lock_held)
         txid = journal.transaction_id
         metadata = journal.metadata
         release_digest = metadata.get("release", {}).get("tree_sha256")
         if not release_digest:
             raise UpdateError("transaction has no verified release identity")
         restart_release: FetchedRelease | None = None
-        with InstanceLock(self.instance, txid):
+        lock_context = (
+            nullcontext()
+            if lock_held
+            else InstanceLock(self.instance, txid)
+        )
+        with lock_context:
             state = journal.state
             service_state = metadata.get("prior_service_state") or {
                 "main": False,
@@ -1090,7 +1100,12 @@ class TransactionalUpdater:
             return self.run(restart_release)
         return result
 
-    def _resume_rollback(self, journal: TransactionJournal) -> dict[str, Any]:
+    def _resume_rollback(
+        self,
+        journal: TransactionJournal,
+        *,
+        lock_held: bool = False,
+    ) -> dict[str, Any]:
         txid = journal.transaction_id
         metadata = journal.metadata
         services = metadata.get("prior_service_state") or {
@@ -1109,7 +1124,12 @@ class TransactionalUpdater:
         )
         restart_source = str(metadata.get("source_transaction_id") or "")
         restart = False
-        with InstanceLock(self.instance, txid):
+        lock_context = (
+            nullcontext()
+            if lock_held
+            else InstanceLock(self.instance, txid)
+        )
+        with lock_context:
             state = journal.state
             resume_phase = (
                 "validating"
@@ -1227,7 +1247,10 @@ class TransactionalUpdater:
                     self._recover_after_stop_boundary(journal, services, exc)
                 raise
         if restart:
-            return self.rollback(transaction_id=restart_source or None)
+            return self.rollback(
+                transaction_id=restart_source or None,
+                lock_held=lock_held,
+            )
         return result
 
     def _reconstruct_activation_baseline(
