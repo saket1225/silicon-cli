@@ -854,10 +854,63 @@ def _fleet_installs(fleet: FleetJournal) -> list[registry.Install]:
     return result
 
 
+def _resume_or_start_fleet_compensation(
+    updater: TransactionalUpdater,
+    fleet: FleetJournal,
+    source_transaction: str,
+    *,
+    deadline_seconds: float | None,
+) -> dict:
+    """Finish one fleet rollback without mutating the shared fleet journal."""
+
+    status = updater.status()
+    active = status.get("active_transaction")
+    if isinstance(active, dict):
+        metadata = active.get("metadata")
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("operation") != "rollback"
+            or metadata.get("source_transaction_id") != source_transaction
+        ):
+            raise UpdateError(
+                "instance has an unrelated active transaction during fleet "
+                "compensation"
+            )
+        result = updater.resume(
+            str(active["transaction_id"]), lock_held=True
+        )
+    else:
+        prior_rollback = _matching_fleet_transaction(
+            updater,
+            fleet,
+            operation="rollback",
+            source_transaction_id=source_transaction,
+        )
+        if (
+            isinstance(prior_rollback, dict)
+            and prior_rollback.get("state") == "COMMITTED"
+        ):
+            result = prior_rollback
+        else:
+            result = updater.rollback(
+                deadline=(
+                    time.time() + deadline_seconds
+                    if deadline_seconds is not None
+                    else None
+                ),
+                transaction_id=source_transaction,
+                lock_held=True,
+            )
+    if result.get("state") != "COMMITTED":
+        raise UpdateError("fleet compensation did not commit")
+    return result
+
+
 def _reconcile_incomplete_fleet(
     fleet: FleetJournal | None = None,
     *,
     deadline_seconds: float | None = None,
+    concurrency: int = DEFAULT_FLEET_CONCURRENCY,
 ) -> dict | None:
     """Conservatively compensate a crash-interrupted partial fleet rollout."""
 
@@ -892,7 +945,11 @@ def _reconcile_incomplete_fleet(
         # per-instance commit and the host journal update.
         for index, updater in enumerate(updaters):
             member = fleet.value["members"][index]
-            if member["state"] not in {"activating", "failed"}:
+            interrupted_activation = member["state"] == "activating" or (
+                member["state"] == "failed"
+                and not member["update_transaction_id"]
+            )
+            if not interrupted_activation:
                 continue
             status = updater.status()
             active = status.get("active_transaction")
@@ -938,10 +995,15 @@ def _reconcile_incomplete_fleet(
             return fleet.value
 
         fleet.set_state("COMPENSATING")
+        compensation: list[tuple[int, TransactionalUpdater, str]] = []
         for index in reversed(range(len(updaters))):
             updater = updaters[index]
             member = fleet.value["members"][index]
-            if member["state"] in {"pending", "failed", "activating"}:
+            uncommitted = member["state"] in {"pending", "activating"} or (
+                member["state"] == "failed"
+                and not member["update_transaction_id"]
+            )
+            if uncommitted:
                 fleet.member(index, state="compensated", error="")
                 continue
             if member["state"] == "compensated":
@@ -953,57 +1015,53 @@ def _reconcile_incomplete_fleet(
                     "update transaction to compensate"
                 )
             fleet.member(index, state="compensating", error="")
-            status = updater.status()
-            active = status.get("active_transaction")
-            rollback_result = None
-            if isinstance(active, dict):
-                metadata = active.get("metadata")
-                if (
-                    not isinstance(metadata, dict)
-                    or metadata.get("operation") != "rollback"
-                    or metadata.get("source_transaction_id")
-                    != source_transaction
-                ):
-                    raise UpdateError(
-                        f"'{member['name']}' has an unrelated active "
-                        "transaction during fleet compensation"
-                    )
-                rollback_result = updater.resume(
-                    str(active["transaction_id"]), lock_held=True
-                )
-            else:
-                prior_rollback = _matching_fleet_transaction(
-                    updater,
-                    fleet,
-                    operation="rollback",
-                    source_transaction_id=source_transaction,
-                )
-                if (
-                    isinstance(prior_rollback, dict)
-                    and prior_rollback.get("state") == "COMMITTED"
-                ):
-                    rollback_result = prior_rollback
-                else:
-                    rollback_result = updater.rollback(
-                        deadline=(
-                            time.time() + deadline_seconds
-                            if deadline_seconds is not None
-                            else None
-                        ),
-                        transaction_id=source_transaction,
-                        lock_held=True,
-                    )
-            if rollback_result.get("state") != "COMMITTED":
-                raise UpdateError(
-                    f"fleet compensation for '{member['name']}' did not commit"
-                )
-            fleet.member(
-                index,
-                state="compensated",
-                rollback_transaction_id=str(
-                    rollback_result["transaction_id"]
-                ),
-                error="",
+            compensation.append((index, updater, source_transaction))
+        compensation_failures: list[str] = []
+        if compensation:
+            workers = min(max(1, concurrency), len(compensation))
+            ui.info(
+                f"Restoring {len(compensation)} fleet member(s) with up to "
+                f"{workers} parallel workers."
+            )
+            with ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="silicon-compensate",
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        _resume_or_start_fleet_compensation,
+                        updater,
+                        fleet,
+                        source_transaction,
+                        deadline_seconds=deadline_seconds,
+                    ): index
+                    for index, updater, source_transaction in compensation
+                }
+                for future in as_completed(futures):
+                    index = futures[future]
+                    member = fleet.value["members"][index]
+                    try:
+                        rollback_result = future.result()
+                    except Exception as exc:
+                        detail = str(exc)
+                        compensation_failures.append(
+                            f"{member['name']}: {detail}"
+                        )
+                        fleet.member(index, state="failed", error=detail)
+                    else:
+                        fleet.member(
+                            index,
+                            state="compensated",
+                            rollback_transaction_id=str(
+                                rollback_result["transaction_id"]
+                            ),
+                            error="",
+                        )
+        if compensation_failures:
+            fleet.set_state("NEEDS_ATTENTION")
+            raise UpdateError(
+                "fleet compensation needs operator resume for "
+                + "; ".join(compensation_failures)
             )
         fleet.set_state("COMPENSATED")
         return fleet.value
@@ -1188,6 +1246,7 @@ def update_instance(
         _reconcile_incomplete_fleet(
             incomplete_fleet,
             deadline_seconds=deadline_seconds,
+            concurrency=resolved_concurrency,
         )
     if len(installs) > 1 and target in {"all", "*"}:
         if not ui.confirm(
@@ -1539,20 +1598,26 @@ def update_instance(
                 "Rolling update did not complete; restoring already updated "
                 "fleet members in reverse order."
             )
+            rollback_targets = list(reversed(committed))
             for (
                 member_index,
-                install,
-                updater,
-                source_transaction,
-            ) in reversed(committed):
-                try:
-                    if fleet_journal is not None:
-                        fleet_journal.member(
-                            member_index,
-                            state="compensating",
-                            error="",
-                        )
-                    rollback_result = updater.rollback(
+                _install,
+                _updater,
+                _source_transaction,
+            ) in rollback_targets:
+                if fleet_journal is not None:
+                    fleet_journal.member(
+                        member_index,
+                        state="compensating",
+                        error="",
+                    )
+            with ThreadPoolExecutor(
+                max_workers=min(resolved_concurrency, len(rollback_targets)),
+                thread_name_prefix="silicon-compensate",
+            ) as executor:
+                rollback_futures = {
+                    executor.submit(
+                        updater.rollback,
                         deadline=(
                             time.time() + deadline_seconds
                             if deadline_seconds is not None
@@ -1560,31 +1625,42 @@ def update_instance(
                         ),
                         transaction_id=source_transaction,
                         lock_held=True,
-                    )
-                    if fleet_journal is not None:
-                        fleet_journal.member(
-                            member_index,
-                            state="compensated",
-                            rollback_transaction_id=str(
-                                rollback_result["transaction_id"]
-                            ),
-                            error="",
+                    ): (member_index, install)
+                    for (
+                        member_index,
+                        install,
+                        updater,
+                        source_transaction,
+                    ) in rollback_targets
+                }
+                for future in as_completed(rollback_futures):
+                    member_index, install = rollback_futures[future]
+                    try:
+                        rollback_result = future.result()
+                        if fleet_journal is not None:
+                            fleet_journal.member(
+                                member_index,
+                                state="compensated",
+                                rollback_transaction_id=str(
+                                    rollback_result["transaction_id"]
+                                ),
+                                error="",
+                            )
+                        ui.success(
+                            f"Restored '{install.name}' to its prior generation."
                         )
-                    ui.success(
-                        f"Restored '{install.name}' to its prior generation."
-                    )
-                except Exception as exc:
-                    if fleet_journal is not None:
-                        fleet_journal.member(
-                            member_index,
-                            state="failed",
-                            error=str(exc),
+                    except Exception as exc:
+                        if fleet_journal is not None:
+                            fleet_journal.member(
+                                member_index,
+                                state="failed",
+                                error=str(exc),
+                            )
+                            fleet_journal.set_state("NEEDS_ATTENTION")
+                        ui.error(
+                            f"Fleet compensation for '{install.name}' needs "
+                            f"operator resume: {exc}"
                         )
-                        fleet_journal.set_state("NEEDS_ATTENTION")
-                    ui.error(
-                        f"Fleet compensation for '{install.name}' needs "
-                        f"operator resume: {exc}"
-                    )
         if failures and fleet_journal is not None and all(
             member["state"] in {"compensated", "failed"}
             for member in fleet_journal.value["members"]
@@ -1863,6 +1939,11 @@ def _update_command(arguments: list[str]) -> None:
                 _reconcile_incomplete_fleet(
                     fleet,
                     deadline_seconds=deadline_seconds,
+                    concurrency=(
+                        concurrency
+                        if concurrency is not None
+                        else DEFAULT_FLEET_CONCURRENCY
+                    ),
                 )
             )
             return

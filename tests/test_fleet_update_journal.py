@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -143,6 +144,88 @@ class FleetUpdateJournalTests(unittest.TestCase):
             )
             recovered_second.resume.assert_called_once_with(
                 "tx-two", lock_held=True
+            )
+
+    def test_interrupted_commits_are_compensated_in_parallel(self):
+        with tempfile.TemporaryDirectory() as raw:
+            workspace = Path(raw)
+            host_state = workspace / "host"
+            installs = []
+            members = []
+            updaters = []
+            rollback_barrier = threading.Barrier(2, timeout=2)
+            for index, name in enumerate(("one", "two", "three", "four")):
+                path = workspace / name
+                (path / ".silicon").mkdir(parents=True)
+                install = registry.Install(
+                    index=index,
+                    name=name,
+                    path=str(path),
+                    pid_file=str(path / ".silicon.pid"),
+                )
+                installs.append(install)
+                members.append({"name": name, "path": str(path)})
+                updater = mock.Mock()
+                updater.status.return_value = {"active_transaction": None}
+                updater.history.return_value = []
+                updaters.append(updater)
+
+            # Compensation iterates in reverse, so these are the first two
+            # submitted to a two-worker pool. The barrier proves they overlap.
+            for index in (1, 2):
+                name = installs[index].name
+
+                def rollback(*_args, _name=name, **_kwargs):
+                    rollback_barrier.wait()
+                    return {
+                        "transaction_id": f"rollback-{_name}",
+                        "state": "COMMITTED",
+                    }
+
+                updaters[index].rollback.side_effect = rollback
+            updaters[0].rollback.return_value = {
+                "transaction_id": "rollback-one",
+                "state": "COMMITTED",
+            }
+
+            release = self._release()
+            fleet = FleetJournal.create(
+                host_state,
+                release=release.manifest.identity.to_dict(),
+                runtime_image="",
+                members=members,
+            )
+            for index, name in enumerate(("one", "two", "three")):
+                fleet.member(
+                    index,
+                    state="committed",
+                    update_transaction_id=f"tx-{name}",
+                )
+            fleet.set_state("NEEDS_ATTENTION")
+
+            with (
+                mock.patch.object(update, "REGISTRY_DIR", host_state),
+                mock.patch.object(
+                    update.registry, "installs", return_value=installs
+                ),
+                mock.patch.object(update, "_cache", return_value=object()),
+                mock.patch.object(update, "_hooks"),
+                mock.patch.object(
+                    update,
+                    "TransactionalUpdater",
+                    side_effect=updaters,
+                ),
+                mock.patch.object(update.ui, "info"),
+            ):
+                result = update._reconcile_incomplete_fleet(
+                    fleet,
+                    concurrency=2,
+                )
+
+            self.assertEqual(result["state"], "COMPENSATED")
+            self.assertEqual(
+                [member["state"] for member in result["members"]],
+                ["compensated"] * 4,
             )
 
 

@@ -563,6 +563,7 @@ class DockerUpdateHookTests(unittest.TestCase):
     def test_parallel_activation_finishes_failed_wave_and_stops_later_waves(self):
         installs = []
         updaters = []
+        rollback_barrier = threading.Barrier(2, timeout=2)
         for index, name in enumerate(("one", "two", "three", "four")):
             path = self.root.parent / name
             path.mkdir()
@@ -582,6 +583,17 @@ class DockerUpdateHookTests(unittest.TestCase):
             updater.run.return_value = {"transaction_id": f"tx-{name}"}
             updaters.append(updater)
         updaters[1].run.side_effect = RuntimeError("health check failed")
+        for index in (0, 2):
+            name = installs[index].name
+
+            def rollback(*_args, _name=name, **_kwargs):
+                rollback_barrier.wait()
+                return {
+                    "transaction_id": f"rollback-{_name}",
+                    "state": "COMMITTED",
+                }
+
+            updaters[index].rollback.side_effect = rollback
         release = self.signed_release()
 
         with (
