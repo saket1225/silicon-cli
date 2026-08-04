@@ -850,7 +850,23 @@ class MaintenanceProtocol:
             and local_phase
             in {"updating", "validating", "rolling_back", "available"}
         ):
-            self._run(["phase", local_phase, "--id", transaction_id])
+            try:
+                self._run(["phase", local_phase, "--id", transaction_id])
+            except MaintenanceError:
+                # A long recovery can outlive its drain deadline. The runtime
+                # then expires the owned fence back to available on its own.
+                # Recovery has already restored and health-checked the prior
+                # generation before publishing ``rolled_back`` here, so this
+                # exact owned terminal state is an idempotent success.
+                status = self._run(["status"])
+                expired_owned_recovery = (
+                    phase == "rolled_back"
+                    and status.get("maintenance_id") == transaction_id
+                    and status.get("phase") == "available"
+                    and int(status.get("active_count", 0)) == 0
+                )
+                if not expired_owned_recovery:
+                    raise
         if glass_phase in {
             "draining",
             "checkpointing",

@@ -362,6 +362,51 @@ class GlassLeaseTests(unittest.TestCase):
 
 
 class LocalMaintenanceProtocolTests(unittest.TestCase):
+    def test_expired_owned_fence_accepts_rolled_back_completion(self):
+        with tempfile.TemporaryDirectory() as raw:
+            calls = []
+
+            def command(arguments):
+                calls.append(arguments)
+                if arguments[:2] == ["phase", "rolling_back"]:
+                    raise MaintenanceError(
+                        "invalid maintenance transition: available -> rolling_back"
+                    )
+                if arguments == ["status"]:
+                    return {
+                        "maintenance_id": "update-1",
+                        "phase": "available",
+                        "active_count": 0,
+                        "last_outcome": "deadline_expired",
+                    }
+                return {}
+
+            protocol = MaintenanceProtocol(Path(raw), command=command)
+            protocol.set_phase("update-1", "rolled_back", "")
+
+            self.assertEqual(
+                calls,
+                [
+                    ["phase", "rolling_back", "--id", "update-1"],
+                    ["status"],
+                ],
+            )
+
+    def test_expired_foreign_fence_rejects_rolled_back_completion(self):
+        with tempfile.TemporaryDirectory() as raw:
+            def command(arguments):
+                if arguments[:2] == ["phase", "rolling_back"]:
+                    raise MaintenanceError("foreign fence")
+                return {
+                    "maintenance_id": "other-update",
+                    "phase": "available",
+                    "active_count": 0,
+                }
+
+            protocol = MaintenanceProtocol(Path(raw), command=command)
+            with self.assertRaisesRegex(MaintenanceError, "foreign fence"):
+                protocol.set_phase("update-1", "rolled_back", "")
+
     def test_wait_requires_same_id_epoch_and_a_revalidated_safe_boundary(self):
         with tempfile.TemporaryDirectory() as raw:
             calls = []
