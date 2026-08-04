@@ -417,6 +417,9 @@ class DockerRuntimeTests(unittest.TestCase):
         self.assertIn("example/silicon:latest", compose)
         self.assertIn("healthcheck:", compose)
         self.assertIn("silicon-runtime-healthcheck.py", compose)
+        self.assertIn("CMD-SHELL", compose)
+        self.assertIn("runtime-health.json", compose)
+        self.assertIn("health.get('ready') is True", compose)
         self.assertIn("start_period: 120s", compose)
 
     def test_enabled_is_false_inside_container(self):

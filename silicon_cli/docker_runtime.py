@@ -34,6 +34,23 @@ AUTH_PROVIDERS = {"claude", "codex"}
 UNPINNED_IMAGE_OPT_IN = "SILICON_DOCKER_ALLOW_UNPINNED_IMAGE"
 SILICON_EXTEND_VERSION = "0.1.4"
 FULL_STOP_EXEC_TIMEOUT_SECONDS = 30.0
+RUNTIME_HEALTHCHECK_PATH = "/usr/local/libexec/silicon-runtime-healthcheck.py"
+LEGACY_RUNTIME_HEALTHCHECK = (
+    "import json,os,time;"
+    "root='/silicon';"
+    "supervisor=int(open(root+'/.silicon.pid').read());"
+    "os.kill(supervisor,0);"
+    "health=json.load(open(root+'/.silicon/runtime-health.json'));"
+    "child=int(health['pid']);"
+    "os.kill(child,0);"
+    "age=time.time()-float(health['heartbeat_at']);"
+    "assert health.get('ready') is True and 0 <= age <= 30"
+)
+RUNTIME_HEALTHCHECK_COMMAND = (
+    f"if [ -x {RUNTIME_HEALTHCHECK_PATH} ]; then "
+    f"exec python3 {RUNTIME_HEALTHCHECK_PATH}; "
+    f"else exec python3 -c {json.dumps(LEGACY_RUNTIME_HEALTHCHECK)}; fi"
+)
 
 _CONTAINER_PROCESS_IDENTITY_HELPER = r"""
 def _process_birth_identity(process_id):
@@ -359,7 +376,7 @@ def render_compose(
                 f"    container_name: {_json(cname)}",
                 "    restart: unless-stopped",
                 "    healthcheck:",
-                "      test: [\"CMD\", \"python3\", \"/usr/local/libexec/silicon-runtime-healthcheck.py\"]",
+                f"      test: [\"CMD-SHELL\", {_json(RUNTIME_HEALTHCHECK_COMMAND)}]",
                 "      interval: 15s",
                 "      timeout: 5s",
                 "      retries: 4",
