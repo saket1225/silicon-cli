@@ -496,7 +496,14 @@ def _docker_hooks(inst: registry.Install) -> EngineHooks:
 
     coordinator_available = docker_runtime.maintenance_coordinator_available(inst)
     maintenance = (
-        MaintenanceProtocol(root, command=coordinator_command)
+        MaintenanceProtocol(
+            root,
+            command=coordinator_command,
+            # A Docker status probe starts an exec process and Python runtime.
+            # Polling four fleet workers at 250 ms creates an avoidable exec
+            # storm and filesystem-journal pressure on the host.
+            poll_interval_seconds=2.0,
+        )
         if coordinator_available
         else MaintenanceProtocol(
             root,
@@ -516,20 +523,19 @@ def _docker_hooks(inst: registry.Install) -> EngineHooks:
         maintenance.begin(transaction_id, target_version)
 
     def quiesce_delivery() -> None:
-        if (
-            docker_runtime.container_running(inst)
-            and docker_runtime.interface_daemon_running(inst)
-        ):
-            docker_runtime.stop_interface_daemon(inst, required=True)
+        if docker_runtime.container_running(inst):
+            if docker_runtime.interface_daemon_running(inst):
+                docker_runtime.stop_interface_daemon(inst, required=True)
             socket_path = root / ".silicon-interface" / "daemon.sock"
             try:
                 metadata = socket_path.lstat()
             except FileNotFoundError:
                 pass
             else:
-                # The stopped daemon can leave its bound inode behind. Remove
-                # only the exact verified Unix socket; regular files, links,
-                # and other special files remain for policy validation.
+                # A stopped, crashed, or not-yet-observable daemon can leave
+                # its bound inode behind. Remove only the exact verified Unix
+                # socket; regular files, links, and other special files remain
+                # for policy validation.
                 if stat.S_ISSOCK(metadata.st_mode):
                     socket_path.unlink()
 

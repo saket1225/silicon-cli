@@ -220,6 +220,41 @@ class DockerUpdateHookTests(unittest.TestCase):
 
         self.assertEqual(daemon_file.read_text(encoding="utf-8"), "durable")
 
+    def test_hooks_remove_stale_socket_when_daemon_is_not_running(self):
+        state = self.root / ".silicon-interface"
+        state.mkdir()
+        daemon_socket = state / "daemon.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(str(daemon_socket))
+        finally:
+            listener.close()
+        with (
+            mock.patch.object(
+                update.docker_runtime,
+                "maintenance_coordinator_available",
+                return_value=True,
+            ),
+            mock.patch.object(
+                update.docker_runtime,
+                "container_running",
+                return_value=True,
+            ),
+            mock.patch.object(
+                update.docker_runtime,
+                "interface_daemon_running",
+                return_value=False,
+            ),
+            mock.patch.object(
+                update.docker_runtime,
+                "stop_interface_daemon",
+            ) as stop_interface,
+        ):
+            update._hooks(self.install).quiesce_delivery()
+
+        stop_interface.assert_not_called()
+        self.assertFalse(daemon_socket.exists())
+
     def test_expired_docker_fence_preserves_structured_maintenance_error(self):
         expired = {
             "maintenance_id": "tx-expired",

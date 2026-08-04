@@ -636,6 +636,7 @@ class MaintenanceProtocol:
         command: Callable[[list[str]], dict] | None = None,
         glass: GlassMaintenanceLease | None = None,
         legacy_offline_safe: Callable[[], bool] | None = None,
+        poll_interval_seconds: float = 0.25,
     ):
         self.instance = Path(instance)
         self._command = command
@@ -650,6 +651,9 @@ class MaintenanceProtocol:
         )
         self._target_version = ""
         self._epoch: int | None = None
+        self._poll_interval_seconds = max(
+            0.05, float(poll_interval_seconds)
+        )
 
     @property
     def legacy_offline(self) -> bool:
@@ -833,7 +837,7 @@ class MaintenanceProtocol:
                 raise MaintenanceTimeout(
                     "Silicon did not reach a safe task boundary before the update deadline"
                 )
-            time.sleep(0.25)
+            time.sleep(self._poll_interval_seconds)
 
     def set_phase(self, transaction_id: str, phase: str, _detail: str) -> None:
         glass_phase = phase

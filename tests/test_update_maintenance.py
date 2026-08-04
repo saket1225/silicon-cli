@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from silicon_cli.updater.maintenance import (
     GlassMaintenanceLease,
@@ -453,16 +454,23 @@ class LocalMaintenanceProtocolTests(unittest.TestCase):
                     pass
 
             protocol = MaintenanceProtocol(
-                Path(raw), command=command, glass=NoGlass()
+                Path(raw),
+                command=command,
+                glass=NoGlass(),
+                poll_interval_seconds=2.0,
             )
             protocol.begin("update-1", "2.0.0")
             protocol.request_drain("update-1", time.time() + 10)
-            protocol.await_quiescent(
-                "update-1",
-                time.time() + 10,
-                lambda: False,
-                services_running=True,
-            )
+            with mock.patch(
+                "silicon_cli.updater.maintenance.time.sleep"
+            ) as sleep:
+                protocol.await_quiescent(
+                    "update-1",
+                    time.time() + 10,
+                    lambda: False,
+                    services_running=True,
+                )
+            sleep.assert_called_once_with(2.0)
             protocol.set_phase("update-1", "updating", "")
             self.assertGreaterEqual(
                 sum(1 for call in calls if call[0] == "status"), 2
