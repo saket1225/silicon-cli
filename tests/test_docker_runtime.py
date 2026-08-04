@@ -458,6 +458,7 @@ class DockerRuntimeTests(unittest.TestCase):
 
         cmd = captured["cmd"]
         self.assertEqual(cmd[:3], ["docker", "run", "--rm"])
+        self.assertIn("--no-healthcheck", cmd)
         self.assertIn("--entrypoint", cmd)
         self.assertIn("/usr/local/bin/silicon-runtime-entrypoint", cmd)
         self.assertIn("SILICON_SHARED_HOME=/silicon-shared-home", cmd)
@@ -1047,6 +1048,7 @@ class DockerRuntimeTests(unittest.TestCase):
 
         cmd = run.call_args.args[0]
         self.assertEqual(cmd[:3], ["docker", "run", "--rm"])
+        self.assertIn("--no-healthcheck", cmd)
         entrypoint = cmd.index("--entrypoint")
         self.assertEqual(
             cmd[entrypoint + 1],
