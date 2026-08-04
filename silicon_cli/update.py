@@ -56,7 +56,11 @@ from .updater.release import FetchedRelease
 HEARTBEAT_MAX_AGE_SECONDS = 30.0
 
 HEALTH_BUDGET_SECONDS = 90.0
-HEALTH_BUDGET_DOCKER_SECONDS = 120.0
+# A saturated multi-container host can spend more than two minutes between
+# container creation and the runtime's first healthy main-loop heartbeat.  A
+# five-minute ceiling still fails a genuinely broken boot promptly, while a
+# healthy fast boot returns as soon as the gate passes and pays no extra delay.
+HEALTH_BUDGET_DOCKER_SECONDS = 300.0
 DEFAULT_FLEET_CONCURRENCY = 8
 DEFAULT_FLEET_CANARY_COUNT = 1
 MAX_FLEET_CONCURRENCY = 64

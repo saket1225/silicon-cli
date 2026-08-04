@@ -702,6 +702,12 @@ class HealthBudgetTests(unittest.TestCase):
             update.HEALTH_BUDGET_SECONDS,
         )
 
+    def test_docker_budget_covers_saturated_host_startup(self):
+        # Fleet measurements on a CPU-starved Docker host reached first
+        # readiness after roughly 160 seconds. Keep enough headroom to avoid a
+        # false rollback without slowing the successful fast path.
+        self.assertGreaterEqual(update.HEALTH_BUDGET_DOCKER_SECONDS, 300.0)
+
 
 class HeartbeatFreshnessTests(unittest.TestCase):
     """The readiness window must outlast the runtime's heartbeat cadence.
