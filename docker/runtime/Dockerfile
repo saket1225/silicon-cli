@@ -5,8 +5,8 @@ ARG RUNTIME_CONTRACT_SHA256=unknown
 ARG SILICON_CLI_SPEC=silicon-cli==1.0.29
 ARG SILICON_BROWSER_SPEC=silicon-browser==1.1.1
 ARG SILICON_EXTEND_SPEC=silicon-extend==0.1.4
-ARG SILICON_INTERFACE_CLI_URL=https://github.com/teamofsilicons/silicon-interface-web/releases/download/interface-cli-v2.0.4/teamofsilicons-silicon-interface-cli-2.0.4.tgz
-ARG SILICON_INTERFACE_CLI_SHA256=75c6c5439ef7f5d62635408f00ad9314999d397b844175e3dfcecbf822391073
+ARG SILICON_INTERFACE_CLI_URL=https://github.com/teamofsilicons/silicon-interface-web/releases/download/interface-cli-v2.0.5/teamofsilicons-silicon-interface-cli-2.0.5.tgz
+ARG SILICON_INTERFACE_CLI_SHA256=ad812b6b8a257e3babe8c4f2a0bc4d71f7dde7d109ea2475ab3400acbe37f54a
 ARG CLAUDE_CODE_SPEC=@anthropic-ai/claude-code@2.1.220
 ARG CODEX_SPEC=@openai/codex@0.146.0
 ARG PIP_SPEC=pip==26.2
@@ -35,22 +35,28 @@ RUN apt-get update \
         procps \
         python3 \
         python3-dev \
-        python3-pip \
         python3-venv \
         tini \
         unzip \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN python3 -m venv /opt/silicon-runtime \
+    && python3 -m venv /opt/silicon-runtime \
     && /opt/silicon-runtime/bin/pip install --upgrade \
+        --no-cache-dir \
         "${PIP_SPEC}" \
         "${SETUPTOOLS_SPEC}" \
         "${WHEEL_SPEC}" \
     && /opt/silicon-runtime/bin/pip install \
+        --no-cache-dir \
         "${SILICON_CLI_SPEC}" \
         "${SILICON_BROWSER_SPEC}" \
         "${SILICON_EXTEND_SPEC}" \
-    && /opt/silicon-runtime/bin/pip check
+    && /opt/silicon-runtime/bin/pip check \
+    && apt-get purge -y --auto-remove \
+        build-essential \
+        libffi-dev \
+        libssl-dev \
+        pkg-config \
+        python3-dev \
+    && rm -rf /var/lib/apt/lists/* /root/.cache/pip
 
 RUN curl --fail --location --silent --show-error \
         --output /tmp/silicon-interface-cli.tgz \
@@ -62,7 +68,8 @@ RUN curl --fail --location --silent --show-error \
     && rm -f /tmp/silicon-interface-cli.tgz \
     && npm install -g --no-audit --no-fund \
     "${CLAUDE_CODE_SPEC}" \
-    "${CODEX_SPEC}"
+    "${CODEX_SPEC}" \
+    && npm cache clean --force
 
 COPY docker/runtime/activate-interface-cli.py /usr/local/libexec/silicon-activate-interface-cli.py
 COPY docker/runtime/runtime-healthcheck.py /usr/local/libexec/silicon-runtime-healthcheck.py
@@ -73,6 +80,6 @@ RUN chmod 0555 \
         /usr/local/bin/silicon-runtime-entrypoint
 
 WORKDIR /silicon
-HEALTHCHECK --interval=15s --timeout=5s --start-period=120s --retries=4 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
   CMD ["python3", "/usr/local/libexec/silicon-runtime-healthcheck.py"]
 ENTRYPOINT ["tini", "--", "/usr/local/bin/silicon-runtime-entrypoint"]

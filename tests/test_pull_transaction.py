@@ -225,6 +225,34 @@ class RegistryDurabilityTests(unittest.TestCase):
         self.assertEqual(registry.register("ada", str(path)), "exists")
         with self.assertRaises(registry.RegistryConflict):
             registry.register("ada", str(self.root / "other"))
+
+    def test_unchanged_registration_does_not_rewrite_registry(self):
+        path = self.root / "ada"
+        path.mkdir()
+        registry.register(
+            "ada",
+            str(path),
+            runtime="docker",
+            service="silicon-ada",
+            compose_file=str(self.root / "compose.yml"),
+            image="example/image@sha256:" + "a" * 64,
+            container_name="silicon-ada",
+        )
+
+        with mock.patch.object(registry, "_save_unlocked") as save:
+            result = registry.register(
+                "ada",
+                str(path),
+                runtime="docker",
+                service="silicon-ada",
+                compose_file=str(self.root / "compose.yml"),
+                image="example/image@sha256:" + "a" * 64,
+                container_name="silicon-ada",
+                update_existing=True,
+            )
+
+        self.assertEqual(result, "exists")
+        save.assert_not_called()
         self.assertEqual(len(registry.installs()), 1)
 
 

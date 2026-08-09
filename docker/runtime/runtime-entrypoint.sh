@@ -87,6 +87,7 @@ prepare_runtime() {
   mapfile -d '' -t runtime_paths < <(python3 - "$SILICON_ROOT" <<'PY'
 import hashlib
 import json
+import os
 import platform
 import re
 import sys
@@ -120,8 +121,24 @@ if environment_value:
         raise SystemExit("active Silicon environment must not be a symlink")
     environment = environment.resolve()
     environments = (root / ".silicon" / "environments").resolve()
+    allowed_environment_roots = [environments]
+    shared_environment_value = str(
+        os.environ.get("SILICON_SHARED_ENVIRONMENT_ROOT") or ""
+    ).strip()
+    if shared_environment_value:
+        shared_environments = Path(shared_environment_value)
+        if (
+            not shared_environments.is_absolute()
+            or shared_environments.is_symlink()
+            or not shared_environments.is_dir()
+        ):
+            raise SystemExit("shared Silicon environment root is unsafe")
+        allowed_environment_roots.append(shared_environments.resolve())
     python = environment / "bin" / "python"
-    if environments not in environment.parents or not python.is_file():
+    if (
+        not any(allowed in environment.parents for allowed in allowed_environment_roots)
+        or not python.is_file()
+    ):
         raise SystemExit("invalid active Silicon environment pointer")
     lockfile = candidate / "requirements.lock"
     marker = environment / ".silicon-environment.json"

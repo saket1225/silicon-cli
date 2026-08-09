@@ -47,6 +47,14 @@ class DockerRuntimeTests(unittest.TestCase):
                 "SILICON_DOCKER_SUDO",
                 "SILICON_DOCKER_AUTO_INSTALL",
                 "SILICON_DOCKER_ALLOW_UNPINNED_IMAGE",
+                "SILICON_DOCKER_MEMORY_LIMIT",
+                "SILICON_DOCKER_MEMORY_RESERVATION",
+                "SILICON_DOCKER_MEMORY_SWAP_LIMIT",
+                "SILICON_DOCKER_CPU_LIMIT",
+                "SILICON_DOCKER_PIDS_LIMIT",
+                "SILICON_DOCKER_NOFILE_LIMIT",
+                "SILICON_DOCKER_LOG_MAX_SIZE",
+                "SILICON_DOCKER_LOG_MAX_FILES",
             )
         }
         for key in self.old_env:
@@ -57,6 +65,7 @@ class DockerRuntimeTests(unittest.TestCase):
         registry.REGISTRY_DIR = self.root / ".silicon"
         registry.REGISTRY_FILE = registry.REGISTRY_DIR / "registry.json"
         docker_runtime.CONFIG_FILE = registry.REGISTRY_DIR / "docker.json"
+        docker_runtime._prepared_release_images.clear()
 
     def tearDown(self):
         registry.REGISTRY_DIR = self.old_registry_dir
@@ -239,6 +248,20 @@ class DockerRuntimeTests(unittest.TestCase):
         os.environ["SILICON_RUNTIME_IMAGE"] = bootstrap
 
         self.assertEqual(docker_runtime.load_config()["image"], bootstrap)
+
+    def test_prepared_immutable_image_is_reused_across_fleet_preflights(self):
+        image = (
+            "ghcr.io/teamofsilicons/silicon-runtime@sha256:" + "d" * 64
+        )
+        self.write_docker_config(image=image)
+
+        with mock.patch.object(docker_runtime, "_ensure_image") as ensure:
+            first = docker_runtime.prepare_release_image(image)
+            second = docker_runtime.prepare_release_image(image)
+
+        self.assertEqual(first["image"], image)
+        self.assertEqual(second["image"], image)
+        ensure.assert_called_once()
 
     def test_bind_release_runtime_persists_exact_digest_after_verified_pull(self):
         os.environ.pop("SILICON_DOCKER_ALLOW_UNPINNED_IMAGE", None)
@@ -429,6 +452,121 @@ class DockerRuntimeTests(unittest.TestCase):
         self.assertIn("runtime-health.json", compose)
         self.assertIn("health.get('ready') is True", compose)
         self.assertIn("start_period: 120s", compose)
+        self.assertIn("interval: 30s", compose)
+        self.assertIn("cpus: 2", compose)
+        self.assertIn('mem_limit: "2g"', compose)
+        self.assertIn('mem_reservation: "128m"', compose)
+        self.assertIn('memswap_limit: "2g"', compose)
+        self.assertIn("pids_limit: 512", compose)
+        self.assertIn("soft: 8192", compose)
+        self.assertIn("hard: 8192", compose)
+        self.assertIn('driver: "local"', compose)
+        self.assertIn('max-size: "10m"', compose)
+        self.assertIn('max-file: "3"', compose)
+        self.assertIn('MALLOC_ARENA_MAX: "2"', compose)
+        shared_environments = str(
+            (docker_runtime.CONFIG_FILE.parent / "cache" / "environments").resolve()
+        )
+        self.assertIn(
+            f'{shared_environments}:{shared_environments}:ro',
+            compose,
+        )
+
+    def test_resource_limits_are_tunable_without_disabling_safe_defaults(self):
+        self.write_docker_config()
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SILICON_DOCKER_MEMORY_LIMIT": "3g",
+                "SILICON_DOCKER_MEMORY_RESERVATION": "256m",
+                "SILICON_DOCKER_MEMORY_SWAP_LIMIT": "4g",
+                "SILICON_DOCKER_CPU_LIMIT": "1.5",
+                "SILICON_DOCKER_PIDS_LIMIT": "640",
+                "SILICON_DOCKER_NOFILE_LIMIT": "4096",
+                "SILICON_DOCKER_LOG_MAX_SIZE": "20m",
+                "SILICON_DOCKER_LOG_MAX_FILES": "5",
+            },
+        ):
+            cfg = docker_runtime.load_config()
+
+        self.assertEqual(cfg["memory_limit"], "3g")
+        self.assertEqual(cfg["memory_reservation"], "256m")
+        self.assertEqual(cfg["memory_swap_limit"], "4g")
+        self.assertEqual(cfg["cpu_limit"], "1.5")
+        self.assertEqual(cfg["pids_limit"], 640)
+        self.assertEqual(cfg["nofile_limit"], 4096)
+        self.assertEqual(cfg["log_max_size"], "20m")
+        self.assertEqual(cfg["log_max_files"], 5)
+        self.assertEqual(
+            docker_runtime._docker_run_resource_args(cfg),
+            [
+                "--cpus",
+                "1.5",
+                "--memory",
+                "3g",
+                "--memory-reservation",
+                "256m",
+                "--memory-swap",
+                "4g",
+                "--pids-limit",
+                "640",
+                "--ulimit",
+                "nofile=4096:4096",
+            ],
+        )
+
+    def test_memory_reservation_cannot_exceed_hard_limit(self):
+        self.write_docker_config()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "SILICON_DOCKER_MEMORY_LIMIT": "1g",
+                    "SILICON_DOCKER_MEMORY_RESERVATION": "2g",
+                },
+            ),
+            self.assertRaisesRegex(RuntimeError, "cannot exceed"),
+        ):
+            docker_runtime.load_config()
+
+    def test_memory_swap_limit_cannot_be_lower_than_memory_limit(self):
+        self.write_docker_config()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "SILICON_DOCKER_MEMORY_LIMIT": "2g",
+                    "SILICON_DOCKER_MEMORY_SWAP_LIMIT": "1g",
+                },
+            ),
+            self.assertRaisesRegex(RuntimeError, "cannot be lower"),
+        ):
+            docker_runtime.load_config()
+
+    def test_memory_limit_override_keeps_no_swap_default_in_sync(self):
+        self.write_docker_config()
+        with mock.patch.dict(
+            os.environ,
+            {"SILICON_DOCKER_MEMORY_LIMIT": "3g"},
+        ):
+            cfg = docker_runtime.load_config()
+
+        self.assertEqual(cfg["memory_limit"], "3g")
+        self.assertEqual(cfg["memory_swap_limit"], "3g")
+
+    def test_unchanged_compose_render_avoids_durable_rewrite(self):
+        self.write_docker_config()
+        instance = self.root / "silicons" / "ada"
+        instance.mkdir(parents=True)
+        docker_runtime.register_instance("ada", instance)
+
+        with mock.patch.object(
+            docker_runtime,
+            "atomic_write_bytes",
+        ) as write:
+            docker_runtime.render_compose(docker_runtime.load_config())
+
+        write.assert_not_called()
 
     def test_enabled_is_false_inside_container(self):
         self.write_docker_config()
@@ -578,10 +716,10 @@ class DockerRuntimeTests(unittest.TestCase):
             "ARG SILICON_EXTEND_SPEC=silicon-extend==0.1.4",
             "ARG SILICON_INTERFACE_CLI_URL="
             "https://github.com/teamofsilicons/silicon-interface-web/releases/"
-            "download/interface-cli-v2.0.4/"
-            "teamofsilicons-silicon-interface-cli-2.0.4.tgz",
+            "download/interface-cli-v2.0.5/"
+            "teamofsilicons-silicon-interface-cli-2.0.5.tgz",
             "ARG SILICON_INTERFACE_CLI_SHA256="
-            "75c6c5439ef7f5d62635408f00ad9314999d397b844175e3dfcecbf822391073",
+            "ad812b6b8a257e3babe8c4f2a0bc4d71f7dde7d109ea2475ab3400acbe37f54a",
             "ARG CLAUDE_CODE_SPEC=@anthropic-ai/claude-code@2.1.220",
             "ARG CODEX_SPEC=@openai/codex@0.146.0",
             "ARG PIP_SPEC=pip==26.2",
@@ -1135,17 +1273,17 @@ class DockerRuntimeTests(unittest.TestCase):
             "example/silicon:latest",
             "silicon-ada",
         )
-        expected = instance / ".silicon" / "environments" / "abc-py313-linux"
+        environment_root = (
+            docker_runtime.CONFIG_FILE.parent / "cache" / "environments"
+        ).resolve()
+        expected = environment_root / "abc-py313-linux"
 
         with mock.patch.object(
             docker_runtime,
             "_ephemeral_command",
             return_value=SimpleNamespace(
                 returncode=0,
-                stdout=(
-                    '{"environment_path":'
-                    '"/silicon/.silicon/environments/abc-py313-linux"}\n'
-                ),
+                stdout=json.dumps({"environment_path": str(expected)}) + "\n",
                 stderr="",
             ),
         ) as command:
@@ -1162,12 +1300,18 @@ class DockerRuntimeTests(unittest.TestCase):
             '[sys.executable, "-m", "venv", "--copies", str(temporary)]',
             args[1][2],
         )
-        self.assertIn('"--no-compile"', args[1][2])
+        self.assertNotIn('"--no-compile"', args[1][2])
+        self.assertIn("fcntl.flock", args[1][2])
+        self.assertIn("orphan_prefix", args[1][2])
+        self.assertIn("SILICON_SHARED_ENVIRONMENT_ROOT", args[1][2])
         self.assertIn(
             "PIP_CACHE_DIR=/silicon-shared-home/.cache/pip",
             command.call_args.kwargs["extra_environment"],
         )
         self.assertTrue(command.call_args.kwargs["capture"])
+        self.assertTrue(
+            command.call_args.kwargs["shared_environment_writable"]
+        )
 
     def test_prepare_environment_requires_hash_pinned_lockfile(self):
         self.write_docker_config()
@@ -1358,6 +1502,7 @@ class DockerRuntimeTests(unittest.TestCase):
             / "runtime-entrypoint.sh"
         )
         text = entrypoint.read_text()
+        self.assertIn("import os", text)
         self.assertNotIn('[ ! -f "$SILICON_ROOT/main.py" ]', text)
         resolved = text.index('release_root="${runtime_paths[0]}"')
         validated = text.index('[ ! -f "$release_root/main.py" ]')
@@ -1828,6 +1973,36 @@ class DockerRuntimeTests(unittest.TestCase):
             selected,
             "/silicon/.silicon/environments/env-1/bin/python",
         )
+
+    def test_active_container_python_reuses_shared_environment_path(self):
+        self.write_docker_config()
+        instance = self.root / "silicons" / "ada"
+        environment = (
+            docker_runtime.CONFIG_FILE.parent
+            / "cache"
+            / "environments"
+            / "env-1"
+        )
+        (environment / "bin").mkdir(parents=True)
+        (environment / "bin" / "python").write_bytes(b"python")
+        inst = registry.Install(
+            0,
+            "ada",
+            str(instance),
+            str(instance / ".silicon.pid"),
+            "docker",
+        )
+        store = mock.Mock()
+        store.current.return_value = {"generation_id": "generation-1"}
+        store.resolve_environment.return_value = environment
+
+        with mock.patch(
+            "silicon_cli.updater.generation.GenerationStore",
+            return_value=store,
+        ):
+            selected = docker_runtime._active_container_python(inst)
+
+        self.assertEqual(selected, str(environment.resolve() / "bin" / "python"))
 
     def test_start_binds_only_the_active_generation_digest(self):
         instance = self.root / "silicons" / "ada"

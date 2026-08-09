@@ -40,7 +40,7 @@ class RuntimeContractTests(unittest.TestCase):
         )
         self.assertEqual(
             contract["minimum_command_versions"]["silicon-interface"],
-            "2.0.4",
+            "2.0.5",
         )
         self.assertEqual(
             contract["minimum_command_versions"]["silicon-browser"],

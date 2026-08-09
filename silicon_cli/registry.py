@@ -159,7 +159,7 @@ def register(
                         f"registry identity collision for '{name}' at {path}"
                     )
                 if update_existing:
-                    inst.update({
+                    updated = {
                         "name": name,
                         "path": path,
                         "pid_file": pid_file,
@@ -168,7 +168,13 @@ def register(
                         "compose_file": compose_file,
                         "image": image,
                         "container_name": container_name,
-                    })
+                    }
+                    if all(
+                        inst.get(key, "") == value
+                        for key, value in updated.items()
+                    ):
+                        return "exists"
+                    inst.update(updated)
                     _save_unlocked(reg)
                     return "updated"
                 return "exists"

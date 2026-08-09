@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Iterable
@@ -22,6 +23,14 @@ CONFIG_FILE = REGISTRY_DIR / "docker.json"
 DEFAULT_ROOT = Path.home() / "silicons"
 DEFAULT_IMAGE = ""
 DEFAULT_IMAGE_REPOSITORY = "ghcr.io/teamofsilicons/silicon-runtime"
+DEFAULT_MEMORY_LIMIT = "2g"
+DEFAULT_MEMORY_RESERVATION = "128m"
+DEFAULT_MEMORY_SWAP_LIMIT = DEFAULT_MEMORY_LIMIT
+DEFAULT_CPU_LIMIT = "2.0"
+DEFAULT_PIDS_LIMIT = 512
+DEFAULT_NOFILE_LIMIT = 8192
+DEFAULT_LOG_MAX_SIZE = "10m"
+DEFAULT_LOG_MAX_FILES = 3
 CONTAINER_PATH = "/silicon"
 CONTAINER_HOME = f"{CONTAINER_PATH}/.home"
 CONTAINER_SHARED_HOME = "/silicon-shared-home"
@@ -52,6 +61,9 @@ RUNTIME_HEALTHCHECK_COMMAND = (
     f"exec python3 {RUNTIME_HEALTHCHECK_PATH}; "
     f"else exec python3 -c {json.dumps(LEGACY_RUNTIME_HEALTHCHECK)}; fi"
 )
+
+_prepared_release_image_lock = threading.Lock()
+_prepared_release_images: set[str] = set()
 
 _CONTAINER_PROCESS_IDENTITY_HELPER = r"""
 def _process_birth_identity(process_id):
@@ -131,7 +143,72 @@ def runtime_opted_out() -> bool:
 
 def _save_config(config: dict) -> None:
     ensure_private_directory(CONFIG_FILE.parent)
+    try:
+        current = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        if current == config:
+            return
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
     atomic_write_json(CONFIG_FILE, config, mode=0o600)
+
+
+def _optional_size(value: object, default: str, *, label: str) -> str:
+    raw = str(value if value is not None else default).strip().lower()
+    if raw in {"", "0", "off", "none", "false"}:
+        return ""
+    if re.fullmatch(r"[1-9][0-9]*(?:b|k|kb|m|mb|g|gb|t|tb)?", raw) is None:
+        raise RuntimeError(
+            f"{label} must be a positive Docker size such as 128m or 2g"
+        )
+    return raw
+
+
+def _size_bytes(value: str) -> int:
+    match = re.fullmatch(r"([1-9][0-9]*)(b|k|kb|m|mb|g|gb|t|tb)?", value)
+    if match is None:
+        raise ValueError("invalid Docker size")
+    factors = {
+        "": 1,
+        "b": 1,
+        "k": 1024,
+        "kb": 1024,
+        "m": 1024**2,
+        "mb": 1024**2,
+        "g": 1024**3,
+        "gb": 1024**3,
+        "t": 1024**4,
+        "tb": 1024**4,
+    }
+    return int(match.group(1)) * factors[match.group(2) or ""]
+
+
+def _optional_positive_float(value: object, default: str, *, label: str) -> str:
+    raw = str(value if value is not None else default).strip().lower()
+    if raw in {"", "0", "off", "none", "false"}:
+        return ""
+    try:
+        parsed = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{label} must be a positive number") from exc
+    if not math.isfinite(parsed) or parsed <= 0 or parsed > 1024:
+        raise RuntimeError(f"{label} must be between 0 and 1024")
+    return f"{parsed:g}"
+
+
+def _bounded_positive_int(
+    value: object,
+    default: int,
+    *,
+    label: str,
+    maximum: int,
+) -> int:
+    try:
+        parsed = int(value if value is not None else default)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{label} must be a positive integer") from exc
+    if parsed <= 0 or parsed > maximum:
+        raise RuntimeError(f"{label} must be between 1 and {maximum}")
+    return parsed
 
 
 def _allow_unpinned_image() -> bool:
@@ -192,6 +269,91 @@ def load_config(required: bool = False) -> dict:
     )
     env_sudo = os.environ.get("SILICON_DOCKER_SUDO")
     docker_sudo = _truthy(env_sudo) if env_sudo is not None else bool(data.get("docker_sudo", False))
+    shared_environment_root = (
+        CONFIG_FILE.parent / "cache" / "environments"
+    ).resolve()
+    memory_limit = _optional_size(
+        os.environ.get("SILICON_DOCKER_MEMORY_LIMIT", data.get("memory_limit")),
+        DEFAULT_MEMORY_LIMIT,
+        label="SILICON_DOCKER_MEMORY_LIMIT",
+    )
+    memory_reservation = _optional_size(
+        os.environ.get(
+            "SILICON_DOCKER_MEMORY_RESERVATION",
+            data.get("memory_reservation"),
+        ),
+        DEFAULT_MEMORY_RESERVATION,
+        label="SILICON_DOCKER_MEMORY_RESERVATION",
+    )
+    if "SILICON_DOCKER_MEMORY_SWAP_LIMIT" in os.environ:
+        memory_swap_value = os.environ["SILICON_DOCKER_MEMORY_SWAP_LIMIT"]
+    elif "SILICON_DOCKER_MEMORY_LIMIT" in os.environ:
+        # A one-off hard-limit override keeps the default no-swap policy
+        # without requiring the operator to repeat the same value twice.
+        memory_swap_value = memory_limit
+    else:
+        memory_swap_value = data.get("memory_swap_limit")
+    memory_swap_limit = _optional_size(
+        memory_swap_value,
+        memory_limit,
+        label="SILICON_DOCKER_MEMORY_SWAP_LIMIT",
+    )
+    if (
+        memory_limit
+        and memory_reservation
+        and _size_bytes(memory_reservation) > _size_bytes(memory_limit)
+    ):
+        raise RuntimeError(
+            "SILICON_DOCKER_MEMORY_RESERVATION cannot exceed "
+            "SILICON_DOCKER_MEMORY_LIMIT"
+        )
+    if memory_swap_limit and not memory_limit:
+        raise RuntimeError(
+            "SILICON_DOCKER_MEMORY_SWAP_LIMIT requires "
+            "SILICON_DOCKER_MEMORY_LIMIT"
+        )
+    if (
+        memory_limit
+        and memory_swap_limit
+        and _size_bytes(memory_swap_limit) < _size_bytes(memory_limit)
+    ):
+        raise RuntimeError(
+            "SILICON_DOCKER_MEMORY_SWAP_LIMIT cannot be lower than "
+            "SILICON_DOCKER_MEMORY_LIMIT"
+        )
+    cpu_limit = _optional_positive_float(
+        os.environ.get("SILICON_DOCKER_CPU_LIMIT", data.get("cpu_limit")),
+        DEFAULT_CPU_LIMIT,
+        label="SILICON_DOCKER_CPU_LIMIT",
+    )
+    pids_limit = _bounded_positive_int(
+        os.environ.get("SILICON_DOCKER_PIDS_LIMIT", data.get("pids_limit")),
+        DEFAULT_PIDS_LIMIT,
+        label="SILICON_DOCKER_PIDS_LIMIT",
+        maximum=1_048_576,
+    )
+    nofile_limit = _bounded_positive_int(
+        os.environ.get(
+            "SILICON_DOCKER_NOFILE_LIMIT",
+            data.get("nofile_limit"),
+        ),
+        DEFAULT_NOFILE_LIMIT,
+        label="SILICON_DOCKER_NOFILE_LIMIT",
+        maximum=1_048_576,
+    )
+    log_max_size = _optional_size(
+        os.environ.get("SILICON_DOCKER_LOG_MAX_SIZE", data.get("log_max_size")),
+        DEFAULT_LOG_MAX_SIZE,
+        label="SILICON_DOCKER_LOG_MAX_SIZE",
+    )
+    if not log_max_size:
+        log_max_size = DEFAULT_LOG_MAX_SIZE
+    log_max_files = _bounded_positive_int(
+        os.environ.get("SILICON_DOCKER_LOG_MAX_FILES", data.get("log_max_files")),
+        DEFAULT_LOG_MAX_FILES,
+        label="SILICON_DOCKER_LOG_MAX_FILES",
+        maximum=100,
+    )
     return {
         "enabled": bool(data.get("enabled", False) or env_enabled),
         "root": str(root),
@@ -199,6 +361,15 @@ def load_config(required: bool = False) -> dict:
         "shared_home": str(shared_home),
         "image": image,
         "docker_sudo": docker_sudo,
+        "shared_environment_root": str(shared_environment_root),
+        "memory_limit": memory_limit,
+        "memory_reservation": memory_reservation,
+        "memory_swap_limit": memory_swap_limit,
+        "cpu_limit": cpu_limit,
+        "pids_limit": pids_limit,
+        "nofile_limit": nofile_limit,
+        "log_max_size": log_max_size,
+        "log_max_files": log_max_files,
     }
 
 
@@ -243,6 +414,11 @@ def init(
         docker_sudo = bool(current.get("docker_sudo", False))
     chosen_root.mkdir(parents=True, exist_ok=True)
     chosen_shared_home.mkdir(parents=True, exist_ok=True)
+    shared_environment_root = Path(
+        current.get("shared_environment_root")
+        or CONFIG_FILE.parent / "cache" / "environments"
+    ).expanduser().resolve()
+    shared_environment_root.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     config = {
         "enabled": True,
@@ -251,6 +427,19 @@ def init(
         "shared_home": str(chosen_shared_home),
         "image": chosen_image,
         "docker_sudo": docker_sudo,
+        "shared_environment_root": str(shared_environment_root),
+        "memory_limit": current.get("memory_limit", DEFAULT_MEMORY_LIMIT),
+        "memory_reservation": current.get(
+            "memory_reservation", DEFAULT_MEMORY_RESERVATION
+        ),
+        "memory_swap_limit": current.get(
+            "memory_swap_limit", current.get("memory_limit", DEFAULT_MEMORY_SWAP_LIMIT)
+        ),
+        "cpu_limit": current.get("cpu_limit", DEFAULT_CPU_LIMIT),
+        "pids_limit": current.get("pids_limit", DEFAULT_PIDS_LIMIT),
+        "nofile_limit": current.get("nofile_limit", DEFAULT_NOFILE_LIMIT),
+        "log_max_size": current.get("log_max_size", DEFAULT_LOG_MAX_SIZE),
+        "log_max_files": current.get("log_max_files", DEFAULT_LOG_MAX_FILES),
     }
     _save_config(config)
     if write_compose:
@@ -337,6 +526,10 @@ def render_compose(
         lines = ["name: silicon-runtime", "", "services:"]
         shared_home = str(Path(cfg["shared_home"]).expanduser().resolve())
         Path(shared_home).mkdir(parents=True, exist_ok=True)
+        shared_environments = str(
+            Path(cfg["shared_environment_root"]).expanduser().resolve()
+        )
+        Path(shared_environments).mkdir(parents=True, exist_ok=True)
         if not rows:
             lines.append("  # Services are added by `silicon new` or `silicon pull`.")
         for inst in rows:
@@ -376,17 +569,51 @@ def render_compose(
                 f"    image: {_json(image)}",
                 f"    container_name: {_json(cname)}",
                 "    restart: unless-stopped",
+                "    stop_grace_period: 45s",
+                *(
+                    [f"    cpus: {cfg['cpu_limit']}"]
+                    if cfg.get("cpu_limit")
+                    else []
+                ),
+                *(
+                    [f"    mem_limit: {_json(cfg['memory_limit'])}"]
+                    if cfg.get("memory_limit")
+                    else []
+                ),
+                *(
+                    [f"    mem_reservation: {_json(cfg['memory_reservation'])}"]
+                    if cfg.get("memory_reservation")
+                    else []
+                ),
+                *(
+                    [f"    memswap_limit: {_json(cfg['memory_swap_limit'])}"]
+                    if cfg.get("memory_swap_limit")
+                    else []
+                ),
+                f"    pids_limit: {int(cfg['pids_limit'])}",
+                "    ulimits:",
+                "      nofile:",
+                f"        soft: {int(cfg['nofile_limit'])}",
+                f"        hard: {int(cfg['nofile_limit'])}",
                 "    healthcheck:",
                 f"      test: [\"CMD-SHELL\", {_json(RUNTIME_HEALTHCHECK_COMMAND)}]",
-                "      interval: 15s",
+                "      interval: 30s",
                 "      timeout: 5s",
-                "      retries: 4",
+                "      retries: 3",
                 "      start_period: 120s",
+                "    logging:",
+                '      driver: "local"',
+                "      options:",
+                f"        max-size: {_json(cfg['log_max_size'])}",
+                f"        max-file: {_json(str(cfg['log_max_files']))}",
+                '        compress: "true"',
                 *([f"    user: {_json(user)}"] if user else []),
                 "    environment:",
                 f"      SILICON_INSTANCE_NAME: {_json(inst.name)}",
                 f"      SILICON_SHARED_HOME: {_json(CONTAINER_SHARED_HOME)}",
+                f"      SILICON_SHARED_ENVIRONMENT_ROOT: {_json(shared_environments)}",
                 '      SILICON_CONTAINER_MODE: "1"',
+                '      MALLOC_ARENA_MAX: "2"',
                 *(
                     [
                         "      SILICON_LEGACY_UPDATE_FENCE_OWNER: "
@@ -398,13 +625,20 @@ def render_compose(
                 "    volumes:",
                 f"      - {_json(path + ':' + CONTAINER_PATH)}",
                 f"      - {_json(shared_home + ':' + CONTAINER_SHARED_HOME)}",
+                f"      - {_json(shared_environments + ':' + shared_environments + ':ro')}",
                 "",
             ])
-        atomic_write_bytes(
-            compose,
-            ("\n".join(lines).rstrip() + "\n").encode("utf-8"),
-            mode=0o600,
-        )
+        payload = ("\n".join(lines).rstrip() + "\n").encode("utf-8")
+        try:
+            unchanged = (
+                compose.is_file()
+                and not compose.is_symlink()
+                and compose.read_bytes() == payload
+            )
+        except OSError:
+            unchanged = False
+        if not unchanged:
+            atomic_write_bytes(compose, payload, mode=0o600)
     return compose
 
 
@@ -430,6 +664,36 @@ def _sudo_prefix() -> list[str] | None:
 def _docker_cmd(config: dict | None = None) -> list[str]:
     cfg = config if config is not None else load_config()
     return [*(["sudo"] if cfg.get("docker_sudo") else []), "docker"]
+
+
+def _docker_run_resource_args(config: dict) -> list[str]:
+    """Apply the service isolation envelope to every helper container too."""
+
+    arguments: list[str] = []
+    for option, key, default in (
+        ("--cpus", "cpu_limit", DEFAULT_CPU_LIMIT),
+        ("--memory", "memory_limit", DEFAULT_MEMORY_LIMIT),
+        (
+            "--memory-reservation",
+            "memory_reservation",
+            DEFAULT_MEMORY_RESERVATION,
+        ),
+        ("--memory-swap", "memory_swap_limit", DEFAULT_MEMORY_SWAP_LIMIT),
+    ):
+        value = config.get(key, default)
+        if value:
+            arguments.extend((option, str(value)))
+    arguments.extend(
+        (
+            "--pids-limit",
+            str(int(config.get("pids_limit", DEFAULT_PIDS_LIMIT))),
+            "--ulimit",
+            "nofile="
+            f"{int(config.get('nofile_limit', DEFAULT_NOFILE_LIMIT))}:"
+            f"{int(config.get('nofile_limit', DEFAULT_NOFILE_LIMIT))}",
+        )
+    )
+    return arguments
 
 
 def _manual_docker_steps() -> None:
@@ -626,7 +890,14 @@ def prepare_release_image(image: str) -> dict:
             "committed in the published Stemcell Git tag"
         )
     cfg = {**load_config(required=True), "image": pinned}
-    _ensure_image(cfg)
+    # One fleet rollout sends every member through dependency preflight. The
+    # image is content-addressed, so a successful pull/inspection is reusable
+    # for the lifetime of this CLI process instead of issuing two Docker
+    # inspect calls per Silicon.
+    with _prepared_release_image_lock:
+        if pinned not in _prepared_release_images:
+            _ensure_image(cfg)
+            _prepared_release_images.add(pinned)
     return cfg
 
 
@@ -902,6 +1173,7 @@ def _auth_container(config: dict, provider: str) -> int:
         "run",
         "--rm",
         "--no-healthcheck",
+        *_docker_run_resource_args(config),
         "-it",
         *(["--user", user] if user else []),
         "-e",
@@ -934,6 +1206,7 @@ def _shared_tool_container(config: dict, tool: str, args: list[str]) -> int:
         "run",
         "--rm",
         "--no-healthcheck",
+        *_docker_run_resource_args(config),
         *(["-it"] if ui.interactive() else []),
         *(["--user", user] if user else []),
         "-e",
@@ -1270,7 +1543,7 @@ def silicon_ready(
     inst: registry.Install,
     *,
     min_uptime: float = 5.0,
-    max_heartbeat_age: float = 5.0,
+    max_heartbeat_age: float = 15.0,
 ) -> bool:
     """Require a stable child plus a fresh app-owned readiness heartbeat."""
 
@@ -1337,21 +1610,29 @@ def maintenance_command(
     )
     shared_home = Path(cfg["shared_home"]).expanduser().resolve()
     shared_home.mkdir(parents=True, exist_ok=True)
+    shared_environments = Path(
+        cfg["shared_environment_root"]
+    ).expanduser().resolve()
+    shared_environments.mkdir(parents=True, exist_ok=True)
     env = [
         "-e", f"SILICON_INSTANCE_NAME={inst.name}",
         "-e", "SILICON_CONTAINER_MODE=1",
         "-e", f"SILICON_SHARED_HOME={CONTAINER_SHARED_HOME}",
+        "-e", f"SILICON_SHARED_ENVIRONMENT_ROOT={shared_environments}",
+        "-e", "MALLOC_ARENA_MAX=2",
     ]
     user = host_user()
     volume = [
         "-v", f"{Path(inst.path).expanduser().resolve()}:{CONTAINER_PATH}",
         "-v", f"{shared_home}:{CONTAINER_SHARED_HOME}",
+        "-v", f"{shared_environments}:{shared_environments}:ro",
     ]
     cmd = [
         *_docker_cmd(cfg),
         "run",
         "--rm",
         "--no-healthcheck",
+        *_docker_run_resource_args(cfg),
         "--entrypoint",
         "/usr/local/bin/silicon-runtime-entrypoint",
         *(["--user", user] if user else []),
@@ -1373,6 +1654,7 @@ def _ephemeral_command(
     image: str | None = None,
     check: bool = False,
     capture: bool = False,
+    shared_environment_writable: bool = False,
 ) -> subprocess.CompletedProcess:
     """Run a mounted-instance command without starting the service entrypoint."""
 
@@ -1383,12 +1665,17 @@ def _ephemeral_command(
     )
     shared_home = Path(cfg["shared_home"]).expanduser().resolve()
     shared_home.mkdir(parents=True, exist_ok=True)
+    shared_environments = Path(
+        cfg["shared_environment_root"]
+    ).expanduser().resolve()
+    shared_environments.mkdir(parents=True, exist_ok=True)
     user = host_user()
     cmd = [
         *_docker_cmd(cfg),
         "run",
         "--rm",
         "--no-healthcheck",
+        *_docker_run_resource_args(cfg),
         "--entrypoint",
         command[0],
         *(["--user", user] if user else []),
@@ -1404,6 +1691,10 @@ def _ephemeral_command(
         "SILICON_CONTAINER_MODE=1",
         "-e",
         f"SILICON_SHARED_HOME={CONTAINER_SHARED_HOME}",
+        "-e",
+        f"SILICON_SHARED_ENVIRONMENT_ROOT={shared_environments}",
+        "-e",
+        "MALLOC_ARENA_MAX=2",
         *[
             item
             for value in extra_environment
@@ -1413,6 +1704,11 @@ def _ephemeral_command(
         f"{Path(inst.path).expanduser().resolve()}:{CONTAINER_PATH}",
         "-v",
         f"{shared_home}:{CONTAINER_SHARED_HOME}",
+        "-v",
+        (
+            f"{shared_environments}:{shared_environments}"
+            + ("" if shared_environment_writable else ":ro")
+        ),
         selected_image,
         *command[1:],
     ]
@@ -1464,12 +1760,25 @@ def _active_container_python(inst: registry.Install) -> str:
     generations = GenerationStore(root)
     environment = generations.resolve_environment(generations.current())
     if environment is not None:
+        environment = environment.resolve()
         environment_python = environment / "bin" / "python"
         if not environment_python.is_file():
             raise RuntimeError(
                 "active Docker Silicon environment has no Python executable"
             )
-        return _container_path(inst, environment_python)
+        instance_root = Path(inst.path).expanduser().resolve()
+        shared_root = Path(
+            config_for_install(inst)["shared_environment_root"]
+        ).expanduser().resolve()
+        if instance_root in environment_python.parents:
+            return _container_path(inst, environment_python)
+        if shared_root in environment_python.parents:
+            # The shared cache is mounted at the identical absolute path so
+            # one Linux venv can serve every container on this host.
+            return str(environment_python)
+        raise RuntimeError(
+            "active Docker Silicon environment escaped its trusted stores"
+        )
     legacy_python = (
         root / ".venv" / "bin" / "python"
     )
@@ -1578,10 +1887,12 @@ def prepare_environment(
     container_release = _container_path(inst, release_path)
     script = r"""
 import hashlib
+import fcntl
 import json
 import os
 import platform
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -1625,10 +1936,22 @@ runtime_identity = {
     "platform": platform_tag,
     "key": platform_key,
 }
-environment_root = root / ".silicon" / "environments"
+environment_root_value = str(
+    os.environ.get("SILICON_SHARED_ENVIRONMENT_ROOT") or ""
+).strip()
+if not environment_root_value:
+    raise SystemExit("shared dependency environment root is unavailable")
+environment_root = Path(environment_root_value)
+if not environment_root.is_absolute():
+    raise SystemExit("shared dependency environment root must be absolute")
 environment_root.mkdir(parents=True, exist_ok=True)
-if environment_root.is_symlink() or root not in environment_root.resolve().parents:
-    raise SystemExit("dependency environment root is unsafe")
+if (
+    environment_root.is_symlink()
+    or not environment_root.is_dir()
+    or environment_root == Path(environment_root.anchor)
+):
+    raise SystemExit("shared dependency environment root is unsafe")
+environment_root = environment_root.resolve()
 environment = environment_root / f"{digest}-{platform_key}"
 marker = environment / ".silicon-environment.json"
 if environment.is_symlink():
@@ -1649,50 +1972,67 @@ def ready():
         and (environment / "bin" / "python").is_file()
     )
 
-if not ready():
-    temporary = environment.with_name(f".{environment.name}.{os.getpid()}.tmp")
-    shutil.rmtree(temporary, ignore_errors=True)
-    if environment.exists() or environment.is_symlink():
-        if environment.is_symlink() or not environment.is_dir():
-            raise SystemExit("dependency environment target is unsafe")
-        shutil.rmtree(environment)
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "venv", "--copies", str(temporary)],
-            check=True,
+locks = environment_root / ".locks"
+locks.mkdir(parents=True, exist_ok=True)
+lock_path = locks / f"{digest}-{platform_key}.lock"
+with lock_path.open("a+b") as lock_handle:
+    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+    if not ready():
+        orphan_prefix = f".{environment.name}."
+        for orphan in environment_root.iterdir():
+            if not (
+                orphan.name.startswith(orphan_prefix)
+                and orphan.name.endswith(".tmp")
+            ):
+                continue
+            if orphan.is_symlink() or not orphan.is_dir():
+                orphan.unlink(missing_ok=True)
+            else:
+                shutil.rmtree(orphan)
+        temporary = environment.with_name(
+            f".{environment.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp"
         )
-        subprocess.run(
-            [
-                str(temporary / "bin" / "python"),
-                "-m",
-                "pip",
-                "install",
-                "--disable-pip-version-check",
-                "--no-compile",
-                "--require-hashes",
-                "-r",
-                str(requirements),
-            ],
-            check=True,
-        )
-        marker_tmp = temporary / ".silicon-environment.json.tmp"
-        marker_tmp.write_text(
-            json.dumps(
-                {
-                    "requirements_sha256": digest,
-                    "requirements_file": "requirements.lock",
-                    "require_hashes": True,
-                    "runtime": runtime_identity,
-                },
-                sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        os.replace(marker_tmp, temporary / ".silicon-environment.json")
-        os.replace(temporary, environment)
-    finally:
         shutil.rmtree(temporary, ignore_errors=True)
+        if environment.exists() or environment.is_symlink():
+            if environment.is_symlink() or not environment.is_dir():
+                raise SystemExit("dependency environment target is unsafe")
+            shutil.rmtree(environment)
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "venv", "--copies", str(temporary)],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    str(temporary / "bin" / "python"),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--disable-pip-version-check",
+                    "--require-hashes",
+                    "-r",
+                    str(requirements),
+                ],
+                check=True,
+            )
+            marker_tmp = temporary / ".silicon-environment.json.tmp"
+            marker_tmp.write_text(
+                json.dumps(
+                    {
+                        "requirements_sha256": digest,
+                        "requirements_file": "requirements.lock",
+                        "require_hashes": True,
+                        "runtime": runtime_identity,
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            os.replace(marker_tmp, temporary / ".silicon-environment.json")
+            os.replace(temporary, environment)
+        finally:
+            shutil.rmtree(temporary, ignore_errors=True)
 
 print(json.dumps({"environment_path": str(environment)}))
 """
@@ -1707,6 +2047,7 @@ print(json.dumps({"environment_path": str(environment)}))
         ),
         image=image,
         capture=True,
+        shared_environment_writable=True,
     )
     lines = result.stdout.strip().splitlines()
     if result.returncode or not lines:
@@ -1716,14 +2057,14 @@ print(json.dumps({"environment_path": str(environment)}))
         )
     try:
         value = json.loads(lines[-1])
-        environment = _host_path(inst, str(value["environment_path"]))
+        environment = Path(str(value["environment_path"])).resolve(strict=False)
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise RuntimeError(
             "Docker dependency builder returned an invalid environment path"
         ) from exc
-    environment_root = (
-        Path(inst.path).expanduser().resolve() / ".silicon" / "environments"
-    ).resolve()
+    environment_root = Path(
+        config_for_install(inst)["shared_environment_root"]
+    ).expanduser().resolve()
     if environment_root not in environment.parents:
         raise RuntimeError("Docker dependency environment escaped its safe root")
     return environment
@@ -2327,7 +2668,23 @@ def cmd_docker(args: list[str]) -> None:
         ui.info(f"Root: {cfg['root']}")
         ui.info(f"Compose: {cfg['compose_file']}")
         ui.info(f"Shared auth home: {cfg['shared_home']}")
+        ui.info(
+            "Shared dependency environments: "
+            f"{cfg['shared_environment_root']}"
+        )
         ui.info(f"Image: {cfg['image']}")
+        ui.info(
+            "Per-Silicon guards: "
+            f"CPU {cfg['cpu_limit'] or 'unlimited'}, "
+            f"memory {cfg['memory_limit'] or 'unlimited'}, "
+            f"reservation {cfg['memory_reservation'] or 'none'}, "
+            f"swap {cfg['memory_swap_limit'] or 'engine default'}, "
+            f"PIDs {cfg['pids_limit']}, files {cfg['nofile_limit']}"
+        )
+        ui.info(
+            "Docker logs: local driver, "
+            f"{cfg['log_max_size']} × {cfg['log_max_files']}"
+        )
         ui.info(f"Docker command: {'sudo docker' if cfg.get('docker_sudo') else 'docker'}")
         return
     if sub == "compose":

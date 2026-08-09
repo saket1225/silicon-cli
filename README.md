@@ -91,6 +91,14 @@ and durable update jobs.
 | `SILICON_DOCKER_SHARED_HOME` | `<root>/.shared-home` | VM-wide Claude/Codex auth home mounted into every container |
 | `SILICON_DOCKER_SUDO` | *(empty)* | set to `1` to run Docker commands through `sudo docker` |
 | `SILICON_DOCKER_ALLOW_UNPINNED_IMAGE` | *(empty)* | unsafe local-development-only escape hatch; production must leave this unset |
+| `SILICON_DOCKER_CPU_LIMIT` | `2.0` | per-Silicon CPU runaway guard; set to `off` to disable |
+| `SILICON_DOCKER_MEMORY_LIMIT` | `2g` | per-Silicon hard memory ceiling; set to `off` to disable |
+| `SILICON_DOCKER_MEMORY_RESERVATION` | `128m` | per-Silicon soft memory reservation; set to `off` to disable |
+| `SILICON_DOCKER_MEMORY_SWAP_LIMIT` | same as memory limit | total memory-plus-swap ceiling; the default prevents one Silicon from swap-thrashing the host; set to `off` for Docker's default |
+| `SILICON_DOCKER_PIDS_LIMIT` | `512` | maximum processes/threads in one Silicon container |
+| `SILICON_DOCKER_NOFILE_LIMIT` | `8192` | maximum open files/sockets in one Silicon container |
+| `SILICON_DOCKER_LOG_MAX_SIZE` | `10m` | size of each compressed local Docker log segment |
+| `SILICON_DOCKER_LOG_MAX_FILES` | `3` | retained Docker log segments per Silicon |
 | `SILICON_UPDATE_RETAIN_GENERATIONS` | `3` | bounded number of immutable update generations to retain (minimum safety floor: 2) |
 
 ## Docker runtime
@@ -195,6 +203,17 @@ it with:
 ```bash
 silicon docker compose
 ```
+
+The runtime builds each hash-pinned Linux dependency environment once under
+`~/.silicon/cache/environments` and mounts it read-only into every Silicon that
+uses the same requirements. Fleet updates therefore wait for one dependency
+build instead of repeating the same installation per container. Compose also
+uses bounded compressed logs, a 30-second deep health probe, a PID ceiling, and
+generous CPU/memory/file runaway guards. Swap is disabled inside the memory
+ceiling so a single bloated container cannot make the whole host page heavily.
+These limits protect neighboring Silicons
+without constraining normal network-bound manager replies; override them with
+the environment variables above when a specialized workload needs more.
 
 Publish the Python packages first. The runtime workflow then builds the exact
 CLI commit, stamps the runtime-contract digest into the OCI image, runs the

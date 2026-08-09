@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import stat
+import sys
 from pathlib import Path
 
 HOME = Path.home()
@@ -36,15 +37,15 @@ STEMCELL_GIT_URL = f"https://github.com/{STEMCELL_REPO}.git"
 # Silicon Interface CLI. During local development, silicon-cli will auto-detect
 # a sibling silicon-interface checkout. Production uses the immutable GitHub
 # release asset because npm publishing is not part of the runtime release path.
-SILICON_INTERFACE_CLI_VERSION = "2.0.4"
+SILICON_INTERFACE_CLI_VERSION = "2.0.5"
 SILICON_INTERFACE_CLI_RELEASE_URL = (
     "https://github.com/teamofsilicons/silicon-interface-web/releases/download/"
-    "interface-cli-v2.0.4/"
-    "teamofsilicons-silicon-interface-cli-2.0.4.tgz"
+    "interface-cli-v2.0.5/"
+    "teamofsilicons-silicon-interface-cli-2.0.5.tgz"
 )
 SILICON_INTERFACE_CLI_RELEASE_SHA256 = (
-    "75c6c5439ef7f5d62635408f00ad9314"
-    "999d397b844175e3dfcecbf822391073"
+    "ad812b6b8a257e3babe8c4f2a0bc4d71"
+    "f7dde7d109ea2475ab3400acbe37f54a"
 )
 SILICON_INTERFACE_CLI_PACKAGE = os.environ.get(
     "SILICON_INTERFACE_CLI_PACKAGE",
@@ -98,11 +99,29 @@ def active_environment_python(path: str | os.PathLike) -> str | None:
             return None
         cache_environments = (REGISTRY_DIR / "cache" / "environments").resolve()
         instance_environments = (root / ".silicon" / "environments").resolve()
+        trusted_environment_roots = [
+            cache_environments,
+            instance_environments,
+        ]
+        shared_environment_value = str(
+            os.environ.get("SILICON_SHARED_ENVIRONMENT_ROOT") or ""
+        ).strip()
+        if shared_environment_value:
+            shared_environment = Path(shared_environment_value).expanduser()
+            if (
+                not shared_environment.is_absolute()
+                or shared_environment.is_symlink()
+                or not shared_environment.is_dir()
+            ):
+                raise RuntimeError(
+                    "shared Silicon environment root is unsafe"
+                )
+            trusted_environment_roots.append(shared_environment.resolve())
         if (
             not environment.is_dir()
             or not any(
                 allowed == environment or allowed in environment.parents
-                for allowed in (cache_environments, instance_environments)
+                for allowed in trusted_environment_roots
             )
         ):
             raise RuntimeError(
@@ -167,6 +186,12 @@ def runtime_environment(path: str | os.PathLike) -> dict[str, str]:
     root = Path(path).resolve()
     environment["SILICON_DATA_ROOT"] = str(root)
     environment["SILICON_RELEASE_ROOT"] = str(active_release_root(path))
+    # glibc otherwise creates one malloc arena per busy thread and retains
+    # freed pages for long-lived manager/sidecar processes. Two arenas keep
+    # concurrency while bounding age-related RSS growth; explicit operator
+    # overrides remain authoritative.
+    if sys.platform.startswith("linux"):
+        environment.setdefault("MALLOC_ARENA_MAX", "2")
     python = active_environment_python(root) or venv_python(root)
     if python:
         active_bin = str(Path(python).resolve().parent)

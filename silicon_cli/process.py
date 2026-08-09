@@ -475,7 +475,7 @@ def runtime_ready(
     pid_file: str | os.PathLike,
     *,
     min_uptime: float = 5.0,
-    max_heartbeat_age: float = 5.0,
+    max_heartbeat_age: float = 15.0,
 ) -> bool:
     """Require both supervisor child health and the app's ready heartbeat."""
 
