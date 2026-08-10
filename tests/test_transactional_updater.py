@@ -755,6 +755,53 @@ class TransactionTests(unittest.TestCase):
                 fixture.events.index("stop"),
             )
 
+    def test_partially_running_service_set_is_rejected_before_transaction(self):
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = Fixture(Path(raw))
+            fixture.services = {
+                "container": True,
+                "main": False,
+                "glass_agent": True,
+                "interface": True,
+            }
+            updater = TransactionalUpdater(
+                fixture.instance, fixture.cache, hooks=fixture.hooks()
+            )
+
+            with self.assertRaisesRegex(UpdateError, "main process is not running"):
+                updater.plan(fixture.release)
+            with self.assertRaisesRegex(UpdateError, "main process is not running"):
+                updater.preflight(fixture.release)
+            with self.assertRaisesRegex(UpdateError, "main process is not running"):
+                updater.run(fixture.release)
+
+            self.assertEqual(updater.history(), [])
+            self.assertNotIn("drain", fixture.events)
+
+    def test_revoked_ack_without_recorded_main_does_not_busy_loop(self):
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = Fixture(Path(raw))
+            hooks = fixture.hooks()
+            hooks.set_phase = lambda *_args: (_ for _ in ()).throw(
+                RuntimeError("runtime has not reached safe_to_stop")
+            )
+            quiescent = mock.Mock()
+            hooks.await_quiescent = quiescent
+            updater = TransactionalUpdater(
+                fixture.instance, fixture.cache, hooks=hooks
+            )
+
+            with self.assertRaisesRegex(UpdateError, "recorded main process"):
+                updater._enter_updating_at_safe_boundary(
+                    "transaction",
+                    None,
+                    lambda: False,
+                    False,
+                    "test",
+                )
+
+            quiescent.assert_not_called()
+
     def test_fleet_can_defer_retention_until_after_activation_commit(self):
         with tempfile.TemporaryDirectory() as raw:
             fixture = Fixture(Path(raw))

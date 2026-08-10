@@ -177,6 +177,18 @@ class TransactionalUpdater:
         return digest
 
     @staticmethod
+    def _validate_service_state_for_update(state: dict[str, bool]) -> None:
+        """Reject a partially running runtime before it can own a fence."""
+
+        active = sorted(key for key, value in state.items() if bool(value))
+        if active and not bool(state.get("main")):
+            raise UpdateError(
+                "Silicon main process is not running while supporting "
+                f"services remain active ({', '.join(active)}); start the "
+                "Silicon or stop it fully before updating"
+            )
+
+    @staticmethod
     def _prune_source_exclusions(root: Path) -> None:
         """Remove living data and generated files from an immutable source tree."""
 
@@ -203,6 +215,7 @@ class TransactionalUpdater:
                 raise UpdateError(
                     "cannot plan over an interrupted update; resume it first"
                 )
+            self._validate_service_state_for_update(self.hooks.service_state())
             work = self.instance / ".silicon" / "work" / dry_id
             shutil.rmtree(work, ignore_errors=True)
             try:
@@ -539,6 +552,13 @@ class TransactionalUpdater:
             except Exception as exc:
                 if "runtime has not reached safe_to_stop" not in str(exc):
                     raise
+                if not services_running:
+                    raise UpdateError(
+                        "maintenance acknowledgement was revoked after the "
+                        "checkpoint, but the recorded main process was not "
+                        "running; recover the transaction and start the "
+                        "Silicon before retrying"
+                    ) from exc
             self.hooks.await_quiescent(
                 transaction_id,
                 deadline,
@@ -569,6 +589,7 @@ class TransactionalUpdater:
                 )
             current = self.generations.current()
             self._validate_release_sequence(current, cached)
+            self._validate_service_state_for_update(self.hooks.service_state())
             work = self.instance / ".silicon" / "work" / preflight_id
             shutil.rmtree(work, ignore_errors=True)
             work.mkdir(parents=True, exist_ok=True)
@@ -623,6 +644,7 @@ class TransactionalUpdater:
             current = self.generations.current()
             self._validate_release_sequence(current, cached)
             service_state = self.hooks.service_state()
+            self._validate_service_state_for_update(service_state)
             journal = TransactionJournal.create(
                 self.instance,
                 {
@@ -1168,6 +1190,15 @@ class TransactionalUpdater:
                 )
                 restart_release = self.cache.load(release_digest)
             elif state == "STOPPING":
+                try:
+                    self._validate_service_state_for_update(service_state)
+                except UpdateError as exc:
+                    self._recover_after_stop_boundary(
+                        journal,
+                        service_state,
+                        exc,
+                    )
+                    return journal.value
                 self._enter_updating_at_safe_boundary(
                     txid,
                     None,
@@ -1302,6 +1333,15 @@ class TransactionalUpdater:
                     )
                     restart = True
                 elif state == "STOPPING":
+                    try:
+                        self._validate_service_state_for_update(services)
+                    except UpdateError as exc:
+                        self._recover_after_stop_boundary(
+                            journal,
+                            services,
+                            exc,
+                        )
+                        return journal.value
                     self._enter_updating_at_safe_boundary(
                         txid,
                         None,
