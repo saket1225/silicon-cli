@@ -1367,6 +1367,119 @@ class TransactionTests(unittest.TestCase):
                 active_release_root(fixture.instance), fixture.instance.resolve()
             )
 
+    def test_rollback_reuses_and_repairs_instance_local_environment(self):
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = Fixture(Path(raw))
+            Fixture._write(
+                fixture.new,
+                "requirements.lock",
+                "example==1 --hash=sha256:" + "a" * 64 + "\n",
+            )
+            fixture.release = create_artifact(
+                fixture.new,
+                fixture.root / "release-with-dependencies.tar",
+                revision="a" * 40,
+                source_label="test",
+                trust="test-fixture",
+            )
+            newer = fixture.root / "newer-with-dependencies"
+            shutil.copytree(fixture.new, newer)
+            Fixture._write(newer, "core/tool.py", "VALUE = 'newer'\n")
+            newer_release = create_artifact(
+                newer,
+                fixture.root / "newer-with-dependencies.tar",
+                revision="b" * 40,
+                source_label="test",
+                trust="test-fixture",
+            )
+            local_environment = (
+                fixture.instance
+                / ".silicon"
+                / "environments"
+                / "target-runtime"
+            )
+            shared_environment = fixture.cache.environments / "shared-runtime"
+            prepare_calls = 0
+            hooks = fixture.hooks()
+
+            def prepare(_release, _runtime_image):
+                nonlocal prepare_calls
+                prepare_calls += 1
+                environment = (
+                    local_environment
+                    if prepare_calls == 1
+                    else shared_environment
+                )
+                environment.mkdir(parents=True, exist_ok=True)
+                return environment
+
+            hooks.prepare_environment = prepare
+            updater = TransactionalUpdater(
+                fixture.instance,
+                fixture.cache,
+                hooks=hooks,
+            )
+            updater.run(fixture.release)
+            first_generation = updater.generations.current()
+            second = updater.run(newer_release)
+            Fixture._write(
+                updater.generations.resolve_release(first_generation),
+                "core/tool.py",
+                "VALUE = 'drifted after activation'\n",
+            )
+
+            rolled_back = updater.rollback(
+                transaction_id=second["transaction_id"]
+            )
+            self.assertEqual(rolled_back["state"], "COMMITTED")
+            self.assertEqual(prepare_calls, 2)
+            self.assertIn(
+                "-rollback-",
+                rolled_back["metadata"]["staged_release_path"],
+            )
+            self.assertEqual(
+                updater.generations.current()["environment_path"],
+                ".silicon/environments/target-runtime",
+            )
+
+            third = updater.run(newer_release)
+            normal_start = hooks.start_services
+
+            def crash_after_activation(state):
+                normal_start(state)
+                raise FailpointCrash("process exited after rollback activation")
+
+            hooks.start_services = crash_after_activation
+            with self.assertRaises(FailpointCrash):
+                updater.rollback(transaction_id=third["transaction_id"])
+
+            journal = TransactionJournal.history(fixture.instance)[0]
+            self.assertEqual(journal.state, "ACTIVATED")
+            broken = dict(journal.metadata["new_generation"])
+            broken["environment_path"] = str(shared_environment.resolve())
+            updater.generations.restore(broken)
+            journal.merge_metadata(
+                new_generation=broken,
+                environment_path=broken["environment_path"],
+            )
+
+            updater.hooks = fixture.hooks()
+            resumed = updater.resume()
+            self.assertEqual(resumed["state"], "COMMITTED")
+            self.assertEqual(
+                updater.generations.current()["environment_path"],
+                ".silicon/environments/target-runtime",
+            )
+            self.assertEqual(
+                resumed["metadata"]["rollback_environment_compatibility"],
+                {
+                    "state": "repaired",
+                    "environment_path": (
+                        ".silicon/environments/target-runtime"
+                    ),
+                },
+            )
+
     def test_rollback_carries_post_activation_self_customizations(self):
         with tempfile.TemporaryDirectory() as raw:
             fixture = Fixture(Path(raw))

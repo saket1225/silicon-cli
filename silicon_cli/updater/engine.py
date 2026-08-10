@@ -20,6 +20,7 @@ from .io import (
     fsync_dir,
     hash_tree,
     regular_files,
+    sha256_file,
 )
 from .journal import (
     ORDERED_STATES,
@@ -430,6 +431,84 @@ class TransactionalUpdater:
         raise UpdateError(
             "prepared dependency environment escaped every trusted store"
         )
+
+    def _compatible_rollback_environment(
+        self,
+        target_generation: dict[str, Any],
+        rollback_release: Path,
+    ) -> Path | None:
+        """Reuse the target's instance-local venv when its lock is unchanged.
+
+        Runtimes published before shared dependency environments were added
+        reject absolute host-cache pointers.  A rollback must therefore prefer
+        the already authenticated, instance-local environment that made the
+        target generation healthy, provided the reconstructed release has the
+        exact same dependency lock.
+        """
+
+        raw_pointer = Path(
+            str(target_generation.get("environment_path") or "")
+        )
+        if (
+            raw_pointer.is_absolute()
+            or raw_pointer.parts[:2] != (".silicon", "environments")
+        ):
+            return None
+        try:
+            environment = self.generations.resolve_environment(
+                target_generation
+            )
+            target_release = self.generations.resolve_release(
+                target_generation
+            )
+        except GenerationError:
+            return None
+        if environment is None:
+            return None
+        target_lock = target_release / "requirements.lock"
+        rollback_lock = rollback_release / "requirements.lock"
+        if (
+            target_lock.is_symlink()
+            or rollback_lock.is_symlink()
+            or not target_lock.is_file()
+            or not rollback_lock.is_file()
+            or sha256_file(target_lock) != sha256_file(rollback_lock)
+        ):
+            return None
+        return environment
+
+    def _repair_resumed_rollback_environment(
+        self,
+        journal: TransactionJournal,
+        generation: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Repair an activated rollback made by a pre-fix CLI invocation."""
+
+        target = journal.metadata.get("rollback_target_generation")
+        if not isinstance(target, dict):
+            return generation
+        environment = self._compatible_rollback_environment(
+            target,
+            self.generations.resolve_release(generation),
+        )
+        if environment is None:
+            return generation
+        pointer = self._environment_pointer(environment)
+        if pointer == str(generation.get("environment_path") or ""):
+            return generation
+        repaired = dict(generation)
+        repaired["environment_path"] = pointer
+        self.generations.validate(repaired)
+        self.generations.restore(repaired)
+        journal.merge_metadata(
+            new_generation=repaired,
+            environment_path=pointer,
+            rollback_environment_compatibility={
+                "state": "repaired",
+                "environment_path": pointer,
+            },
+        )
+        return repaired
 
     def preflight(
         self,
@@ -1138,6 +1217,16 @@ class TransactionalUpdater:
                 txid, target_version[:64], resume_phase
             )
             active = self.generations.current()
+            if (
+                state in {"ACTIVATED", "STARTED", "VALIDATED"}
+                and active.get("generation_id")
+                == desired.get("generation_id")
+            ):
+                desired = self._repair_resumed_rollback_environment(
+                    journal,
+                    desired,
+                )
+                active = self.generations.current()
             recovery_started = bool(
                 metadata.get("recovery_error")
                 or metadata.get("checkpoint_recovery")
@@ -1664,7 +1753,8 @@ class TransactionalUpdater:
         )
         materialized_sha, _files = hash_tree(candidate)
         generation_id = (
-            f"{target_upstream[:16]}-{materialized_sha[:16]}"
+            f"{target_upstream[:16]}-{materialized_sha[:16]}-rollback-"
+            f"{journal.transaction_id[-12:]}"
         )
         final_release = self.generations.releases / generation_id
         if final_release.exists():
@@ -1681,10 +1771,15 @@ class TransactionalUpdater:
             os.replace(candidate, final_release)
             fsync_dir(final_release.parent)
 
-        environment = self._prepare_dependency_environment(
+        environment = self._compatible_rollback_environment(
+            desired,
             final_release,
-            target_release.manifest.runtime_image,
         )
+        if environment is None:
+            environment = self._prepare_dependency_environment(
+                final_release,
+                target_release.manifest.runtime_image,
+            )
         environment_pointer = self._environment_pointer(environment)
 
         generation = {
