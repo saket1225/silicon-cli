@@ -247,7 +247,7 @@ PY
     export PATH="$SILICON_ROOT/.venv/bin:$PATH"
   fi
 
-  python - "${SILICON_EXTEND_REQUIRED_VERSION:-0.1.4}" <<'PY'
+  "$runtime_python" - "${SILICON_EXTEND_REQUIRED_VERSION:-0.1.4}" <<'PY'
 from importlib import metadata
 import sys
 

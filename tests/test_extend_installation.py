@@ -82,6 +82,15 @@ class ExtendInstallationTest(unittest.TestCase):
             'name="silicon-extend"',
             entrypoint,
         )
+        self.assertIn(
+            '"$runtime_python" - '
+            '"${SILICON_EXTEND_REQUIRED_VERSION:-0.1.4}"',
+            entrypoint,
+        )
+        self.assertNotIn(
+            '\n  python - "${SILICON_EXTEND_REQUIRED_VERSION:-0.1.4}"',
+            entrypoint,
+        )
 
     def test_runtime_image_declares_required_extend_version(self):
         dockerfile = (
