@@ -477,6 +477,31 @@ class CliUpdateTests(unittest.TestCase):
             store=Path(checkpoint["store"]),
         )
 
+    def test_checkpoint_retries_atomic_snapshot_source_disappearance(self):
+        expected = {
+            "provider": "stemcell-canonical",
+            "root_hash": "a" * 64,
+        }
+        snapshot_command = mock.Mock(
+            side_effect=(
+                update.UpdateError(
+                    "canonical local recovery snapshot failed: "
+                    "Protected source disappeared: "
+                    "core/interface_state/.maintenance.json.jl_0y4vb.tmp"
+                ),
+                expected,
+            )
+        )
+        with mock.patch.object(update.time, "sleep") as sleep:
+            actual = update._create_checkpoint_with_transient_retry(
+                snapshot_command,
+                "generation-0:pre-update:tx-1",
+            )
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(snapshot_command.call_count, 2)
+        sleep.assert_called_once_with(0.1)
+
     def test_post_commit_retention_runs_active_canonical_snapshot_gc(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

@@ -30,9 +30,14 @@ class MaintenanceTimeout(MaintenanceError):
     pass
 
 
+class TransientMaintenanceError(MaintenanceError):
+    """A Glass transport failure that is safe to retry idempotently."""
+
+
 TERMINAL_GLASS_PHASES = {"idle", "rolled_back", "deferred", "failed"}
 MAX_GLASS_RESPONSE_BYTES = 1024 * 1024
 MAX_GLASS_ERROR_BYTES = 64 * 1024
+GLASS_TRANSITION_ATTEMPTS = 4
 
 
 def _origin(value: str) -> tuple[str, str, int]:
@@ -242,14 +247,27 @@ class GlassMaintenanceLease:
                     ) + suffix
                 except Exception:
                     detail_text = str(exc)
-                raise MaintenanceError(
+                error_type = (
+                    TransientMaintenanceError
+                    if exc.code in {408, 425, 429} or 500 <= exc.code <= 599
+                    else MaintenanceError
+                )
+                raise error_type(
                     f"Glass maintenance update failed ({exc.code}): "
                     f"{detail_text}"
                 ) from exc
             except MaintenanceError:
                 raise
             except Exception as exc:
-                raise MaintenanceError(
+                error_type = (
+                    TransientMaintenanceError
+                    if isinstance(
+                        exc,
+                        (urllib.error.URLError, TimeoutError, ConnectionError),
+                    )
+                    else MaintenanceError
+                )
+                raise error_type(
                     f"Glass maintenance update failed: {exc}"
                 ) from exc
             finally:
@@ -278,6 +296,18 @@ class GlassMaintenanceLease:
                 )
             self._phase = phase
             return value
+
+    def _send_required(self, phase: str) -> dict:
+        """Retry only idempotent, explicitly transient Glass transitions."""
+
+        for attempt in range(GLASS_TRANSITION_ATTEMPTS):
+            try:
+                return self._send(phase)
+            except TransientMaintenanceError:
+                if attempt + 1 >= GLASS_TRANSITION_ATTEMPTS:
+                    raise
+                time.sleep(0.25 * (2**attempt))
+        raise AssertionError("unreachable Glass transition retry state")
 
     def _get_projection(self) -> dict:
         if self.credentials is None:
@@ -316,7 +346,7 @@ class GlassMaintenanceLease:
         if not self.configured:
             return
         self._retry_pending()
-        self._send("preparing")
+        self._send_required("preparing")
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._heartbeat,
@@ -349,7 +379,7 @@ class GlassMaintenanceLease:
                     )
                 ),
             )
-            self._send(phase)
+            self._send_required(phase)
         except Exception:
             # Local crash recovery must not strand a stopped Silicon merely
             # because Glass is temporarily unreachable. Its old lease will
@@ -393,7 +423,7 @@ class GlassMaintenanceLease:
         if not self.configured:
             return
         try:
-            self._send(phase)
+            self._send_required(phase)
         except MaintenanceError:
             if required:
                 raise

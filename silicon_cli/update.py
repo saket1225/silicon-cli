@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import signal
 import stat
 import subprocess
@@ -85,6 +86,28 @@ DEFAULT_FLEET_CONCURRENCY = 8
 DEFAULT_FLEET_CANARY_COUNT = 1
 MAX_FLEET_CONCURRENCY = 64
 PREWARM_MARKER = "SILICON_UPDATE_PREWARM="
+SNAPSHOT_TRANSIENT_ATTEMPTS = 3
+_ATOMIC_SNAPSHOT_DISAPPEAR_RE = re.compile(
+    r"Protected source disappeared: [^\n]*"
+    r"(?:^|/)\..+\.(?:[0-9]+\.[0-9]+|[A-Za-z0-9_-]{8})\.tmp(?:\s|$)"
+)
+
+
+def _create_checkpoint_with_transient_retry(snapshot_command, release_id: str):
+    """Repeat the whole protected-path walk after an atomic temp rename."""
+
+    payload = {"release_id": release_id}
+    for attempt in range(SNAPSHOT_TRANSIENT_ATTEMPTS):
+        try:
+            return snapshot_command("create", payload)
+        except UpdateError as exc:
+            if (
+                _ATOMIC_SNAPSHOT_DISAPPEAR_RE.search(str(exc)) is None
+                or attempt + 1 >= SNAPSHOT_TRANSIENT_ATTEMPTS
+            ):
+                raise
+            time.sleep(0.1 * (2**attempt))
+    raise AssertionError("unreachable checkpoint retry state")
 
 
 def _compensation_worker_count(concurrency: int, members: int) -> int:
@@ -359,9 +382,9 @@ def _local_hooks(inst: registry.Install) -> EngineHooks:
     def create_checkpoint(transaction_id: str, release_id: str) -> dict[str, str]:
         snapshot_release = f"{release_id}:pre-update:{transaction_id}"
         try:
-            return snapshot_command(
-                "create",
-                {"release_id": snapshot_release},
+            return _create_checkpoint_with_transient_retry(
+                snapshot_command,
+                snapshot_release,
             )
         except UpdateError as exc:
             message = str(exc)
@@ -734,9 +757,9 @@ def _docker_hooks(inst: registry.Install) -> EngineHooks:
     def create_checkpoint(transaction_id: str, release_id: str) -> dict[str, str]:
         snapshot_release = f"{release_id}:pre-update:{transaction_id}"
         try:
-            return snapshot_command(
-                "create",
-                {"release_id": snapshot_release},
+            return _create_checkpoint_with_transient_retry(
+                snapshot_command,
+                snapshot_release,
             )
         except UpdateError as exc:
             message = str(exc)

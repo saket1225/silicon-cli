@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import io
 import json
 import tempfile
 import time
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -31,6 +33,48 @@ class RawResponse:
 
 
 class GlassLeaseTests(unittest.TestCase):
+    def test_required_transition_retries_transient_glass_502(self):
+        with tempfile.TemporaryDirectory() as raw:
+            instance = Path(raw)
+            (instance / ".glass.json").write_text(
+                json.dumps(
+                    {
+                        "server_url": "https://glass.example",
+                        "api_key": "scs_live_test",
+                    }
+                )
+            )
+            calls = 0
+
+            def open_request(request, **_kwargs):
+                nonlocal calls
+                calls += 1
+                if calls < 3:
+                    raise urllib.error.HTTPError(
+                        request.full_url,
+                        502,
+                        "Bad Gateway",
+                        {},
+                        io.BytesIO(b"temporary upstream failure"),
+                    )
+                payload = json.loads(request.data)
+                return Response({"active": True, **payload})
+
+            lease = GlassMaintenanceLease(
+                instance, opener=open_request, heartbeat_seconds=3600
+            )
+            with mock.patch(
+                "silicon_cli.updater.maintenance.time.sleep"
+            ) as sleep:
+                lease.begin("update-retry", "2.0.0")
+            lease.finish("cancelled")
+
+            self.assertEqual(calls, 4)
+            self.assertEqual(
+                [call.args[0] for call in sleep.call_args_list],
+                [0.25, 0.5],
+            )
+
     def test_rejects_oversized_and_non_object_glass_responses(self):
         with tempfile.TemporaryDirectory() as raw:
             instance = Path(raw)
