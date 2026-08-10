@@ -719,6 +719,42 @@ class TransactionTests(unittest.TestCase):
                 "important memory\n",
             )
 
+    def test_checkpoint_safe_boundary_race_waits_for_fresh_ack(self):
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = Fixture(Path(raw))
+            hooks = fixture.hooks()
+            normal_set_phase = hooks.set_phase
+            updating_attempts = 0
+
+            def race_safe_boundary(transaction_id, phase, detail):
+                nonlocal updating_attempts
+                if phase == "updating":
+                    updating_attempts += 1
+                    if updating_attempts == 1:
+                        raise RuntimeError(
+                            "runtime has not reached safe_to_stop"
+                        )
+                normal_set_phase(transaction_id, phase, detail)
+
+            hooks.set_phase = race_safe_boundary
+            updater = TransactionalUpdater(
+                fixture.instance, fixture.cache, hooks=hooks
+            )
+
+            result = updater.run(fixture.release)
+
+            self.assertEqual(result["state"], "COMMITTED")
+            self.assertEqual(updating_attempts, 2)
+            self.assertEqual(fixture.events.count("quiescent"), 2)
+            self.assertLess(
+                max(
+                    index
+                    for index, event in enumerate(fixture.events)
+                    if event == "quiescent"
+                ),
+                fixture.events.index("stop"),
+            )
+
     def test_fleet_can_defer_retention_until_after_activation_commit(self):
         with tempfile.TemporaryDirectory() as raw:
             fixture = Fixture(Path(raw))

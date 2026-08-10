@@ -510,6 +510,42 @@ class TransactionalUpdater:
         )
         return repaired
 
+    def _enter_updating_at_safe_boundary(
+        self,
+        transaction_id: str,
+        deadline: float | None,
+        cancelled: Callable[[], bool],
+        services_running: bool,
+        detail: str,
+    ) -> None:
+        """Cross a maintenance fence whose acknowledgement may be retracted.
+
+        A durable outbox item or pre-fence descendant can appear while the
+        updater is checkpointing and revoke ``safe_to_stop``.  The phase
+        transition is the authoritative atomic revalidation.  If it loses
+        that race, wait for a fresh acknowledgement and retry rather than
+        recovering a Silicon whose services were never stopped.
+        """
+        while True:
+            if cancelled():
+                raise UpdateCancelled("update cancellation requested")
+            try:
+                self.hooks.set_phase(
+                    transaction_id,
+                    "updating",
+                    detail,
+                )
+                return
+            except Exception as exc:
+                if "runtime has not reached safe_to_stop" not in str(exc):
+                    raise
+            self.hooks.await_quiescent(
+                transaction_id,
+                deadline,
+                cancelled,
+                services_running,
+            )
+
     def preflight(
         self,
         release: FetchedRelease,
@@ -681,8 +717,12 @@ class TransactionalUpdater:
                     "cancel boundary crossed; revalidating maintenance fence",
                     failpoint=failpoint,
                 )
-                self.hooks.set_phase(
-                    txid, "updating", "Stopping services at a safe boundary"
+                self._enter_updating_at_safe_boundary(
+                    txid,
+                    deadline,
+                    journal.cancellation_requested,
+                    bool(service_state.get("main")),
+                    "Stopping services at a safe boundary",
                 )
                 stopped = True
                 self.hooks.stop_services()
@@ -1128,8 +1168,12 @@ class TransactionalUpdater:
                 )
                 restart_release = self.cache.load(release_digest)
             elif state == "STOPPING":
-                self.hooks.set_phase(
-                    txid, "updating", "Resuming stop at a safe boundary"
+                self._enter_updating_at_safe_boundary(
+                    txid,
+                    None,
+                    journal.cancellation_requested,
+                    bool(service_state.get("main")),
+                    "Resuming stop at a safe boundary",
                 )
                 self.hooks.stop_services()
                 journal.transition("STOPPED", "service stop resumed")
@@ -1258,8 +1302,12 @@ class TransactionalUpdater:
                     )
                     restart = True
                 elif state == "STOPPING":
-                    self.hooks.set_phase(
-                        txid, "updating", "Resuming rollback stop boundary"
+                    self._enter_updating_at_safe_boundary(
+                        txid,
+                        None,
+                        journal.cancellation_requested,
+                        bool(services.get("main")),
+                        "Resuming rollback stop boundary",
                     )
                     self.hooks.stop_services()
                     journal.transition("STOPPED", "rollback service stop resumed")
@@ -1941,8 +1989,12 @@ class TransactionalUpdater:
                 journal.transition(
                     "STOPPING", "rollback cancel boundary crossed"
                 )
-                self.hooks.set_phase(
-                    txid, "updating", "Stopping at the verified safe boundary"
+                self._enter_updating_at_safe_boundary(
+                    txid,
+                    deadline,
+                    journal.cancellation_requested,
+                    bool(services.get("main")),
+                    "Stopping at the verified safe boundary",
                 )
                 self.hooks.stop_services()
                 journal.transition("STOPPED", "current services stopped")
