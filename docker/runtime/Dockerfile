@@ -5,8 +5,8 @@ ARG RUNTIME_CONTRACT_SHA256=unknown
 ARG SILICON_CLI_SPEC=silicon-cli==1.0.29
 ARG SILICON_BROWSER_SPEC=silicon-browser==1.1.1
 ARG SILICON_EXTEND_SPEC=silicon-extend==0.1.4
-ARG SILICON_INTERFACE_CLI_URL=https://github.com/teamofsilicons/silicon-interface-web/releases/download/interface-cli-v2.0.5/teamofsilicons-silicon-interface-cli-2.0.5.tgz
-ARG SILICON_INTERFACE_CLI_SHA256=ad812b6b8a257e3babe8c4f2a0bc4d71f7dde7d109ea2475ab3400acbe37f54a
+ARG SILICON_INTERFACE_CLI_URL=https://github.com/teamofsilicons/silicon-interface-web/releases/download/interface-cli-v2.0.6/teamofsilicons-silicon-interface-cli-2.0.6.tgz
+ARG SILICON_INTERFACE_CLI_SHA256=16a99e3a556436593a17930b5325e359bbd60997031eec82592dbd512229a5ed
 ARG CLAUDE_CODE_SPEC=@anthropic-ai/claude-code@2.1.220
 ARG CODEX_SPEC=@openai/codex@0.146.0
 ARG PIP_SPEC=pip==26.2
