@@ -130,6 +130,154 @@ class DockerRuntimeTests(unittest.TestCase):
 
         self.assertEqual(cfg["image"], "")
 
+    def test_docker_is_not_selected_by_saved_configuration(self):
+        self.write_docker_config()
+
+        self.assertFalse(docker_runtime.runtime_requested())
+
+    def test_docker_requires_an_explicit_runtime_selection(self):
+        self.write_docker_config()
+        os.environ["SILICON_RUNTIME"] = "docker"
+
+        self.assertTrue(docker_runtime.runtime_requested())
+
+    def test_migrate_local_prepares_host_runtime_before_registry_switch(self):
+        cfg = self.write_docker_config()
+        instance = Path(cfg["root"]) / "ada"
+        release = instance / ".silicon" / "releases" / "generation-1"
+        environment = self.root / "host-environment"
+        release.mkdir(parents=True)
+        environment.mkdir()
+        registry.register(
+            "ada",
+            str(instance),
+            runtime="docker",
+            service="silicon-ada",
+            compose_file=cfg["compose_file"],
+            image="image@sha256:" + "a" * 64,
+            container_name="silicon-ada",
+        )
+        store = mock.Mock()
+        store.current.return_value = {
+            "kind": "immutable-release",
+            "environment_path": "old-environment",
+        }
+        store.resolve_release.return_value = release
+        cache = mock.Mock()
+        cache.prepare_environment.return_value = environment
+
+        with (
+            mock.patch.object(
+                docker_runtime, "container_running", return_value=False
+            ),
+            mock.patch.object(
+                docker_runtime.runtime_contract, "verify_host_pull_runtime"
+            ),
+            mock.patch.object(
+                docker_runtime.runtime_contract, "verify_host_providers"
+            ),
+            mock.patch.object(
+                docker_runtime.runtime_contract,
+                "verify_local_interface_install",
+            ),
+            mock.patch.object(docker_runtime.interface_cli, "setup") as setup,
+            mock.patch(
+                "silicon_cli.updater.journal.TransactionJournal.history",
+                return_value=[],
+            ),
+            mock.patch(
+                "silicon_cli.updater.generation.GenerationStore",
+                return_value=store,
+            ),
+            mock.patch(
+                "silicon_cli.updater.cache.ReleaseCache",
+                return_value=cache,
+            ),
+            mock.patch.object(docker_runtime, "render_compose"),
+        ):
+            docker_runtime.migrate_local("ada")
+
+        migrated = registry.find("ada")
+        self.assertIsNotNone(migrated)
+        self.assertEqual(migrated.runtime, "local")
+        self.assertEqual(migrated.service, "")
+        self.assertEqual(migrated.image, "")
+        setup.assert_called_once_with(
+            instance.resolve(), required=True, start_daemon=False
+        )
+        restored = store.restore.call_args.args[0]
+        self.assertEqual(
+            restored["environment_path"], str(environment.resolve())
+        )
+
+    def test_host_local_migration_rebinds_and_anchors_inbox_cursor(self):
+        instance = self.root / "silicons" / "ada"
+        inbox = instance / ".silicon-interface" / "inbox.jsonl"
+        cursor = (
+            instance
+            / "core"
+            / "interface_state"
+            / "interface_inbox_consumer.json"
+        )
+        inbox.parent.mkdir(parents=True)
+        cursor.parent.mkdir(parents=True)
+        first = b'{"event_id":"evt-1"}\n'
+        inbox.write_bytes(first + b'{"event_id":"evt-2"}\n')
+        cursor.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "path": "/silicon/.silicon-interface/inbox.jsonl",
+                    "file_id": "docker:file-id",
+                    "offset": len(first),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        changed = docker_runtime._prepare_host_local_inbox_cursor(instance)
+
+        self.assertTrue(changed)
+        state = json.loads(cursor.read_text(encoding="utf-8"))
+        metadata = inbox.stat()
+        self.assertEqual(state["path"], str(inbox.resolve()))
+        self.assertEqual(
+            state["file_id"], f"{metadata.st_dev}:{metadata.st_ino}"
+        )
+        self.assertEqual(state["offset"], len(first))
+        self.assertEqual(state["anchor_start"], 0)
+        self.assertEqual(
+            state["anchor_sha256"],
+            hashlib.sha256(first).hexdigest(),
+        )
+
+    def test_host_local_migration_rejects_cursor_outside_instance(self):
+        instance = self.root / "silicons" / "ada"
+        inbox = instance / ".silicon-interface" / "inbox.jsonl"
+        cursor = (
+            instance
+            / "core"
+            / "interface_state"
+            / "interface_inbox_consumer.json"
+        )
+        inbox.parent.mkdir(parents=True)
+        cursor.parent.mkdir(parents=True)
+        inbox.write_bytes(b'{}\n')
+        cursor.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "path": "/tmp/unrelated-inbox.jsonl",
+                    "file_id": "other:file-id",
+                    "offset": 3,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "outside the selected"):
+            docker_runtime._prepare_host_local_inbox_cursor(instance)
+
     def test_full_stop_falls_back_when_restart_loop_blocks_exec(self):
         cfg = self.write_docker_config()
         instance = self.root / "silicons" / "ada"
@@ -2204,6 +2352,18 @@ class DockerRuntimeTests(unittest.TestCase):
 
     def test_pull_runtime_can_be_opted_out(self):
         os.environ["SILICON_RUNTIME"] = "local"
+        old_ensure = docker_runtime.ensure_ready
+
+        def fail_if_called(**_kwargs):
+            raise AssertionError("ensure_ready should not be called")
+
+        docker_runtime.ensure_ready = fail_if_called
+        try:
+            self.assertFalse(docker_runtime.ensure_pull_runtime())
+        finally:
+            docker_runtime.ensure_ready = old_ensure
+
+    def test_pull_runtime_defaults_to_host_local(self):
         old_ensure = docker_runtime.ensure_ready
 
         def fail_if_called(**_kwargs):

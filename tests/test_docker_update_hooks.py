@@ -351,6 +351,40 @@ class DockerUpdateHookTests(unittest.TestCase):
 
         glass_begin.assert_not_called()
 
+    def test_stopped_coordinator_capable_docker_uses_offline_fence(self):
+        coordinator = self.root / "core" / "maintenance.py"
+        coordinator.parent.mkdir()
+        coordinator.write_text("# installed coordinator\n", encoding="utf-8")
+        with (
+            mock.patch.object(
+                update.docker_runtime,
+                "maintenance_coordinator_available",
+                return_value=True,
+            ),
+            mock.patch.object(
+                update.docker_runtime,
+                "container_running",
+                return_value=False,
+            ),
+            mock.patch.object(
+                update.docker_runtime,
+                "run_active_python",
+            ) as active_python,
+        ):
+            hooks = update._hooks(self.install)
+            hooks.begin_maintenance("tx-offline", "2.0.0")
+            hooks.request_drain("tx-offline", None)
+
+        active_python.assert_not_called()
+        self.assertTrue(
+            (
+                self.root
+                / ".silicon"
+                / "maintenance"
+                / "legacy-offline.json"
+            ).is_file()
+        )
+
     def test_schema_floor_error_falls_back_to_bootstrap_snapshot(self):
         bootstrap = {
             "manifest_path": str(self.root / "manifest.json"),

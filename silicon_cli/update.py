@@ -11,7 +11,14 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from collections import deque
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+)
 from contextlib import contextmanager
 from importlib import metadata
 from pathlib import Path
@@ -41,7 +48,11 @@ from .updater.cache import ReleaseCache
 from .updater.channel import ReleaseChannelError, fetch_latest_release
 from .updater.fleet import FleetJournal, FleetJournalError
 from .updater.lock import InstanceLock
-from .updater.maintenance import MaintenanceError, MaintenanceProtocol
+from .updater.maintenance import (
+    MaintenanceError,
+    MaintenanceProtocol,
+    MaintenanceTimeout,
+)
 from .updater.release import FetchedRelease
 
 # A restarted Silicon must satisfy min_uptime AND publish a fresh heartbeat
@@ -85,6 +96,14 @@ FLEET_COMPENSATION_CONCURRENCY = DOCKER_CONTROL_CONCURRENCY
 DEFAULT_FLEET_CONCURRENCY = 8
 DEFAULT_FLEET_CANARY_COUNT = 1
 MAX_FLEET_CONCURRENCY = 64
+# A local runtime that cannot acknowledge its drain promptly is parked so a
+# ready Silicon can use the activation slot.  The per-attempt slice makes that
+# handoff quick; the total budget prevents an unattended fleet command from
+# waiting for hours on one permanently busy member.  Callers can explicitly
+# override the total budget with --deadline.
+DEFAULT_FLEET_DRAIN_SLICE_SECONDS = 2.0
+DEFAULT_FLEET_DRAIN_BUDGET_SECONDS = 30.0
+DEFAULT_FLEET_DRAIN_PROBE_SECONDS = 0.25
 PREWARM_MARKER = "SILICON_UPDATE_PREWARM="
 SNAPSHOT_TRANSIENT_ATTEMPTS = 3
 _ATOMIC_SNAPSHOT_DISAPPEAR_RE = re.compile(
@@ -545,6 +564,7 @@ def _docker_hooks(inst: registry.Install) -> EngineHooks:
         MaintenanceProtocol(
             root,
             command=coordinator_command,
+            legacy_offline_safe=lambda: not any(state().values()),
             # A Docker status probe starts an exec process and Python runtime.
             # Polling four fleet workers at 250 ms creates an avoidable exec
             # storm and filesystem-journal pressure on the host.
@@ -558,9 +578,17 @@ def _docker_hooks(inst: registry.Install) -> EngineHooks:
     )
 
     def begin_maintenance(transaction_id: str, target_version: str) -> None:
+        services_active = any(state().values())
+        # A fully stopped Docker instance must use the durable offline fence
+        # even when its installed release contains a maintenance coordinator.
+        # There is no running runtime to acknowledge or preserve a drain. Latch
+        # this only for a newly beginning transaction: reattachment instead
+        # recovers the persisted offline fence or the coordinator state.
+        if not services_active:
+            maintenance.select_offline()
         # A running legacy container cannot truthfully enter a task-safe drain.
         # Reject before publishing a Carbon-visible Glass lease.
-        if not coordinator_available and any(state().values()):
+        if not coordinator_available and services_active:
             raise MaintenanceError(
                 "this legacy Docker Stemcell has no task-safe coordinator; "
                 f"run `silicon stop --full {inst.name}` from the host, then "
@@ -1040,7 +1068,10 @@ def _reconcile_incomplete_fleet(
         # per-instance commit and the host journal update.
         for index, updater in enumerate(updaters):
             member = fleet.value["members"][index]
-            interrupted_activation = member["state"] == "activating" or (
+            interrupted_activation = member["state"] in {
+                "activating",
+                "draining",
+            } or (
                 member["state"] == "failed"
                 and not member["update_transaction_id"]
             )
@@ -1094,7 +1125,11 @@ def _reconcile_incomplete_fleet(
         for index in reversed(range(len(updaters))):
             updater = updaters[index]
             member = fleet.value["members"][index]
-            uncommitted = member["state"] in {"pending", "activating"} or (
+            uncommitted = member["state"] in {
+                "pending",
+                "activating",
+                "draining",
+            } or (
                 member["state"] == "failed"
                 and not member["update_transaction_id"]
             )
@@ -1281,6 +1316,295 @@ def _transaction_signal_guard():
                 pass
 
 
+def _activate_local_fleet_work_conserving(
+    prepared: list[tuple[registry.Install, TransactionalUpdater, dict]],
+    member_indexes: list[int],
+    release: FetchedRelease,
+    fleet_journal: FleetJournal,
+    committed: list[
+        tuple[int, registry.Install, TransactionalUpdater, str]
+    ],
+    *,
+    concurrency: int,
+    deadline_seconds: float | None,
+    success_limit: int | None = None,
+    drain_slice_seconds: float = DEFAULT_FLEET_DRAIN_SLICE_SECONDS,
+    drain_budget_seconds: float = DEFAULT_FLEET_DRAIN_BUDGET_SECONDS,
+    drain_probe_seconds: float = DEFAULT_FLEET_DRAIN_PROBE_SECONDS,
+    parked_limit: int | None = None,
+) -> tuple[int, list[int], dict[str, int]]:
+    """Activate ready local Silicons without letting busy drains own slots.
+
+    A short probe starts with a productive-slot reservation. If it is still
+    draining after that probe, it moves to the separate parked pool and a new
+    candidate immediately receives the productive reservation. Parked workers
+    continue watching their owned maintenance fence; when one becomes safe it
+    must acquire the shared activation gate before checkpoint/stop/activation.
+
+    The real maintenance deadline remains active for the entire parked drain.
+    If that bounded deadline expires, the engine cancels only its owned fence,
+    leaves the old generation serving, and reports a fleet failure so existing
+    transactional compensation can restore already-committed members.
+
+    This scheduler is intentionally local-runtime only.  Docker control-plane
+    serialization and container recovery retain their existing wave behavior.
+    """
+
+    if not member_indexes:
+        return 0, [], {"attempts": 0, "deferred_attempts": 0}
+    if any(prepared[index][0].is_docker for index in member_indexes):
+        raise UpdateError(
+            "work-conserving activation only supports local-Python Silicons"
+        )
+    productive_limit = min(max(1, concurrency), len(member_indexes))
+    resolved_parked_limit = min(
+        productive_limit,
+        max(1, productive_limit if parked_limit is None else parked_limit),
+    )
+    workers = min(
+        productive_limit + resolved_parked_limit,
+        len(member_indexes),
+    )
+    target_successes = min(
+        len(member_indexes),
+        success_limit if success_limit is not None else len(member_indexes),
+    )
+    pending = deque(member_indexes)
+    completed_indexes: set[int] = set()
+    failures = 0
+    attempts = 0
+    deferred_attempts = 0
+    stop_scheduling = False
+    member_states: dict[int, str] = {}
+    probe_started_at: dict[int, float] = {}
+    states_lock = threading.Lock()
+    activation_gate = threading.BoundedSemaphore(productive_limit)
+    peak_productive = 0
+    peak_parked = 0
+    peak_in_flight = 0
+    futures: dict[
+        Future[dict], tuple[int, registry.Install, TransactionalUpdater]
+    ] = {}
+
+    explicit_budget = deadline_seconds
+    member_budget = (
+        float(explicit_budget)
+        if explicit_budget is not None
+        else float(drain_budget_seconds)
+    )
+    # ``drain_slice_seconds`` remains an internal compatibility knob for
+    # focused callers, but it is deliberately not used as the maintenance
+    # deadline. The short value is only a probe quantum; parked Silicons keep
+    # their DRAIN_REQUESTED fence for the full bounded member budget.
+    probe_seconds = max(
+        0.01,
+        min(float(drain_probe_seconds), float(drain_slice_seconds)),
+    )
+
+    def record_peaks() -> None:
+        nonlocal peak_productive, peak_parked, peak_in_flight
+        productive = sum(
+            state == "productive" for state in member_states.values()
+        )
+        parked = sum(
+            state == "parked" for state in member_states.values()
+        )
+        peak_productive = max(peak_productive, productive)
+        peak_parked = max(peak_parked, parked)
+        peak_in_flight = max(peak_in_flight, len(member_states))
+
+    def set_state(member_index: int, state: str) -> None:
+        with states_lock:
+            if member_index not in member_states:
+                return
+            member_states[member_index] = state
+            if state == "probing":
+                probe_started_at[member_index] = time.monotonic()
+            record_peaks()
+
+    def run_attempt(
+        member_index: int,
+        updater: TransactionalUpdater,
+        preflight: dict,
+        attempt_deadline: float,
+    ) -> dict:
+        return updater.run(
+            release,
+            deadline=attempt_deadline,
+            prepared=preflight,
+            lock_held=True,
+            defer_retention=True,
+            activation_gate=activation_gate,
+            on_drain_requested=lambda: set_state(member_index, "probing"),
+            on_activation_slot=lambda: set_state(
+                member_index, "productive"
+            ),
+            on_activation_slot_released=lambda: set_state(
+                member_index, "finishing"
+            ),
+        )
+
+    executor = ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="silicon-activate-local",
+    )
+    try:
+        while futures or (
+            not stop_scheduling
+            and len(completed_indexes) < target_successes
+            and pending
+        ):
+            now = time.monotonic()
+            with states_lock:
+                for member_index, state in list(member_states.items()):
+                    if (
+                        state == "probing"
+                        and now - probe_started_at.get(member_index, now)
+                        >= probe_seconds
+                    ):
+                        member_states[member_index] = "parked"
+                        install = prepared[member_index][0]
+                        fleet_journal.member(
+                            member_index,
+                            state="draining",
+                            error="",
+                        )
+                        ui.info(
+                            f"'{install.name}' is still busy; parked its "
+                            "bounded drain and opened the productive slot."
+                        )
+                record_peaks()
+
+            while (
+                not stop_scheduling
+                and len(futures) < workers
+                and pending
+            ):
+                with states_lock:
+                    productive_reservations = sum(
+                        state in {"starting", "probing", "productive"}
+                        for state in member_states.values()
+                    )
+                    parked = sum(
+                        state == "parked"
+                        for state in member_states.values()
+                    )
+                remaining_successes = target_successes - len(
+                    completed_indexes
+                )
+                if (
+                    productive_reservations
+                    >= min(productive_limit, remaining_successes)
+                    or parked >= resolved_parked_limit
+                ):
+                    break
+                member_index = pending.popleft()
+                install, updater, preflight = prepared[member_index]
+                attempt_deadline = time.time() + member_budget
+                attempts += 1
+                with states_lock:
+                    member_states[member_index] = "starting"
+                    record_peaks()
+                fleet_journal.member(
+                    member_index, state="activating", error=""
+                )
+                ui.info(
+                    f"Task-safely activating the pre-staged update for "
+                    f"'{install.name}'..."
+                )
+                future = executor.submit(
+                    run_attempt,
+                    member_index,
+                    updater,
+                    preflight,
+                    attempt_deadline,
+                )
+                futures[future] = (member_index, install, updater)
+
+            if not futures:
+                break
+            done, _not_done = wait(
+                set(futures),
+                timeout=min(0.05, probe_seconds),
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                continue
+            for future in done:
+                member_index, install, updater = futures.pop(future)
+                with states_lock:
+                    member_states.pop(member_index, None)
+                    probe_started_at.pop(member_index, None)
+                try:
+                    result = future.result()
+                except MaintenanceTimeout as exc:
+                    deferred_attempts += 1
+                    failures += 1
+                    stop_scheduling = True
+                    detail = (
+                        "Silicon remained busy for the bounded fleet drain "
+                        f"budget ({member_budget:g}s): {exc}"
+                    )
+                    fleet_journal.member(
+                        member_index,
+                        state="compensated",
+                        error=detail,
+                    )
+                    ui.error(
+                        f"Deferred update for '{install.name}' expired "
+                        f"safely: {detail}"
+                    )
+                except Exception as exc:
+                    failures += 1
+                    stop_scheduling = True
+                    member_state = "failed"
+                    try:
+                        if updater.status().get("active_transaction") is None:
+                            member_state = "compensated"
+                    except Exception:
+                        pass
+                    fleet_journal.member(
+                        member_index,
+                        state=member_state,
+                        error=str(exc),
+                    )
+                    ui.error(
+                        f"Update failed safely for '{install.name}': {exc}"
+                    )
+                else:
+                    transaction_id = str(result["transaction_id"])
+                    committed.append(
+                        (member_index, install, updater, transaction_id)
+                    )
+                    completed_indexes.add(member_index)
+                    fleet_journal.member(
+                        member_index,
+                        state="committed",
+                        update_transaction_id=transaction_id,
+                        error="",
+                    )
+                    ui.success(
+                        f"'{install.name}' updated transactionally "
+                        f"({transaction_id})"
+                    )
+    finally:
+        # A signal stops new submissions. Already-running attempts have a short
+        # deadline and execute the engine's owned-fence cleanup before this
+        # returns, so cancellation never abandons a background drain thread.
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    remaining_indexes = [
+        index for index in member_indexes if index not in completed_indexes
+    ]
+    return failures, remaining_indexes, {
+        "attempts": attempts,
+        "deferred_attempts": deferred_attempts,
+        "peak_productive": peak_productive,
+        "peak_parked": peak_parked,
+        "peak_in_flight": peak_in_flight,
+    }
+
+
 def update_instance(
     target: str | None,
     *,
@@ -1449,9 +1773,18 @@ def update_instance(
             thread_name_prefix="silicon-preflight",
         ) as executor:
             preflight_futures: dict[
-                Future[dict], tuple[int, registry.Install]
+                Future[dict], tuple[
+                    int, registry.Install, TransactionalUpdater
+                ]
             ] = {}
             for member_index, (install, updater) in enumerate(updaters):
+                persisted = updater.load_preflight(release)
+                if isinstance(persisted, dict):
+                    preflight_results[member_index] = persisted
+                    ui.info(
+                        f"Reusing verified prewarm for '{install.name}'."
+                    )
+                    continue
                 ui.info(
                     f"Pre-staging '{install.name}' while it continues "
                     "serving work..."
@@ -1461,9 +1794,13 @@ def update_instance(
                     release,
                     lock_held=True,
                 )
-                preflight_futures[future] = (member_index, install)
+                preflight_futures[future] = (
+                    member_index,
+                    install,
+                    updater,
+                )
             for future in as_completed(preflight_futures):
-                member_index, install = preflight_futures[future]
+                member_index, install, updater = preflight_futures[future]
                 try:
                     result = future.result()
                     if not result["safe_to_apply"]:
@@ -1479,6 +1816,13 @@ def update_instance(
                             "no selected Silicon has been stopped or activated."
                         )
                     else:
+                        try:
+                            updater.save_preflight(result, release)
+                        except Exception as exc:
+                            ui.warn(
+                                f"Could not persist prewarm for "
+                                f"'{install.name}': {exc}"
+                            )
                         preflight_results[member_index] = result
                 except UpdateConflict as exc:
                     failures += 1
@@ -1520,122 +1864,210 @@ def update_instance(
                 ],
             )
 
-        # Fleet locks retain the exact preflight assets until every activation
-        # commits. A canary wave limits the blast radius; later waves use
-        # bounded parallelism. If a wave fails, every commit is compensated.
-        waves = _activation_waves(
-            len(prepared),
-            concurrency=resolved_concurrency,
-            canary_count=resolved_canary_count,
-        )
         activation_started = time.monotonic()
-        for wave_number, member_indexes in enumerate(waves, start=1):
-            if failures:
-                break
-            wave_kind = (
-                "canary"
-                if resolved_canary_count and wave_number == 1
-                else "parallel"
-            )
-            ui.info(
-                f"Starting {wave_kind} activation wave {wave_number}/"
-                f"{len(waves)} for {len(member_indexes)} Silicon(s)."
-            )
-            wave_started = time.monotonic()
-            activation_futures: dict[
-                Future[dict], tuple[
-                    int, registry.Install, TransactionalUpdater
-                ]
-            ] = {}
-            for member_index in member_indexes:
-                install, updater, preflight = prepared[member_index]
-                if fleet_journal is not None:
-                    fleet_journal.member(
-                        member_index, state="activating", error=""
-                    )
+        local_work_conserving = (
+            fleet_journal is not None
+            and all(not install.is_docker for install, _updater, _ in prepared)
+        )
+        if local_work_conserving:
+            # A canary is a success quota rather than a fixed member. If the
+            # first candidate is busy it remains parked while another ready
+            # Silicon can establish the canary before the main activation pool
+            # opens. Both phases retain at most concurrency productive slots
+            # plus concurrency parked drains.
+            remaining_indexes = list(range(len(prepared)))
+            wave_number = 0
+            if resolved_canary_count:
+                wave_number += 1
+                wave_started = time.monotonic()
+                committed_before_wave = len(committed)
                 ui.info(
-                    f"Task-safely activating the pre-staged update for "
-                    f"'{install.name}'..."
+                    "Starting work-conserving canary activation with "
+                    f"{resolved_concurrency} productive slot(s) and up to "
+                    f"{resolved_concurrency} parked drain(s)."
                 )
-            with _transaction_signal_guard(), ThreadPoolExecutor(
-                max_workers=len(member_indexes),
-                thread_name_prefix="silicon-activate",
-            ) as executor:
+                with _transaction_signal_guard():
+                    (
+                        wave_failures,
+                        remaining_indexes,
+                        wave_stats,
+                    ) = _activate_local_fleet_work_conserving(
+                        prepared,
+                        remaining_indexes,
+                        release,
+                        fleet_journal,
+                        committed,
+                        concurrency=resolved_concurrency,
+                        deadline_seconds=deadline_seconds,
+                        success_limit=resolved_canary_count,
+                    )
+                failures += wave_failures
+                timings["waves"].append(
+                    {
+                        "wave": wave_number,
+                        "kind": "canary",
+                        "members": len(committed) - committed_before_wave,
+                        **wave_stats,
+                        "seconds": round(
+                            time.monotonic() - wave_started, 3
+                        ),
+                    }
+                )
+            if not failures and remaining_indexes:
+                wave_number += 1
+                wave_started = time.monotonic()
+                committed_before_wave = len(committed)
+                ui.info(
+                    "Starting work-conserving fleet activation with "
+                    f"{resolved_concurrency} productive slot(s) and up to "
+                    f"{resolved_concurrency} parked drain(s)."
+                )
+                with _transaction_signal_guard():
+                    (
+                        wave_failures,
+                        remaining_indexes,
+                        wave_stats,
+                    ) = _activate_local_fleet_work_conserving(
+                        prepared,
+                        remaining_indexes,
+                        release,
+                        fleet_journal,
+                        committed,
+                        concurrency=resolved_concurrency,
+                        deadline_seconds=deadline_seconds,
+                    )
+                failures += wave_failures
+                timings["waves"].append(
+                    {
+                        "wave": wave_number,
+                        "kind": "work-conserving",
+                        "members": len(committed) - committed_before_wave,
+                        **wave_stats,
+                        "seconds": round(
+                            time.monotonic() - wave_started, 3
+                        ),
+                    }
+                )
+        else:
+            # Docker and single-instance updates retain the established wave
+            # behavior. The parked-drain scheduler is deliberately local-only.
+            waves = _activation_waves(
+                len(prepared),
+                concurrency=resolved_concurrency,
+                canary_count=resolved_canary_count,
+            )
+            for wave_number, member_indexes in enumerate(waves, start=1):
+                if failures:
+                    break
+                wave_kind = (
+                    "canary"
+                    if resolved_canary_count and wave_number == 1
+                    else "parallel"
+                )
+                ui.info(
+                    f"Starting {wave_kind} activation wave {wave_number}/"
+                    f"{len(waves)} for {len(member_indexes)} Silicon(s)."
+                )
+                wave_started = time.monotonic()
+                activation_futures: dict[
+                    Future[dict], tuple[
+                        int, registry.Install, TransactionalUpdater
+                    ]
+                ] = {}
                 for member_index in member_indexes:
                     install, updater, preflight = prepared[member_index]
-                    future = executor.submit(
-                        updater.run,
-                        release,
-                        deadline=(
-                            time.time() + deadline_seconds
-                            if deadline_seconds is not None
-                            else None
+                    if fleet_journal is not None:
+                        fleet_journal.member(
+                            member_index, state="activating", error=""
+                        )
+                    ui.info(
+                        f"Task-safely activating the pre-staged update for "
+                        f"'{install.name}'..."
+                    )
+                with _transaction_signal_guard(), ThreadPoolExecutor(
+                    max_workers=len(member_indexes),
+                    thread_name_prefix="silicon-activate",
+                ) as executor:
+                    for member_index in member_indexes:
+                        install, updater, preflight = prepared[member_index]
+                        future = executor.submit(
+                            updater.run,
+                            release,
+                            deadline=(
+                                time.time() + deadline_seconds
+                                if deadline_seconds is not None
+                                else None
+                            ),
+                            prepared=preflight,
+                            lock_held=True,
+                            defer_retention=fleet_journal is not None,
+                        )
+                        activation_futures[future] = (
+                            member_index,
+                            install,
+                            updater,
+                        )
+                    for future in as_completed(activation_futures):
+                        member_index, install, updater = (
+                            activation_futures[future]
+                        )
+                        try:
+                            result = future.result()
+                            committed.append(
+                                (
+                                    member_index,
+                                    install,
+                                    updater,
+                                    str(result["transaction_id"]),
+                                )
+                            )
+                            if fleet_journal is not None:
+                                fleet_journal.member(
+                                    member_index,
+                                    state="committed",
+                                    update_transaction_id=str(
+                                        result["transaction_id"]
+                                    ),
+                                    error="",
+                                )
+                            ui.success(
+                                f"'{install.name}' updated transactionally "
+                                f"({result['transaction_id']})"
+                            )
+                        except Exception as exc:
+                            failures += 1
+                            if fleet_journal is not None:
+                                member_state = "failed"
+                                try:
+                                    if (
+                                        updater.status().get(
+                                            "active_transaction"
+                                        )
+                                        is None
+                                    ):
+                                        member_state = "compensated"
+                                except Exception:
+                                    pass
+                                fleet_journal.member(
+                                    member_index,
+                                    state=member_state,
+                                    error=str(exc),
+                                )
+                                fleet_journal.set_state("COMPENSATING")
+                            ui.error(
+                                f"Update failed safely for '{install.name}': "
+                                f"{exc}"
+                            )
+                timings["waves"].append(
+                    {
+                        "wave": wave_number,
+                        "kind": wave_kind,
+                        "members": len(member_indexes),
+                        "seconds": round(
+                            time.monotonic() - wave_started, 3
                         ),
-                        prepared=preflight,
-                        lock_held=True,
-                        defer_retention=fleet_journal is not None,
-                    )
-                    activation_futures[future] = (
-                        member_index,
-                        install,
-                        updater,
-                    )
-                for future in as_completed(activation_futures):
-                    member_index, install, updater = activation_futures[future]
-                    try:
-                        result = future.result()
-                        committed.append(
-                            (
-                                member_index,
-                                install,
-                                updater,
-                                str(result["transaction_id"]),
-                            )
-                        )
-                        if fleet_journal is not None:
-                            fleet_journal.member(
-                                member_index,
-                                state="committed",
-                                update_transaction_id=str(
-                                    result["transaction_id"]
-                                ),
-                                error="",
-                            )
-                        ui.success(
-                            f"'{install.name}' updated transactionally "
-                            f"({result['transaction_id']})"
-                        )
-                    except Exception as exc:
-                        failures += 1
-                        if fleet_journal is not None:
-                            member_state = "failed"
-                            try:
-                                if (
-                                    updater.status().get(
-                                        "active_transaction"
-                                    )
-                                    is None
-                                ):
-                                    member_state = "compensated"
-                            except Exception:
-                                pass
-                            fleet_journal.member(
-                                member_index,
-                                state=member_state,
-                                error=str(exc),
-                            )
-                            fleet_journal.set_state("COMPENSATING")
-                        ui.error(
-                            f"Update failed safely for '{install.name}': {exc}"
-                        )
-            timings["waves"].append(
-                {
-                    "wave": wave_number,
-                    "kind": wave_kind,
-                    "members": len(member_indexes),
-                    "seconds": round(time.monotonic() - wave_started, 3),
-                }
-            )
+                    }
+                )
         timings["activation"] = round(
             time.monotonic() - activation_started,
             3,
@@ -1849,44 +2281,67 @@ def _print_status(value) -> None:
     print(json.dumps(value, indent=2, sort_keys=True))
 
 
-def prewarm_release() -> dict[str, object]:
-    """Fetch and verify the next Docker release without activating a Silicon."""
+def prewarm_release(target: str | None = None) -> dict[str, object]:
+    """Fully prepare local-Python generations without entering maintenance."""
 
     started = time.monotonic()
     timings: dict[str, float] = {}
     release_started = time.monotonic()
     release = _fetch_latest(_cache())
     timings["resolve_release"] = round(time.monotonic() - release_started, 3)
-    image = release.manifest.runtime_image
-    if not image:
+    selected = _targets(target) if target else registry.installs()
+    local_installs = [install for install in selected if not install.is_docker]
+    skipped_docker = [install.name for install in selected if install.is_docker]
+    if not local_installs:
         raise UpdateError(
-            "the published Stemcell Git tag has no immutable runtime_image"
+            "no host-local Python Silicons were selected for prewarming"
         )
-    metadata_started = time.monotonic()
-    runtime_contract.verify_release_contract_metadata(
-        release.manifest.runtime_contract
-    )
-    timings["metadata_contract"] = round(
-        time.monotonic() - metadata_started,
+    roots = [Path(item.path) for item in registry.installs()]
+    workers = min(DEFAULT_FLEET_CONCURRENCY, len(local_installs))
+    prepared: list[str] = []
+    preflight_started = time.monotonic()
+
+    def prepare(install: registry.Install) -> str:
+        updater = TransactionalUpdater(
+            Path(install.path),
+            _cache(),
+            hooks=_hooks(install),
+            all_instances=roots,
+        )
+        receipt = updater.load_preflight(release)
+        if receipt is None:
+            receipt = updater.preflight(release)
+            updater.save_preflight(receipt, release)
+        return install.name
+
+    with ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="silicon-prewarm-local",
+    ) as executor:
+        futures = {
+            executor.submit(prepare, install): install
+            for install in local_installs
+        }
+        for future in as_completed(futures):
+            install = futures[future]
+            try:
+                prepared.append(future.result())
+            except Exception as exc:
+                raise UpdateError(
+                    f"Python prewarm failed for '{install.name}': {exc}"
+                ) from exc
+    timings["preflight"] = round(
+        time.monotonic() - preflight_started,
         3,
     )
-    pull_started = time.monotonic()
-    config = docker_runtime.prepare_release_image(image)
-    timings["image_pull"] = round(time.monotonic() - pull_started, 3)
-    probe_started = time.monotonic()
-    versions = docker_runtime.verify_runtime_contract(config, image)
-    timings["runtime_probe"] = round(time.monotonic() - probe_started, 3)
     timings["total"] = round(time.monotonic() - started, 3)
     return {
         "schema": 1,
         "status": "succeeded",
         "release": release.manifest.identity.version,
-        "runtime_image": image,
-        "runtime_contract_sha256": release.manifest.runtime_contract.get(
-            "sha256",
-            "",
-        ),
-        "versions": versions,
+        "runtime": "local-python",
+        "prepared": sorted(prepared),
+        "skipped_docker": sorted(skipped_docker),
         "timings_seconds": timings,
     }
 
@@ -1905,11 +2360,11 @@ def _update_command(arguments: list[str]) -> None:
         trigger_update_check(args[1] if len(args) > 1 else None)
         return
     if args and args[0] == "prewarm":
-        if len(args) != 1:
-            raise UpdateError("Usage: silicon update prewarm")
+        if len(args) > 2:
+            raise UpdateError("Usage: silicon update prewarm [target]")
         prewarm_started = time.monotonic()
         try:
-            payload = prewarm_release()
+            payload = prewarm_release(args[1] if len(args) == 2 else None)
         except RuntimeError as exc:
             payload = {
                 "schema": 1,

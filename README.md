@@ -47,10 +47,12 @@ silicon update history [name]      Show durable transaction history
 silicon update rollback [name]     Task-safely reactivate the prior generation
 silicon list                 List all instances
 silicon docker init [--root ~/silicons] [--image registry/repository@sha256:<digest>]
-                             Check Docker and enable one-container-per-Silicon runtime
+                             Legacy opt-in: enable one-container-per-Silicon runtime
 silicon docker doctor        Check/repair Docker runtime setup
 silicon docker login [claude|codex|all]
                              Set up shared Claude/Codex auth for Docker silicons
+silicon docker migrate-local [name|all]
+                             Move fully stopped Docker silicons to host-local
 silicon docker compose       Print generated Compose file path
 silicon claude [args...]     Run Claude Code with shared Docker auth
 silicon codex [args...]      Run Codex with shared Docker auth
@@ -84,7 +86,7 @@ and durable update jobs.
 | `SILICON_INTERFACE_CLI_SOURCE` | *(empty)* | local package dir or `silicon-interface.mjs` path for dev installs |
 | `SILICON_INTERFACE_CLI_SKIP` | *(empty)* | set to `1` to skip interface CLI setup |
 | `SILICON_INTERFACE_DAEMON_SKIP` | *(empty)* | set to `1` to install the CLI without starting its listener daemon |
-| `SILICON_RUNTIME` | *(empty)* | default pull uses Docker; set to `local` to opt out |
+| `SILICON_RUNTIME` | `local` | host-local runtime; set to `docker` only for legacy compatibility |
 | `SILICON_RUNTIME_IMAGE` | published Stemcell tag metadata | bootstrap-only exact digest when no runtime digest is persisted; it cannot retarget an installed release |
 | `SILICON_DOCKER_ROOT` | `~/silicons` | Docker-backed instance root |
 | `SILICON_DOCKER_COMPOSE` | `<root>/compose.yml` | generated Compose file path |
@@ -101,13 +103,42 @@ and durable update jobs.
 | `SILICON_DOCKER_LOG_MAX_FILES` | `3` | retained Docker log segments per Silicon |
 | `SILICON_UPDATE_RETAIN_GENERATIONS` | `3` | bounded number of immutable update generations to retain (minimum safety floor: 2) |
 
-## Docker runtime
+## Runtime
 
+Silicons run directly on the host by default. This keeps normal pulls and
+updates on one shared host toolchain and removes image pulls, container control
+operations, and per-container health gates from the common path. The pull
+verifies Node 22+, npm, Python, Git, Silicon Browser, Silicon Extend, and the
+selected Claude/Codex CLI on the host. It also installs and verifies the
+per-Silicon Interface CLI while the pull is still staged, so a missing
+prerequisite fails before the Glass credential claim commits.
+
+```bash
+silicon pull sct_live_...
+```
+
+### Legacy Docker compatibility
+
+Docker is no longer selected by default, even when an older `docker.json`
+configuration remains on the machine. Existing Docker-registered Silicons keep
+working, and an operator can explicitly select the compatibility backend with
+`SILICON_RUNTIME=docker` while a fleet is being moved to host-local operation.
 Docker mode keeps the existing `silicon` command but runs each Silicon in its own
 container. Mutable instance state lives on the host under `~/silicons/<name>` and
 is bind-mounted at `/silicon` inside the container. Provider secrets are still
 Glass-managed: the container stores only the Silicon's `.glass.json` key and the
 stemcell fetches provider keys from Glass on boot.
+
+To move existing installs, stop them at a safe maintenance window and run the
+migration. It prepares host-native dependencies and the Interface CLI before
+changing registry routing; it leaves every migrated Silicon stopped for an
+explicit restart:
+
+```bash
+silicon stop --full all
+silicon docker migrate-local all
+silicon start all
+```
 
 Claude Code and Codex account state is shared across all Docker-backed silicons
 on the VM. The shared auth home defaults to `~/silicons/.shared-home` and is
@@ -131,8 +162,7 @@ verifies. Pull completes only after each active Docker Silicon exposes the
 pinned Silicon Extend package and its `silicon-extend` command.
 
 ```bash
-pip install silicon-cli
-silicon pull sct_live_...
+SILICON_RUNTIME=docker silicon pull sct_live_...
 ```
 
 To run the same checks explicitly:
@@ -173,18 +203,6 @@ releases use the updater's pre-staged, hash-locked dependency environment. Only
 a legacy flat installation falls back to creating `/silicon/.venv` from its
 `requirements.txt`, so per-Silicon Python dependencies do not pollute the host.
 
-To force the older host-local install path:
-
-```bash
-SILICON_RUNTIME=local silicon pull sct_live_...
-```
-
-Local mode deliberately bypasses the bundled image, so the pull verifies Node
-22+, npm, Python, Git, Silicon Browser, Silicon Extend, and the selected
-Claude/Codex CLI on the host. It installs and verifies the per-Silicon Interface
-CLI while the pull is still staged; a missing prerequisite aborts the pending
-Glass claim with an actionable update command.
-
 After that, the normal commands continue to work:
 
 ```bash
@@ -215,23 +233,20 @@ These limits protect neighboring Silicons
 without constraining normal network-bound manager replies; override them with
 the environment variables above when a specialized workload needs more.
 
-Publish the Python packages first. The runtime workflow then builds the exact
-CLI commit, stamps the runtime-contract digest into the OCI image, runs the
-complete dependency probe against the pushed immutable digest, and only then
-allows promotion. Record that verified digest and the contract metadata in the
-Stemcell's `silicon.info` before creating the matching stable Git tag:
+The normal Stemcell release path is source-only and does not wait for a Docker
+build or image pull. Publish and test the Python packages, update
+`silicon.info`, and create the matching stable Git tag. The digest currently in
+`silicon.info` is retained only so already-registered Docker Silicons can keep
+using their frozen compatibility image.
+
+Build a new compatibility image only when its bundled toolchain actually has
+to change:
 
 ```bash
 gh workflow run publish-runtime.yml --ref main -f promote_latest=false
 gh run watch
 # Copy the build's verified ghcr.io/...@sha256:<digest> into silicon.info.
-# In silicon-stemcell, validate that exact image before tagging:
-python scripts/verify_release_runtime.py
 ```
-
-Never publish the Stemcell tag before the package and runtime-image checks have
-completed. The CLI compares the small contract record before downloading image
-layers, so a release-order mismatch now fails quickly without fleet downtime.
 
 For local CLI, Silicon Browser, and Silicon Extend development, build their
 wheels into separate directories and layer them over the published runtime

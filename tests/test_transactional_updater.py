@@ -685,6 +685,37 @@ class TransactionTests(unittest.TestCase):
             self.assertNotIn("drain", fixture.events)
             self.assertNotIn("stop", fixture.events)
 
+    def test_preflight_receipt_survives_cli_process_and_activates(self):
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = Fixture(Path(raw))
+            updater = TransactionalUpdater(
+                fixture.instance, fixture.cache, hooks=fixture.hooks()
+            )
+            prepared = updater.preflight(fixture.release)
+            receipt = updater.save_preflight(prepared, fixture.release)
+
+            replacement = TransactionalUpdater(
+                fixture.instance, fixture.cache, hooks=fixture.hooks()
+            )
+            loaded = replacement.load_preflight(fixture.release)
+            self.assertEqual(loaded, prepared)
+            self.assertTrue(receipt.is_file())
+
+            result = replacement.run(fixture.release, prepared=loaded)
+            self.assertEqual(result["state"], "COMMITTED")
+
+    def test_preflight_receipt_is_invalidated_by_source_drift(self):
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = Fixture(Path(raw))
+            updater = TransactionalUpdater(
+                fixture.instance, fixture.cache, hooks=fixture.hooks()
+            )
+            prepared = updater.preflight(fixture.release)
+            updater.save_preflight(prepared, fixture.release)
+            (fixture.instance / "main.py").write_text("print('changed')\n")
+
+            self.assertIsNone(updater.load_preflight(fixture.release))
+
     def test_update_orders_drain_checkpoint_stop_activate_start_validate(self):
         with tempfile.TemporaryDirectory() as raw:
             fixture = Fixture(Path(raw))
@@ -718,6 +749,54 @@ class TransactionTests(unittest.TestCase):
                 (fixture.instance / "prompts/MEMORY.md").read_text(),
                 "important memory\n",
             )
+
+    def test_identical_generation_commits_without_maintenance_or_restart(self):
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = Fixture(Path(raw))
+            updater = TransactionalUpdater(
+                fixture.instance, fixture.cache, hooks=fixture.hooks()
+            )
+            first = updater.run(fixture.release)
+            self.assertEqual(first["state"], "COMMITTED")
+            active_before = updater.generations.current()
+            fixture.events.clear()
+
+            with mock.patch.object(
+                updater,
+                "_prepare_assets",
+                side_effect=AssertionError("identical release was restaged"),
+            ):
+                second = updater.run(fixture.release)
+
+            self.assertEqual(second["state"], "COMMITTED")
+            self.assertTrue(second["metadata"]["no_op"])
+            self.assertEqual(updater.generations.current(), active_before)
+            self.assertNotIn("drain", fixture.events)
+            self.assertNotIn("quiescent", fixture.events)
+            self.assertNotIn("checkpoint", fixture.events)
+            self.assertNotIn("stop", fixture.events)
+            self.assertNotIn("start", fixture.events)
+            reloaded = TransactionJournal.history(fixture.instance)[0]
+            self.assertEqual(reloaded.state, "COMMITTED")
+            self.assertTrue(reloaded.metadata["no_op"])
+
+    def test_modified_active_source_is_not_an_early_noop(self):
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = Fixture(Path(raw))
+            updater = TransactionalUpdater(
+                fixture.instance, fixture.cache, hooks=fixture.hooks()
+            )
+            updater.run(fixture.release)
+            active = updater.generations.active_root()
+            (active / "main.py").write_text("print('locally changed')\n")
+            fixture.events.clear()
+
+            result = updater.run(fixture.release)
+
+            self.assertEqual(result["state"], "COMMITTED")
+            self.assertFalse(result["metadata"].get("no_op", False))
+            self.assertIn("drain", fixture.events)
+            self.assertIn("stop", fixture.events)
 
     def test_checkpoint_safe_boundary_race_waits_for_fresh_ack(self):
         with tempfile.TemporaryDirectory() as raw:

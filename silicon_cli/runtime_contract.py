@@ -119,15 +119,15 @@ def _format_host_failure(failures: list[str]) -> RuntimeError:
     joined = "; ".join(failures)
     return RuntimeError(
         "host-local pull prerequisites are incomplete: "
-        f"{joined}. The default Docker runtime pulls these tools automatically. "
-        "Otherwise update the host with Node 22+, Git, "
+        f"{joined}. Update the host with Node 22+, Git, "
         "`python3 -m pip install --upgrade silicon-browser silicon-extend`, "
-        "and the selected Claude Code/Codex CLI, then rerun the same pull."
+        "and the selected Claude Code/Codex CLI, then rerun the same pull. "
+        "The legacy Docker backend is available only when explicitly selected."
     )
 
 
 def verify_host_pull_runtime() -> None:
-    """Verify the shared host tools required by the explicit local mode."""
+    """Verify the shared host tools required by the default local mode."""
 
     failures: list[str] = []
     for command in HOST_BASE_COMMANDS:

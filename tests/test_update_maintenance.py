@@ -590,6 +590,50 @@ class LocalMaintenanceProtocolTests(unittest.TestCase):
             protocol.finish("legacy-update", "committed")
             self.assertFalse(fence.exists())
 
+    def test_force_offline_ignores_an_installed_coordinator(self):
+        with tempfile.TemporaryDirectory() as raw:
+            instance = Path(raw)
+            coordinator = instance / "core" / "maintenance.py"
+            coordinator.parent.mkdir()
+            coordinator.write_text("# installed coordinator\n", encoding="utf-8")
+
+            class NoGlass:
+                update_id = ""
+
+                def begin(self, *_args):
+                    pass
+
+                def set_queued_count(self, *_args):
+                    pass
+
+                def report(self, *_args, **_kwargs):
+                    pass
+
+                def finish(self, *_args):
+                    pass
+
+                def reattach(self, *_args):
+                    pass
+
+            protocol = MaintenanceProtocol(
+                instance,
+                glass=NoGlass(),
+                legacy_offline_safe=lambda: True,
+                force_offline=True,
+            )
+            protocol.begin("offline-update", "2.0.0")
+            protocol.request_drain("offline-update", None)
+
+            self.assertTrue(protocol.legacy_offline)
+            self.assertTrue(
+                (
+                    instance
+                    / ".silicon"
+                    / "maintenance"
+                    / "legacy-offline.json"
+                ).is_file()
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

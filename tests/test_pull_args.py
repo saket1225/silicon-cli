@@ -48,6 +48,18 @@ class PullArgsTests(unittest.TestCase):
             else:
                 os.environ["SILICON_RUNTIME"] = old
 
+    def test_pull_defaults_to_local_even_if_docker_was_initialized(self):
+        journal = type("Journal", (), {"value": {"runtime": ""}})()
+        old_runtime = os.environ.pop("SILICON_RUNTIME", None)
+        old_legacy = os.environ.pop("SILICON_RUNTIME_DOCKER", None)
+        try:
+            self.assertFalse(sync._pull_runtime_requested(journal))
+        finally:
+            if old_runtime is not None:
+                os.environ["SILICON_RUNTIME"] = old_runtime
+            if old_legacy is not None:
+                os.environ["SILICON_RUNTIME_DOCKER"] = old_legacy
+
     def test_want_backups_logic(self):
         self.assertFalse(sync._want_backups(sync.PullOpts(backup=False)))
         self.assertTrue(sync._want_backups(sync.PullOpts(backup=True)))

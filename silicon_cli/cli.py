@@ -220,9 +220,9 @@ def cmd_agent(subcmd: str | None, target: str | None) -> None:
 
 
 def cmd_new(target: str | None) -> None:
-    if docker_runtime.enabled():
+    if docker_runtime.runtime_requested():
         docker_runtime.ensure_ready(
-            auto_init=False,
+            auto_init=True,
             install=True,
             pull_image=False,
             quiet=True,
@@ -296,7 +296,7 @@ def cmd_help() -> None:
   silicon update all --concurrency 8 --canary-count 1
                               Canary-first bounded-parallel fleet rollout
   silicon update all --all-at-once  Maximum speed with no canary barrier
-  silicon update prewarm            Fetch and verify the next runtime without activation
+  silicon update prewarm [target]   Prepare local Python generations without activation
   silicon update status [name]       Show generation and transaction state
   silicon update cancel [name]       Cancel an update before its stop boundary
   silicon update resume [name]       Resume an interrupted transaction
@@ -305,9 +305,11 @@ def cmd_help() -> None:
   silicon update check [name] Trigger this silicon's system update check now
   silicon update-check [name] Trigger this silicon's system update check now
   silicon list                List all instances
-  silicon docker init         Check Docker and enable Docker-backed installs
-  silicon docker doctor       Repair/check Docker runtime setup
-  silicon docker login        Set up shared Claude/Codex auth for Docker silicons
+  silicon docker init         Legacy opt-in: enable Docker-backed installs
+  silicon docker doctor       Legacy opt-in: check Docker runtime setup
+  silicon docker login        Legacy opt-in: set up shared container auth
+  silicon docker migrate-local [name|all]
+                              Move fully stopped Docker Silicons to host-local
   silicon claude [args...]    Run Claude Code with shared Docker auth
   silicon codex [args...]     Run Codex with shared Docker auth
   silicon script update       Update the silicon CLI itself

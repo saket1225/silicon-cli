@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import subprocess
 import time
 from contextlib import nullcontext
@@ -10,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .cache import ReleaseCache
+from .cache import ReleaseCache, runtime_platform_identity
 from .checkpoint import normalize_checkpoint, resolve_checkpoint
 from .generation import GenerationError, GenerationStore, ManagedPointerMissing
 from .io import (
@@ -19,6 +20,7 @@ from .io import (
     ensure_real_directory,
     fsync_dir,
     hash_tree,
+    read_json,
     regular_files,
     sha256_file,
 )
@@ -29,6 +31,7 @@ from .journal import (
     TransactionJournal,
 )
 from .lock import InstanceLock
+from .maintenance import MaintenanceTimeout
 from .overlay import OverlayStore
 from .planner import UpdatePlan, apply_plan, build_plan
 from .policy import RUNTIME_EXACT, RUNTIME_PREFIXES
@@ -57,6 +60,7 @@ class UpdateCancelled(UpdateError):
 
 
 DATA_ROOT_CAPABILITY = ".silicon-data-root-v1"
+MAX_PREFLIGHT_RECEIPT_BYTES = 8 * 1024 * 1024
 
 
 @dataclass
@@ -413,6 +417,81 @@ class TransactionalUpdater:
                 "nothing was stopped, so retry to merge the newer edits"
             )
 
+    @staticmethod
+    def _generation_equivalent(
+        current: dict[str, Any], candidate: dict[str, Any]
+    ) -> bool:
+        """Whether activation would only rewrite metadata on the same assets."""
+
+        identity_fields = (
+            "upstream_tree_sha256",
+            "materialized_tree_sha256",
+            "environment_path",
+            "overlay_root_hash",
+            "runtime_image",
+            "release",
+        )
+        return all(
+            current.get(field) == candidate.get(field)
+            for field in identity_fields
+        )
+
+    def _active_generation_matches_release(
+        self,
+        current: dict[str, Any],
+        release: FetchedRelease,
+    ) -> bool:
+        """Verify an already-selected generation without staging a candidate."""
+
+        identity = release.manifest.identity.to_dict()
+        if (
+            current.get("kind") != "immutable-release"
+            or current.get("release") != identity
+            or current.get("upstream_tree_sha256")
+            != release.manifest.identity.tree_sha256
+            or current.get("runtime_image", "")
+            != release.manifest.runtime_image
+        ):
+            return False
+        try:
+            self.generations.validate(current)
+            active = self.generations.resolve_release(current)
+            expected_tree = str(current.get("materialized_tree_sha256") or "")
+            if not expected_tree or self._source_fingerprint(active) != expected_tree:
+                return False
+            overlay_hash = str(current.get("overlay_root_hash") or "")
+            if not overlay_hash:
+                return False
+            self.overlays.verify(overlay_hash)
+
+            lockfile = active / "requirements.lock"
+            environment = self.generations.resolve_environment(current)
+            if not lockfile.is_file():
+                return environment is None
+            if environment is None:
+                return False
+            marker = environment / ".silicon-environment.json"
+            python = environment / (
+                "Scripts/python.exe" if os.name == "nt" else "bin/python"
+            )
+            if (
+                marker.is_symlink()
+                or python.is_symlink()
+                or not marker.is_file()
+                or not python.is_file()
+            ):
+                return False
+            ready = read_json(marker)
+            return bool(
+                isinstance(ready, dict)
+                and ready.get("requirements_sha256") == sha256_file(lockfile)
+                and ready.get("requirements_file") == "requirements.lock"
+                and ready.get("require_hashes") is True
+                and ready.get("runtime") == runtime_platform_identity()
+            )
+        except (OSError, RuntimeError, ValueError, GenerationError):
+            return False
+
     def _prepare_dependency_environment(
         self, release: Path, runtime_image: str = ""
     ) -> Path | None:
@@ -612,6 +691,127 @@ class TransactionalUpdater:
             finally:
                 shutil.rmtree(work, ignore_errors=True)
 
+    def _validated_preflight(
+        self,
+        prepared: dict[str, Any],
+        cached: FetchedRelease,
+        current: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], str, str]:
+        """Validate a live or persisted preflight without entering maintenance."""
+
+        if (
+            not isinstance(prepared, dict)
+            or prepared.get("preflight") is not True
+            or prepared.get("safe_to_apply") is not True
+            or prepared.get("release") != cached.manifest.identity.to_dict()
+            or prepared.get("current_generation") != current
+        ):
+            raise UpdateError(
+                "fleet preflight no longer matches this instance or release"
+            )
+        source_generation = str(prepared.get("source_generation_id") or "")
+        source_tree = str(prepared.get("source_tree_sha256") or "")
+        if (
+            source_generation != str(current.get("generation_id") or "")
+            or not source_tree
+            or self._source_fingerprint(
+                self.generations.resolve_release(current)
+            )
+            != source_tree
+        ):
+            raise UpdateError(
+                "Silicon source changed after fleet preflight; no maintenance "
+                "fence was entered for this instance"
+            )
+        raw_generation = prepared.get("generation")
+        raw_plan = prepared.get("plan")
+        if not isinstance(raw_generation, dict) or not isinstance(raw_plan, dict):
+            raise UpdateError("fleet preflight is missing prepared assets")
+        generation = dict(raw_generation)
+        validation = {
+            **generation,
+            "schema": 1,
+            "kind": "immutable-release",
+            "activated_at": time.time(),
+        }
+        self.generations.validate(validation)
+        if (
+            generation.get("upstream_tree_sha256")
+            != cached.manifest.identity.tree_sha256
+        ):
+            raise UpdateError("fleet preflight generation has the wrong release")
+        overlay_hash = str(generation.get("overlay_root_hash") or "")
+        if not overlay_hash:
+            raise UpdateError("fleet preflight generation has no verified overlay")
+        self.overlays.verify(overlay_hash)
+        conflicts = raw_plan.get("conflicts")
+        actions = raw_plan.get("actions")
+        if (
+            not isinstance(conflicts, list)
+            or conflicts
+            or not isinstance(actions, list)
+        ):
+            raise UpdateError("fleet preflight plan is invalid")
+        return generation, raw_plan, source_generation, source_tree
+
+    def save_preflight(
+        self,
+        prepared: dict[str, Any],
+        release: FetchedRelease,
+    ) -> Path:
+        """Persist a source-bound preflight so a later CLI can activate it."""
+
+        cached = self.cache.store(release)
+        current = self.generations.current()
+        self._validated_preflight(prepared, cached, current)
+        directory = ensure_real_directory(
+            self.instance / ".silicon" / "preflights",
+            root=self.instance,
+        )
+        path = directory / f"{cached.manifest.identity.tree_sha256}.json"
+        atomic_write_json(
+            path,
+            {
+                "schema": 1,
+                "saved_at": time.time(),
+                "prepared": prepared,
+            },
+        )
+        return path
+
+    def load_preflight(self, release: FetchedRelease) -> dict[str, Any] | None:
+        """Load a still-current durable preflight, or return None safely."""
+
+        path = (
+            self.instance
+            / ".silicon"
+            / "preflights"
+            / f"{release.manifest.identity.tree_sha256}.json"
+        )
+        try:
+            metadata = path.lstat()
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size <= 0
+                or metadata.st_size > MAX_PREFLIGHT_RECEIPT_BYTES
+            ):
+                return None
+            value = read_json(path)
+            if value.get("schema") != 1 or not isinstance(
+                value.get("saved_at"), (int, float)
+            ):
+                return None
+            prepared = value.get("prepared")
+            if not isinstance(prepared, dict):
+                return None
+            cached = self.cache.store(release)
+            current = self.generations.current()
+            self._validated_preflight(prepared, cached, current)
+            return prepared
+        except (OSError, RuntimeError, ValueError, GenerationError):
+            return None
+
     def run(
         self,
         release: FetchedRelease,
@@ -621,12 +821,17 @@ class TransactionalUpdater:
         prepared: dict[str, Any] | None = None,
         lock_held: bool = False,
         defer_retention: bool = False,
+        activation_gate: Any | None = None,
+        on_drain_requested: Callable[[], None] | None = None,
+        on_activation_slot: Callable[[], None] | None = None,
+        on_activation_slot_released: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         cached = self.cache.store(release)
         txid = TransactionJournal.new_id()
         activated = False
         stopped = False
         delivery_quiesced = False
+        activation_slot_acquired = False
         lock_context = (
             nullcontext()
             if lock_held
@@ -645,6 +850,23 @@ class TransactionalUpdater:
             self._validate_release_sequence(current, cached)
             service_state = self.hooks.service_state()
             self._validate_service_state_for_update(service_state)
+            if self._active_generation_matches_release(current, cached):
+                journal = TransactionJournal.create(
+                    self.instance,
+                    {
+                        "operation": "update",
+                        "release": cached.manifest.identity.to_dict(),
+                        "prior_generation": current,
+                        "prior_service_state": service_state,
+                        "new_generation": current,
+                        "no_op": True,
+                    },
+                    transaction_id=txid,
+                )
+                journal.commit_noop(
+                    "verified active generation already matches release"
+                )
+                return journal.value
             journal = TransactionJournal.create(
                 self.instance,
                 {
@@ -652,6 +874,7 @@ class TransactionalUpdater:
                     "release": cached.manifest.identity.to_dict(),
                     "prior_generation": current,
                     "prior_service_state": service_state,
+                    "drain_deadline": deadline,
                 },
                 transaction_id=txid,
             )
@@ -685,6 +908,12 @@ class TransactionalUpdater:
                         journal,
                         failpoint=failpoint,
                     )
+                if self._generation_equivalent(current, new_generation):
+                    journal.merge_metadata(no_op=True)
+                    journal.commit_noop(
+                        "prepared generation already active; maintenance skipped"
+                    )
+                    return journal.value
                 if current.get("kind") == "legacy-flat":
                     self._seal_legacy_prior(work, journal)
 
@@ -697,6 +926,8 @@ class TransactionalUpdater:
                     "maintenance fence requested",
                     failpoint=failpoint,
                 )
+                if on_drain_requested is not None:
+                    on_drain_requested()
                 self.hooks.await_quiescent(
                     txid,
                     deadline,
@@ -705,6 +936,21 @@ class TransactionalUpdater:
                 )
                 if journal.cancellation_requested():
                     raise UpdateCancelled("update cancellation requested")
+                if activation_gate is not None:
+                    while not activation_gate.acquire(timeout=0.1):
+                        if journal.cancellation_requested():
+                            raise UpdateCancelled(
+                                "update cancellation requested"
+                            )
+                        if deadline is not None and time.time() >= deadline:
+                            raise MaintenanceTimeout(
+                                "Silicon reached quiescence but no fleet "
+                                "activation slot became available before the "
+                                "bounded attempt deadline"
+                            )
+                    activation_slot_acquired = True
+                if on_activation_slot is not None:
+                    on_activation_slot()
                 journal.transition(
                     "QUIESCENT", "all work leases released", failpoint=failpoint
                 )
@@ -825,6 +1071,10 @@ class TransactionalUpdater:
                     journal.transition("FAILED", str(exc))
                 raise
             finally:
+                if activation_slot_acquired:
+                    if on_activation_slot_released is not None:
+                        on_activation_slot_released()
+                    activation_gate.release()
                 shutil.rmtree(work, ignore_errors=True)
 
     def finalize_retention(self, transaction_id: str) -> dict[str, Any]:
@@ -861,57 +1111,13 @@ class TransactionalUpdater:
     ) -> tuple[UpdatePlan, dict[str, Any]]:
         """Attach a fleet-reserved immutable preflight to a transaction."""
 
-        if (
-            not isinstance(prepared, dict)
-            or prepared.get("preflight") is not True
-            or prepared.get("safe_to_apply") is not True
-            or prepared.get("release") != cached.manifest.identity.to_dict()
-            or prepared.get("current_generation") != current
-        ):
-            raise UpdateError(
-                "fleet preflight no longer matches this instance or release"
-            )
-        source_generation = str(
-            prepared.get("source_generation_id") or ""
-        )
-        source_tree = str(prepared.get("source_tree_sha256") or "")
-        if (
-            source_generation != str(current.get("generation_id") or "")
-            or not source_tree
-            or self._source_fingerprint(
-                self.generations.resolve_release(current)
-            )
-            != source_tree
-        ):
-            raise UpdateError(
-                "Silicon source changed after fleet preflight; no maintenance "
-                "fence was entered for this instance"
-            )
-        raw_generation = prepared.get("generation")
-        raw_plan = prepared.get("plan")
-        if not isinstance(raw_generation, dict) or not isinstance(raw_plan, dict):
-            raise UpdateError("fleet preflight is missing prepared assets")
-        generation = dict(raw_generation)
-        validation = {
-            **generation,
-            "schema": 1,
-            "kind": "immutable-release",
-            "activated_at": time.time(),
-        }
-        self.generations.validate(validation)
-        if (
-            generation.get("upstream_tree_sha256")
-            != cached.manifest.identity.tree_sha256
-        ):
-            raise UpdateError("fleet preflight generation has the wrong release")
-        conflicts = raw_plan.get("conflicts")
-        actions = raw_plan.get("actions")
-        if (
-            not isinstance(conflicts, list)
-            or conflicts
-            or not isinstance(actions, list)
-        ):
-            raise UpdateError("fleet preflight plan is invalid")
+        (
+            generation,
+            raw_plan,
+            source_generation,
+            source_tree,
+        ) = self._validated_preflight(prepared, cached, current)
+        actions = raw_plan["actions"]
         plan = UpdatePlan()
         journal.transition(
             "STAGED",
@@ -1112,6 +1318,7 @@ class TransactionalUpdater:
         transaction_id: str | None = None,
         *,
         lock_held: bool = False,
+        deadline: float | None = None,
     ) -> dict[str, Any]:
         journal = self._select_journal(transaction_id, active_only=True)
         if journal is None:
@@ -1120,6 +1327,13 @@ class TransactionalUpdater:
             return self._resume_rollback(journal, lock_held=lock_held)
         txid = journal.transaction_id
         metadata = journal.metadata
+        if deadline is None:
+            recorded_deadline = metadata.get("drain_deadline")
+            if (
+                isinstance(recorded_deadline, (int, float))
+                and not isinstance(recorded_deadline, bool)
+            ):
+                deadline = float(recorded_deadline)
         release_digest = metadata.get("release", {}).get("tree_sha256")
         if not release_digest:
             raise UpdateError("transaction has no verified release identity")
@@ -1201,7 +1415,7 @@ class TransactionalUpdater:
                     return journal.value
                 self._enter_updating_at_safe_boundary(
                     txid,
-                    None,
+                    deadline,
                     journal.cancellation_requested,
                     bool(service_state.get("main")),
                     "Resuming stop at a safe boundary",
@@ -1249,7 +1463,7 @@ class TransactionalUpdater:
                 journal.clear_cancel()
             result = journal.value
         if restart_release is not None:
-            return self.run(restart_release)
+            return self.run(restart_release, deadline=deadline)
         return result
 
     def _resume_rollback(

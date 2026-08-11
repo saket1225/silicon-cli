@@ -666,12 +666,14 @@ class MaintenanceProtocol:
         command: Callable[[list[str]], dict] | None = None,
         glass: GlassMaintenanceLease | None = None,
         legacy_offline_safe: Callable[[], bool] | None = None,
+        force_offline: bool = False,
         poll_interval_seconds: float = 0.25,
     ):
         self.instance = Path(instance)
         self._command = command
         self.glass = glass or GlassMaintenanceLease(self.instance)
         self._legacy_offline_safe = legacy_offline_safe
+        self._force_offline = bool(force_offline)
         self._legacy_offline = False
         self._offline_fence = (
             self.instance
@@ -689,7 +691,14 @@ class MaintenanceProtocol:
     def legacy_offline(self) -> bool:
         return self._legacy_offline
 
+    def select_offline(self) -> None:
+        """Latch the offline fence path for this maintenance transaction."""
+
+        self._force_offline = True
+
     def _coordinator_available(self) -> bool:
+        if self._force_offline or self._legacy_offline:
+            return False
         if self._command is not None:
             return True
         from ..config import active_release_root

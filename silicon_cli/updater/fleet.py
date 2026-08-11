@@ -23,6 +23,7 @@ TERMINAL_STATES = {"COMMITTED", "COMPENSATED"}
 MEMBER_STATES = {
     "pending",
     "activating",
+    "draining",
     "committed",
     "compensating",
     "compensated",

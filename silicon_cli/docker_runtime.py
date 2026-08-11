@@ -1,6 +1,7 @@
 """Docker runtime backend for one-container-per-Silicon installs."""
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -44,6 +45,7 @@ UNPINNED_IMAGE_OPT_IN = "SILICON_DOCKER_ALLOW_UNPINNED_IMAGE"
 SILICON_EXTEND_VERSION = "0.1.4"
 FULL_STOP_EXEC_TIMEOUT_SECONDS = 30.0
 TRANSACTIONAL_START_ACK_TIMEOUT_SECONDS = 300.0
+INBOX_CURSOR_ANCHOR_BYTES = 64 * 1024
 RUNTIME_HEALTHCHECK_PATH = "/usr/local/libexec/silicon-runtime-healthcheck.py"
 LEGACY_RUNTIME_HEALTHCHECK = (
     "import json,os,time;"
@@ -139,6 +141,25 @@ def host_user() -> str:
 def runtime_opted_out() -> bool:
     runtime = os.environ.get("SILICON_RUNTIME", "").strip().lower()
     return runtime in {"local", "host", "native", "none", "off"} or _falsey(os.environ.get("SILICON_RUNTIME_DOCKER"))
+
+
+def runtime_requested() -> bool:
+    """Return whether this invocation explicitly selected Docker.
+
+    Docker used to be the implicit pull/new default once it had been
+    initialized on a host.  Keep that saved configuration readable for legacy
+    installs, but do not let it opt new Silicons back into containers.  An
+    operator must now select Docker on the current command via
+    ``SILICON_RUNTIME=docker`` (or the older boolean switch).
+    """
+
+    runtime = os.environ.get("SILICON_RUNTIME", "").strip().lower()
+    if runtime in {"docker", "container", "containers"}:
+        return True
+    if runtime in {"local", "host", "native", "none", "off"}:
+        return False
+    legacy = os.environ.get("SILICON_RUNTIME_DOCKER")
+    return legacy is not None and _truthy(legacy)
 
 
 def _save_config(config: dict) -> None:
@@ -1274,8 +1295,8 @@ def maybe_prompt_login(config: dict) -> None:
 
 
 def ensure_pull_runtime() -> bool:
-    if runtime_opted_out():
-        ui.info("SILICON_RUNTIME is set to local/host; pulling without Docker runtime.")
+    if not runtime_requested():
+        ui.info("Using the host-local Silicon runtime (Docker was not selected).")
         return False
     # At this point no published Stemcell tag has been fetched yet, so there is
     # deliberately no image to pull. ``stemcell.prepare_hydration`` binds the
@@ -1287,6 +1308,217 @@ def ensure_pull_runtime() -> bool:
         write_compose=False,
     )
     return True
+
+
+def _configured_providers(instance: Path) -> set[str]:
+    """Read the provider CLIs a host-local migration must already expose."""
+
+    path = instance / "silicon.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {"claude"}
+    if not isinstance(value, dict):
+        return {"claude"}
+    providers = (
+        {
+            str(item).strip().lower()
+            for item in value.get("brain_order", [])
+            if isinstance(item, str)
+        }
+        if isinstance(value.get("brain_order"), list)
+        else set()
+    )
+    brain = str(value.get("brain") or "claude").strip().lower()
+    providers.add("codex" if brain == "codex" else "claude")
+    return providers & {"claude", "codex"}
+
+
+def _prepare_host_local_inbox_cursor(instance: Path) -> bool:
+    """Seal and rebind a stopped Docker inbox cursor for host-local use.
+
+    The container records ``/silicon`` and a mount-namespace file identity.
+    Host-local Stemcell sees another absolute path, while rollback may replace
+    an otherwise identical inbox inode.  Persist a content anchor before the
+    runtime switch so either identity change can resume at the committed byte
+    instead of replaying the append-only inbox from zero.
+    """
+
+    instance = Path(instance).expanduser().resolve(strict=True)
+    cursor_path = (
+        instance
+        / "core"
+        / "interface_state"
+        / "interface_inbox_consumer.json"
+    )
+    inbox_path = instance / ".silicon-interface" / "inbox.jsonl"
+    if not cursor_path.is_file():
+        return False
+    try:
+        cursor = json.loads(cursor_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("the Interface inbox cursor is unreadable") from exc
+    if not isinstance(cursor, dict) or cursor.get("version") != 1:
+        raise RuntimeError("the Interface inbox cursor format is unsupported")
+    try:
+        offset = int(cursor.get("offset") or 0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("the Interface inbox cursor offset is invalid") from exc
+    if offset < 0:
+        raise RuntimeError("the Interface inbox cursor offset is invalid")
+    recorded_path = str(cursor.get("path") or "")
+    host_path = str(inbox_path.resolve())
+    docker_path = f"{CONTAINER_PATH}/.silicon-interface/inbox.jsonl"
+    if recorded_path not in {"", host_path, docker_path}:
+        raise RuntimeError(
+            "the Interface inbox cursor points outside the selected Silicon"
+        )
+    try:
+        metadata = inbox_path.stat()
+    except OSError as exc:
+        if offset == 0:
+            return False
+        raise RuntimeError("the committed Interface inbox is missing") from exc
+    if not inbox_path.is_file() or inbox_path.is_symlink():
+        raise RuntimeError("the Interface inbox is not a regular host file")
+    if offset > metadata.st_size:
+        raise RuntimeError(
+            "the Interface inbox is shorter than its committed cursor"
+        )
+
+    anchor_start = max(0, offset - INBOX_CURSOR_ANCHOR_BYTES)
+    anchor_sha256 = ""
+    if offset:
+        try:
+            with inbox_path.open("rb") as inbox:
+                inbox.seek(offset - 1)
+                if inbox.read(1) != b"\n":
+                    raise RuntimeError(
+                        "the Interface inbox cursor is not at a record boundary"
+                    )
+                inbox.seek(anchor_start)
+                anchor = inbox.read(offset - anchor_start)
+        except OSError as exc:
+            raise RuntimeError("the committed Interface inbox is unreadable") from exc
+        if len(anchor) != offset - anchor_start:
+            raise RuntimeError(
+                "the committed Interface inbox changed during migration"
+            )
+        anchor_sha256 = hashlib.sha256(anchor).hexdigest()
+
+    updated = dict(cursor)
+    updated.update(
+        {
+            "version": 1,
+            "path": host_path,
+            "file_id": f"{metadata.st_dev}:{metadata.st_ino}",
+            "offset": offset,
+            "anchor_start": anchor_start if anchor_sha256 else 0,
+            "anchor_sha256": anchor_sha256,
+        }
+    )
+    atomic_write_json(cursor_path, updated, mode=0o600)
+    return True
+
+
+def migrate_local(selector: str | None) -> None:
+    """Convert stopped Docker registrations to the host-local runtime.
+
+    Source and mutable data already live on the host.  The migration prepares
+    a host-native dependency environment and Interface CLI before atomically
+    changing the generation pointer and registry routing.  Containers must be
+    fully stopped so no task or container process can race those writes.
+    """
+
+    from .updater.cache import ReleaseCache
+    from .updater.generation import GenerationStore
+    from .updater.journal import TERMINAL_STATES, TransactionJournal
+    from .updater.lock import InstanceLock
+
+    if selector and registry.is_multi_target(selector):
+        names = registry.resolve_targets(selector)
+        installs = [registry.resolve_one(name) for name in names]
+    else:
+        installs = [registry.resolve_one(selector)]
+    if not installs:
+        raise RuntimeError("no matching Silicon installations")
+    docker_installs = [install for install in installs if install.is_docker]
+    if not docker_installs:
+        ui.info("Every selected Silicon is already host-local.")
+        return
+
+    for install in docker_installs:
+        if container_running(install):
+            raise RuntimeError(
+                f"Docker Silicon '{install.name}' is still running; use "
+                f"`silicon stop --full {install.name}` and retry"
+            )
+        active = [
+            journal
+            for journal in TransactionJournal.history(Path(install.path))
+            if journal.value.get("state") not in TERMINAL_STATES
+        ]
+        if active:
+            raise RuntimeError(
+                f"Silicon '{install.name}' has an unfinished update; run "
+                f"`silicon update resume {install.name}` before migrating"
+            )
+
+    runtime_contract.verify_host_pull_runtime()
+    providers: set[str] = set()
+    for install in docker_installs:
+        providers.update(_configured_providers(Path(install.path)))
+    runtime_contract.verify_host_providers(providers)
+
+    cache = ReleaseCache(REGISTRY_DIR / "cache")
+    for install in docker_installs:
+        root = Path(install.path).expanduser().resolve()
+        ui.info(f"Preparing host-local runtime for '{install.name}'...")
+        with InstanceLock(root, f"migrate-local-{int(time.time() * 1000)}"):
+            if container_running(install):
+                raise RuntimeError(
+                    f"Docker Silicon '{install.name}' restarted during migration"
+                )
+            store = GenerationStore(root)
+            current = store.current()
+            release = store.resolve_release(current)
+            environment = cache.prepare_environment(
+                release,
+                runner=lambda command: subprocess.run(
+                    command, check=False
+                ).returncode,
+            )
+            interface_cli.setup(root, required=True, start_daemon=False)
+            runtime_contract.verify_local_interface_install(root)
+            if _prepare_host_local_inbox_cursor(root):
+                ui.info("Preserved the verified Interface inbox cursor.")
+
+            updated = dict(current)
+            updated["environment_path"] = (
+                str(environment.resolve(strict=True)) if environment else ""
+            )
+            store.restore(updated)
+            if not registry.update_install(
+                install.name,
+                runtime="local",
+                pid_file=str(root / ".silicon.pid"),
+                service="",
+                compose_file="",
+                image="",
+                container_name="",
+            ):
+                raise RuntimeError(
+                    f"Silicon '{install.name}' disappeared from the registry"
+                )
+        ui.success(
+            f"'{install.name}' is host-local. Start it with: "
+            f"silicon start {install.name}"
+        )
+
+    # Remove migrated services from the generated compatibility Compose file.
+    cfg = load_config()
+    if cfg.get("enabled"):
+        render_compose(cfg)
 
 
 def _run(
@@ -2606,6 +2838,10 @@ def parse_init_args(args: list[str]) -> tuple[str | None, str | None, str | None
 
 
 def cmd_docker(args: list[str]) -> None:
+    # Invoking the Docker command is itself an explicit opt-in.  This keeps the
+    # compatibility backend usable without allowing a saved docker.json to
+    # become the default for new Silicons again.
+    os.environ["SILICON_RUNTIME"] = "docker"
     sub = args[0] if args else "status"
     if sub in {"init", "bootstrap"}:
         root, image, shared_home = parse_init_args(args[1:])
@@ -2660,6 +2896,12 @@ def cmd_docker(args: list[str]) -> None:
     if sub == "login":
         login(args[1:])
         return
+    if sub in {"migrate-local", "migrate"}:
+        if len(args) > 2:
+            ui.error("Usage: silicon docker migrate-local [name|all]")
+            raise SystemExit(1)
+        migrate_local(args[1] if len(args) == 2 else None)
+        return
     if sub == "status":
         cfg = load_config()
         if not cfg.get("enabled"):
@@ -2690,5 +2932,8 @@ def cmd_docker(args: list[str]) -> None:
     if sub == "compose":
         print(load_config(required=True)["compose_file"])
         return
-    ui.error("Usage: silicon docker <init|bootstrap|doctor|login|status|compose> [--root PATH] [--image IMAGE]")
+    ui.error(
+        "Usage: silicon docker "
+        "<init|bootstrap|doctor|login|migrate-local|status|compose>"
+    )
     sys.exit(1)

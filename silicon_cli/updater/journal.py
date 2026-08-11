@@ -307,6 +307,29 @@ class TransactionJournal:
         if failpoint == state:
             raise FailpointCrash(f"injected crash after {state}")
 
+    def commit_noop(
+        self, detail: str = "active generation already selected"
+    ) -> None:
+        """Commit a prepared transaction without fabricating lifecycle phases.
+
+        A generation-equivalent update has completed successfully before it
+        enters maintenance.  Recording DRAIN_REQUESTED through VALIDATED would
+        falsely claim that services were fenced and restarted, so this narrow
+        terminal transition keeps the durable history truthful.
+        """
+
+        if self.state not in {"CREATED", "DEPENDENCIES_READY"}:
+            raise InvalidTransition(
+                "no-op commit requires CREATED or DEPENDENCIES_READY, "
+                f"not {self.state}"
+            )
+        now = time.time()
+        self.value["state"] = "COMMITTED"
+        self.value.setdefault("events", []).append(
+            {"state": "COMMITTED", "at": now, "detail": detail}
+        )
+        self._save()
+
     def request_cancel(self) -> None:
         marker = self.path.with_suffix(".cancel")
         atomic_write_json(

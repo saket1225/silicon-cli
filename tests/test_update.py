@@ -95,7 +95,9 @@ class CliUpdateTests(unittest.TestCase):
     def test_update_command_routes_runtime_prewarm(self):
         payload = {"schema": 1, "status": "succeeded"}
         with (
-            mock.patch.object(update, "prewarm_release", return_value=payload),
+            mock.patch.object(
+                update, "prewarm_release", return_value=payload
+            ) as prewarm,
             mock.patch("builtins.print") as output,
         ):
             update.update_command(["prewarm"])
@@ -104,76 +106,76 @@ class CliUpdateTests(unittest.TestCase):
             update.PREWARM_MARKER
             + '{"schema": 1, "status": "succeeded"}'
         )
+        prewarm.assert_called_once_with(None)
 
-    def test_prewarm_checks_metadata_before_pulling_the_image(self):
-        image = (
-            "ghcr.io/teamofsilicons/silicon-runtime@sha256:" + "a" * 64
+    def test_update_command_routes_targeted_python_prewarm(self):
+        payload = {"schema": 1, "status": "succeeded"}
+        with (
+            mock.patch.object(
+                update, "prewarm_release", return_value=payload
+            ) as prewarm,
+            mock.patch("builtins.print"),
+        ):
+            update.update_command(["prewarm", "ada"])
+
+        prewarm.assert_called_once_with("ada")
+
+    def test_prewarm_persists_local_python_preflight(self):
+        install = registry.Install(
+            index=0,
+            name="ada",
+            path="/tmp/ada",
+            pid_file="/tmp/ada/.silicon.pid",
         )
-        declared = runtime_contract.release_contract_metadata()
         release = SimpleNamespace(
             manifest=SimpleNamespace(
-                runtime_image=image,
-                runtime_contract=declared,
                 identity=SimpleNamespace(version="2.4.1"),
             )
         )
+        updater = mock.Mock()
+        updater.load_preflight.return_value = None
+        updater.preflight.return_value = {"preflight": True}
         with (
             mock.patch.object(update, "_fetch_latest", return_value=release),
-            mock.patch.object(update, "_cache"),
+            mock.patch.object(update, "_cache", return_value=object()),
+            mock.patch.object(update.registry, "installs", return_value=[install]),
             mock.patch.object(
-                update.runtime_contract,
-                "verify_release_contract_metadata",
-                return_value=declared,
-            ) as metadata_check,
-            mock.patch.object(
-                update.docker_runtime,
-                "prepare_release_image",
-                return_value={"image": image},
-            ) as prepare,
-            mock.patch.object(
-                update.docker_runtime,
-                "verify_runtime_contract",
-                return_value={"silicon-cli": "1.0.29"},
-            ) as verify,
+                update, "TransactionalUpdater", return_value=updater
+            ),
+            mock.patch.object(update, "_hooks", return_value=mock.Mock()),
         ):
             result = update.prewarm_release()
 
-        metadata_check.assert_called_once_with(declared)
-        prepare.assert_called_once_with(image)
-        verify.assert_called_once_with({"image": image}, image)
+        updater.preflight.assert_called_once_with(release)
+        updater.save_preflight.assert_called_once_with(
+            {"preflight": True}, release
+        )
         self.assertEqual(result["status"], "succeeded")
         self.assertEqual(result["release"], "2.4.1")
-        self.assertEqual(result["runtime_contract_sha256"], declared["sha256"])
+        self.assertEqual(result["runtime"], "local-python")
+        self.assertEqual(result["prepared"], ["ada"])
         self.assertIn("total", result["timings_seconds"])
 
-    def test_prewarm_contract_mismatch_fails_before_image_pull(self):
-        image = (
-            "ghcr.io/teamofsilicons/silicon-runtime@sha256:" + "b" * 64
+    def test_prewarm_rejects_selection_without_local_python_silicons(self):
+        install = registry.Install(
+            index=0,
+            name="ada",
+            path="/tmp/ada",
+            pid_file="/tmp/ada/.silicon.pid",
+            runtime="docker",
         )
         release = SimpleNamespace(
             manifest=SimpleNamespace(
-                runtime_image=image,
-                runtime_contract={"schema": 1, "sha256": "bad"},
                 identity=SimpleNamespace(version="2.4.1"),
             )
         )
         with (
             mock.patch.object(update, "_fetch_latest", return_value=release),
-            mock.patch.object(update, "_cache"),
-            mock.patch.object(
-                update.runtime_contract,
-                "verify_release_contract_metadata",
-                side_effect=RuntimeError("contract mismatch"),
-            ),
-            mock.patch.object(
-                update.docker_runtime,
-                "prepare_release_image",
-            ) as prepare,
-            self.assertRaisesRegex(RuntimeError, "contract mismatch"),
+            mock.patch.object(update, "_cache", return_value=object()),
+            mock.patch.object(update.registry, "installs", return_value=[install]),
+            self.assertRaisesRegex(RuntimeError, "no host-local Python"),
         ):
             update.prewarm_release()
-
-        prepare.assert_not_called()
 
     def test_prewarm_command_emits_structured_failure_with_timing(self):
         with (

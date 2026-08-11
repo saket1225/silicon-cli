@@ -1325,7 +1325,7 @@ def _want_backups(opts: PullOpts | None) -> bool:
 def _pull_runtime_requested(journal: pull_transaction.PullJournal) -> bool:
     if journal.value["runtime"]:
         return journal.value["runtime"] == "docker"
-    return not docker_runtime.runtime_opted_out()
+    return docker_runtime.runtime_requested()
 
 
 def _prepare_runtime_for_release(prepared, *, use_docker: bool) -> tuple[Path, str]:
