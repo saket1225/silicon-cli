@@ -28,17 +28,17 @@ class PackageManagerTests(unittest.TestCase):
     def test_interface_release_asset_metadata_is_pinned(self):
         spec = package_manager.PACKAGE_BY_KEY["silicon-interface"]
 
-        self.assertEqual(package_manager.SILICON_INTERFACE_CLI_VERSION, "2.0.8")
+        self.assertEqual(package_manager.SILICON_INTERFACE_CLI_VERSION, "2.0.10")
         self.assertEqual(
             package_manager.SILICON_INTERFACE_CLI_RELEASE_URL,
             "https://github.com/teamofsilicons/silicon-interface-web/"
-            "releases/download/interface-cli-v2.0.8/"
-            "teamofsilicons-silicon-interface-cli-2.0.8.tgz",
+            "releases/download/interface-cli-v2.0.10/"
+            "teamofsilicons-silicon-interface-cli-2.0.10.tgz",
         )
         self.assertEqual(
             package_manager.SILICON_INTERFACE_CLI_RELEASE_SHA256,
-            "9dc92a55a10e6ccaed0986cae8e5053f"
-            "ddff53118ff89047d501c9fd05c66bc7",
+            "3b1dccc3d964e3abb271a422d477fce3"
+            "de62e26ed93e5d0bcde1af2f13bb8296",
         )
         self.assertEqual(spec.latest_source, "embedded")
 
@@ -334,7 +334,7 @@ class PackageManagerTests(unittest.TestCase):
                 ):
                     return SimpleNamespace(
                         returncode=0,
-                        stdout="2.0.8\n",
+                        stdout="2.0.10\n",
                         stderr="",
                     )
                 observed["command"] = command
@@ -407,7 +407,7 @@ class PackageManagerTests(unittest.TestCase):
                 "--no-fund",
             ],
         )
-        self.assertTrue(command[-1].endswith("silicon-interface-cli-2.0.8.tgz"))
+        self.assertTrue(command[-1].endswith("silicon-interface-cli-2.0.10.tgz"))
         self.assertNotIn("@latest", " ".join(command))
         self.assertNotIn(
             package_manager.PACKAGE_BY_KEY["silicon-interface"].package,
